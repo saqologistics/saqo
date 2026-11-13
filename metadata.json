@@ -1,0 +1,6 @@
+{
+  "name": "SAQO — Inter-State Parcel Delivery",
+  "description": "Fast, reliable black-and-white parcel delivery platform connecting senders, smart-dispatched riders, and operations across Nigerian cities and states.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
