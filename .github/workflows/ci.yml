@@ -1,0 +1,60 @@
+name: SAQO CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: node scripts/restartSmoke.mjs
+      - name: Verify HTTPS and WebSocket through Caddy
+        shell: bash
+        env:
+          SAQO_DOMAIN: localhost
+          SAQO_ENV_FILE: .env.ci
+        run: |
+          printf '%s\n' SAQO_SESSION_SECRET=synthetic-caddy-ci-secret-with-over-32-characters SAQO_ADMIN_EMAIL=admin@saqo.test SAQO_ADMIN_PASSWORD=SmokeTestAdminPassword1 > "$SAQO_ENV_FILE"
+          trap 'docker compose down --volumes' EXIT
+          docker compose up -d --build
+          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile
+          for attempt in {1..30}; do
+            if docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt "$RUNNER_TEMP/saqo-caddy.crt"; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --retry 10 --retry-connrefused --cacert "$RUNNER_TEMP/saqo-caddy.crt" https://localhost/api/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/api/health)" = 308
+          NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/saqo-caddy.crt" node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { once } from 'node:events';
+          import WebSocket from 'ws';
+          const socket = new WebSocket('wss://localhost/ws', { handshakeTimeout: 5000 });
+          const [message] = await once(socket, 'message');
+          assert.equal(JSON.parse(message).type, 'connected');
+          socket.close();
+          JS
+          for attempt in {1..15}; do
+            if docker compose exec -T backup node --import tsx scripts/sqliteBackup.ts health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs backup
+          exit 1

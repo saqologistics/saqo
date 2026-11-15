@@ -1,0 +1,73 @@
+services:
+  app:
+    image: saqo-app:local
+    build:
+      context: .
+      args:
+        VITE_MAPBOX_TOKEN: ${VITE_MAPBOX_TOKEN:-}
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
+        VITE_PHOTON_URL: ${VITE_PHOTON_URL:-}
+        VITE_OSRM_URL: ${VITE_OSRM_URL:-}
+    env_file: ${SAQO_ENV_FILE:-.env}
+    environment:
+      APP_URL: https://${SAQO_DOMAIN:?Set SAQO_DOMAIN to a hostname}
+      NODE_ENV: production
+      SAQO_DB_PATH: /data/${SAQO_DB_FILE:-saqo.db}
+      SAQO_TRUST_PROXY: "1"
+      PORT: "3000"
+    volumes:
+      - sqlite:/data
+    restart: unless-stopped
+    stop_grace_period: 25s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      SAQO_DOMAIN: ${SAQO_DOMAIN:?Set SAQO_DOMAIN to a hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backup:
+    image: saqo-app:local
+    environment:
+      SAQO_DB_PATH: /data/${SAQO_DB_FILE:-saqo.db}
+      SAQO_BACKUP_DIR: /backups
+      SAQO_BACKUP_INTERVAL_SECONDS: ${SAQO_BACKUP_INTERVAL_SECONDS:-21600}
+      SAQO_BACKUP_RETAIN: ${SAQO_BACKUP_RETAIN:-28}
+      SAQO_ALERT_WEBHOOK_URL: ${SAQO_ALERT_WEBHOOK_URL:-}
+      SAQO_ALERT_WEBHOOK_TOKEN: ${SAQO_ALERT_WEBHOOK_TOKEN:-}
+    command: ["node", "--import", "tsx", "scripts/sqliteBackup.ts", "schedule"]
+    volumes:
+      - sqlite:/data
+      - sqlite_backups:/backups
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "--import", "tsx", "scripts/sqliteBackup.ts", "health"]
+      interval: 5m
+      timeout: 15s
+      retries: 2
+
+volumes:
+  sqlite:
+  sqlite_backups:
+  caddy_data:
+  caddy_config:

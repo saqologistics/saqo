@@ -16,11 +16,84 @@
     <meta property="og:description" content="Fast, reliable parcel delivery across cities and states in Nigeria. Request a rider, track your parcel, and deliver with confidence." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <style>
+      #saqo-startup {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: grid;
+        place-items: center;
+        background: #000;
+      }
+
+      #saqo-startup svg {
+        display: block;
+        width: min(76vw, 30rem);
+        height: auto;
+      }
+
+      .saqo-startup-sheen {
+        animation: saqo-logo-sweep 2.2s ease-in-out infinite;
+      }
+
+      .saqo-startup-trail {
+        animation: saqo-trail-move 1.65s ease-in-out infinite;
+      }
+
+      @keyframes saqo-logo-sweep {
+        0%, 12% { transform: translateX(-700px); }
+        78%, 100% { transform: translateX(2000px); }
+      }
+
+      @keyframes saqo-trail-move {
+        from { transform: translateX(-100px); }
+        to { transform: translateX(360px); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .saqo-startup-sheen,
+        .saqo-startup-progress {
+          display: none;
+        }
+      }
+    </style>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
   </head>
   <body class="bg-white text-black antialiased selection:bg-black selection:text-white">
+    <div id="saqo-startup" role="status" aria-label="Starting SAQO Logistics">
+      <svg viewBox="60 125 1928 555" aria-hidden="true" focusable="false">
+        <defs>
+          <g id="saqo-startup-wordmark" fill-rule="evenodd">
+            <path d="M184 146h324l-40 49H183c-18 0-32 12-32 28s14 27 32 27h230c55 0 96 36 96 79s-41 79-96 79H76l50-51h287c18 0 33-12 33-28s-15-27-33-27H184c-55 0-94-34-94-78s39-78 94-78Z" />
+            <path d="M558 408 747 167c13-17 30-26 51-26 21 0 38 9 51 26l184 241h-78L816 215c-6-9-11-14-18-14-7 0-12 5-18 14L637 408Zm118 0 36-40c7-8 17-12 28-12h97c11 0 19 4 26 12l31 40Z" />
+            <path d="M1169 146h240c53 0 93 35 93 82v98c0 25-14 46-36 61l-43-36c14-8 21-18 21-30v-87c0-24-17-39-42-39h-226c-27 0-44 16-44 39v86c0 24 17 39 44 39h110l58 49h-175c-55 0-96-35-96-81v-99c0-47 41-82 96-82Zm98 168h85l150 126h-87Z" />
+            <path d="M1650 146h228c52 0 91 36 91 83v96c0 48-39 83-91 83h-228c-52 0-91-35-91-83v-96c0-47 39-83 91-83Zm9 49c-25 0-41 16-41 40v84c0 24 16 40 41 40h210c25 0 41-16 41-40v-84c0-24-16-40-41-40Z" />
+            <path d="M138 493h23v43c0 5 3 8 8 8h52v17h-62c-14 0-21-7-21-20Zm250 0h37c20 0 30 10 30 26v15c0 17-10 27-30 27h-37c-20 0-30-10-30-27v-15c0-16 10-26 30-26Zm5 17c-9 0-13 4-13 12v10c0 8 4 12 13 12h27c9 0 13-4 13-12v-10c0-8-4-12-13-12Zm230-17h58v17h-54c-9 0-13 4-13 12v10c0 8 4 12 13 12h34v-9h-27v-15h48v24c0 11-7 17-18 17h-41c-20 0-31-10-31-27v-15c0-16 11-26 31-26Zm208 0h21v68h-21Zm193 0h54v17h-53c-4 0-7 2-7 5s3 5 7 5h32c16 0 25 8 25 20 0 13-9 21-25 21h-59v-17h58c4 0 7-2 7-5s-3-5-7-5h-32c-16 0-25-8-25-20 0-13 9-21 25-21Zm188 0h83v17h-31v51h-21v-51h-31Zm219 0h21v68h-21Zm190 0h55v17h-51c-9 0-13 4-13 12v10c0 8 4 12 13 12h51v17h-55c-20 0-31-10-31-27v-15c0-16 11-26 31-26Zm220 0h57v17h-56c-4 0-7 2-7 5s3 5 7 5h34c16 0 25 8 25 20 0 13-9 21-25 21h-60v-17h59c4 0 7-2 7-5s-3-5-7-5h-34c-16 0-25-8-25-20 0-13 9-21 25-21Z" />
+          </g>
+          <mask id="saqo-startup-logo-mask" maskUnits="userSpaceOnUse" x="60" y="125" width="1928" height="455">
+            <use href="#saqo-startup-wordmark" fill="white" />
+          </mask>
+          <linearGradient id="saqo-startup-highlight">
+            <stop stop-color="#fff" stop-opacity="0" />
+            <stop offset=".5" stop-color="#fff" />
+            <stop offset="1" stop-color="#fff" stop-opacity="0" />
+          </linearGradient>
+          <clipPath id="saqo-startup-trail-clip">
+            <rect x="844" y="648" width="360" height="6" rx="3" />
+          </clipPath>
+        </defs>
+        <use href="#saqo-startup-wordmark" fill="#d9d9d9" />
+        <g mask="url(#saqo-startup-logo-mask)">
+          <rect class="saqo-startup-sheen" x="0" y="125" width="700" height="455" fill="url(#saqo-startup-highlight)" />
+        </g>
+        <g class="saqo-startup-progress" clip-path="url(#saqo-startup-trail-clip)">
+          <rect x="844" y="648" width="360" height="6" fill="#3a3a3a" />
+          <rect class="saqo-startup-trail" x="844" y="648" width="100" height="6" rx="3" fill="#fff" />
+        </g>
+      </svg>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

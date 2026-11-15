@@ -7,11 +7,13 @@ import type {
   ComplaintRecord,
   CustomerSummary,
   DeliveryAssignment,
+  DeliveryPaymentStatus,
   DeliveryRequest,
   DeliveryStatus,
   DeliveryStatusHistoryItem,
   NotificationItem,
   ParcelCategory,
+  PaymentMethodCode,
   PaymentRecord,
   PlatformSettings,
   Profile,
@@ -25,11 +27,30 @@ import type {
 } from '../shared/types';
 
 const DB_PATH = process.env.SAQO_DB_PATH || path.resolve(process.cwd(), 'saqo.db');
-const SESSION_SECRET = process.env.SAQO_SESSION_SECRET || 'saqo-dev-hmac-secret-2026';
+const configuredSecret = process.env.SAQO_SESSION_SECRET?.trim();
+if (process.env.NODE_ENV === 'production' &&
+    (!configuredSecret || configuredSecret.length < 32 || configuredSecret === 'saqo-dev-hmac-secret-2026')) {
+  throw new Error('Set SAQO_SESSION_SECRET to a randomly generated secret of at least 32 characters.');
+}
+const SESSION_SECRET = configuredSecret || 'saqo-dev-hmac-secret-2026';
+const SESSION_LIFETIME_MS = 12 * 60 * 60 * 1000;
 
 export const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA foreign_keys = ON;');
 db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA busy_timeout = 5000;');
+
+export function persistDispatchChange<T>(change: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = change();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -55,7 +76,8 @@ export function signSessionToken(payload: { userId: string; role: UserRole }): s
   return `${data}.${sig}`;
 }
 
-export function verifySessionToken(token: string): { userId: string; role: UserRole } | null {
+export function verifySessionToken(token: string): { userId: string; role: UserRole; expiresAt: number } | null {
+  if (token.length > 1024) return null;
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [data, sig] = parts;
@@ -70,8 +92,11 @@ export function verifySessionToken(token: string): { userId: string; role: UserR
   }
   try {
     const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
-    if (parsed.userId && parsed.role) {
-      return { userId: parsed.userId, role: parsed.role };
+    const now = Date.now();
+    if (typeof parsed.userId === 'string' && parsed.userId &&
+        ['client', 'rider', 'admin'].includes(parsed.role) &&
+        Number.isSafeInteger(parsed.iat) && parsed.iat <= now && now - parsed.iat < SESSION_LIFETIME_MS) {
+      return { userId: parsed.userId, role: parsed.role, expiresAt: parsed.iat + SESSION_LIFETIME_MS };
     }
     return null;
   } catch {
@@ -178,6 +203,19 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS delivery_otp_attempts (
+      delivery_id TEXT PRIMARY KEY REFERENCES delivery_requests(id) ON DELETE CASCADE,
+      attempts INTEGER NOT NULL,
+      reset_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS login_attempts (
+      bucket TEXT PRIMARY KEY,
+      attempts INTEGER NOT NULL,
+      reset_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_reset ON login_attempts(reset_at);
+
     CREATE TABLE IF NOT EXISTS payments (
       id TEXT PRIMARY KEY,
       delivery_id TEXT UNIQUE NOT NULL REFERENCES delivery_requests(id) ON DELETE CASCADE,
@@ -219,7 +257,21 @@ export function initDatabase(): void {
       per_km_rate_ngn REAL NOT NULL,
       inter_state_surcharge_ngn REAL NOT NULL,
       rider_commission_percent REAL NOT NULL,
-      whatsapp_support_number TEXT NOT NULL
+      whatsapp_support_number TEXT NOT NULL,
+      show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+      phone TEXT PRIMARY KEY,
+      draft TEXT,
+      profile_id TEXT REFERENCES profiles(id),
+      support_conversation_id TEXT REFERENCES support_conversations(id) ON DELETE SET NULL,
+      last_inbound_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+      message_sid TEXT PRIMARY KEY,
+      received_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS support_conversations (
@@ -253,11 +305,230 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_deliveries_status ON delivery_requests(status);
     CREATE INDEX IF NOT EXISTS idx_assignments_delivery ON delivery_assignments(delivery_id);
     CREATE INDEX IF NOT EXISTS idx_assignments_rider ON delivery_assignments(rider_id);
+    CREATE INDEX IF NOT EXISTS idx_rider_locations_rider ON rider_locations(rider_id);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
     CREATE INDEX IF NOT EXISTS idx_support_conv_visitor ON support_conversations(visitor_token);
     CREATE INDEX IF NOT EXISTS idx_support_conv_user ON support_conversations(user_id);
     CREATE INDEX IF NOT EXISTS idx_support_msg_conv ON support_messages(conversation_id);
+
+    CREATE TABLE IF NOT EXISTS wallets (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL UNIQUE REFERENCES profiles(id) ON DELETE CASCADE,
+      balance_ngn REAL NOT NULL DEFAULT 0 CHECK(balance_ngn >= 0),
+      locked_balance_ngn REAL NOT NULL DEFAULT 0 CHECK(locked_balance_ngn >= 0),
+      currency TEXT NOT NULL DEFAULT 'NGN',
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'frozen', 'closed')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
+      user_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+      type TEXT NOT NULL CHECK(type IN ('credit', 'debit', 'refund', 'adjustment')),
+      category TEXT NOT NULL CHECK(category IN ('funding', 'delivery_payment', 'refund', 'admin_adjustment', 'reversal')),
+      amount_ngn REAL NOT NULL CHECK(amount_ngn > 0),
+      balance_before_ngn REAL NOT NULL CHECK(balance_before_ngn >= 0),
+      balance_after_ngn REAL NOT NULL CHECK(balance_after_ngn >= 0),
+      currency TEXT NOT NULL DEFAULT 'NGN',
+      reference TEXT NOT NULL UNIQUE,
+      idempotency_key TEXT UNIQUE,
+      delivery_id TEXT REFERENCES delivery_requests(id) ON DELETE SET NULL,
+      payment_transaction_id TEXT,
+      status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('pending', 'completed', 'failed', 'reversed')),
+      description TEXT NOT NULL DEFAULT '',
+      actor_user_id TEXT,
+      actor_role TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TRIGGER IF NOT EXISTS trg_wallet_transactions_no_update
+      BEFORE UPDATE ON wallet_transactions
+      BEGIN
+        SELECT RAISE(ABORT, 'wallet_transactions ledger is immutable');
+      END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_wallet_transactions_no_delete
+      BEFORE DELETE ON wallet_transactions
+      BEGIN
+        SELECT RAISE(ABORT, 'wallet_transactions ledger is immutable');
+      END;
+
+    CREATE TABLE IF NOT EXISTS payment_methods (
+      code TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      is_enabled INTEGER NOT NULL DEFAULT 1,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      config TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      id TEXT PRIMARY KEY,
+      reference TEXT NOT NULL UNIQUE,
+      idempotency_key TEXT UNIQUE,
+      provider_tx_id TEXT,
+      provider_tx_ref TEXT,
+      user_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+      customer_name TEXT,
+      customer_email TEXT,
+      customer_phone TEXT,
+      wallet_id TEXT REFERENCES wallets(id) ON DELETE SET NULL,
+      delivery_id TEXT REFERENCES delivery_requests(id) ON DELETE SET NULL,
+      tracking_code TEXT,
+      purpose TEXT NOT NULL CHECK(purpose IN ('wallet_funding', 'delivery_payment')),
+      payment_method TEXT NOT NULL CHECK(payment_method IN ('wallet', 'flutterwave', 'cash', 'bank_transfer')),
+      provider TEXT NOT NULL DEFAULT 'internal' CHECK(provider IN ('internal', 'flutterwave', 'cash', 'bank_transfer')),
+      amount_ngn REAL NOT NULL CHECK(amount_ngn >= 0),
+      fee_ngn REAL NOT NULL DEFAULT 0 CHECK(fee_ngn >= 0),
+      currency TEXT NOT NULL DEFAULT 'NGN',
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'pending_verification', 'collected_by_rider', 'paid', 'failed', 'refunded', 'reversed')),
+      checkout_url TEXT,
+      transfer_reference TEXT,
+      transfer_proof_note TEXT,
+      failure_reason TEXT,
+      verified_at TEXT,
+      verified_by TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_gateway_settings (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL DEFAULT 'flutterwave',
+      public_key TEXT NOT NULL DEFAULT '',
+      secret_key_encrypted TEXT NOT NULL DEFAULT '',
+      encryption_key_encrypted TEXT NOT NULL DEFAULT '',
+      webhook_secret_hash_encrypted TEXT NOT NULL DEFAULT '',
+      webhook_url TEXT NOT NULL DEFAULT '',
+      mode TEXT NOT NULL DEFAULT 'test' CHECK(mode IN ('test', 'live')),
+      is_enabled INTEGER NOT NULL DEFAULT 0,
+      bank_name TEXT NOT NULL DEFAULT '',
+      bank_account_name TEXT NOT NULL DEFAULT '',
+      bank_account_number TEXT NOT NULL DEFAULT '',
+      bank_instructions TEXT NOT NULL DEFAULT '',
+      updated_by TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_webhook_events (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL DEFAULT 'flutterwave',
+      event_type TEXT NOT NULL,
+      event_id TEXT,
+      tx_ref TEXT,
+      flw_tx_id TEXT,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      signature_valid INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'received' CHECK(status IN ('received', 'processed', 'ignored', 'failed')),
+      processing_error TEXT,
+      payload TEXT NOT NULL DEFAULT '{}',
+      received_at TEXT NOT NULL,
+      processed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS refunds (
+      id TEXT PRIMARY KEY,
+      reference TEXT NOT NULL UNIQUE,
+      payment_transaction_id TEXT REFERENCES payment_transactions(id) ON DELETE SET NULL,
+      delivery_id TEXT REFERENCES delivery_requests(id) ON DELETE SET NULL,
+      user_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+      amount_ngn REAL NOT NULL CHECK(amount_ngn > 0),
+      destination TEXT NOT NULL CHECK(destination IN ('wallet', 'flutterwave', 'manual')),
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'failed')),
+      provider_refund_id TEXT,
+      initiated_by TEXT NOT NULL,
+      processed_at TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS cash_collections (
+      id TEXT PRIMARY KEY,
+      delivery_id TEXT NOT NULL UNIQUE REFERENCES delivery_requests(id) ON DELETE CASCADE,
+      tracking_code TEXT NOT NULL,
+      payment_transaction_id TEXT REFERENCES payment_transactions(id) ON DELETE SET NULL,
+      customer_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+      rider_id TEXT REFERENCES riders(id) ON DELETE SET NULL,
+      payment_method TEXT NOT NULL CHECK(payment_method IN ('cash', 'bank_transfer')),
+      expected_amount_ngn REAL NOT NULL CHECK(expected_amount_ngn >= 0),
+      collected_amount_ngn REAL NOT NULL DEFAULT 0 CHECK(collected_amount_ngn >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'pending_verification', 'collected_by_rider', 'reconciled', 'disputed')),
+      transfer_reference TEXT,
+      transfer_proof_note TEXT,
+      rider_confirmed_at TEXT,
+      reconciled_by TEXT,
+      reconciled_at TEXT,
+      notes TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_audit_logs (
+      id TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      amount_ngn REAL NOT NULL DEFAULT 0,
+      direction TEXT,
+      reason TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      actor_name TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wallets_user ON wallets(user_id);
+    CREATE INDEX IF NOT EXISTS idx_wallet_tx_wallet ON wallet_transactions(wallet_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_transactions(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_payment_tx_user ON payment_transactions(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_payment_tx_delivery ON payment_transactions(delivery_id);
+    CREATE INDEX IF NOT EXISTS idx_payment_tx_status_method ON payment_transactions(status, payment_method, created_at);
+    CREATE INDEX IF NOT EXISTS idx_webhook_events_tx_ref ON payment_webhook_events(tx_ref, flw_tx_id);
+    CREATE INDEX IF NOT EXISTS idx_cash_collections_status ON cash_collections(status, rider_id);
   `);
+
+  // Safe migrations on delivery_requests for payment method & status
+  const settingsCols = db.prepare('PRAGMA table_info(platform_settings)').all() as Array<{ name: string }>;
+  if (!settingsCols.some((column) => column.name === 'show_delivery_state_selectors')) {
+    db.exec('ALTER TABLE platform_settings ADD COLUMN show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0');
+  }
+  const deliveryCols = db.prepare('PRAGMA table_info(delivery_requests)').all() as Array<{ name: string }>;
+  const colNames = new Set(deliveryCols.map((c) => c.name));
+  if (!colNames.has('payment_method')) {
+    db.exec("ALTER TABLE delivery_requests ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'cash'");
+  }
+  if (!colNames.has('payment_status')) {
+    db.exec("ALTER TABLE delivery_requests ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'pending'");
+  }
+  if (!colNames.has('payment_reference')) {
+    db.exec('ALTER TABLE delivery_requests ADD COLUMN payment_reference TEXT');
+  }
+
+  const nowIso = new Date().toISOString();
+  const seedMethodStmt = db.prepare(`
+    INSERT OR IGNORE INTO payment_methods (code, name, description, is_enabled, sort_order, config, updated_at)
+    VALUES (?, ?, ?, 1, ?, '{}', ?)
+  `);
+  seedMethodStmt.run('wallet', 'SAQO Wallet', 'Pay instantly from your SAQO wallet balance', 1, nowIso);
+  seedMethodStmt.run('flutterwave', 'Pay Online (Flutterwave)', 'Pay securely via card, bank, or USSD with Flutterwave', 2, nowIso);
+  seedMethodStmt.run('cash', 'Cash on Delivery', 'Pay cash directly to the assigned SAQO rider', 3, nowIso);
+  seedMethodStmt.run('bank_transfer', 'Bank Transfer', 'Transfer directly to SAQO bank account with verification', 4, nowIso);
+
+  db.prepare(`
+    INSERT OR IGNORE INTO payment_gateway_settings (
+      id, provider, public_key, secret_key_encrypted, encryption_key_encrypted,
+      webhook_secret_hash_encrypted, webhook_url, mode, is_enabled,
+      bank_name, bank_account_name, bank_account_number, bank_instructions, updated_at
+    ) VALUES (
+      'default', 'flutterwave', '', '', '', '', '', 'test', 0,
+      'Access Bank', 'SAQO Logistics Ltd', '0000000000',
+      'Use your tracking code or payment reference as transfer narration.', ?
+    )
+  `).run(nowIso);
 
   const settingsCount = db.prepare('SELECT COUNT(*) as c FROM platform_settings').get() as { c: number };
   if (settingsCount.c === 0) {
@@ -315,11 +586,25 @@ function bootstrapAdminAccount(): void {
   const adminCount = db
     .prepare("SELECT COUNT(*) as c FROM profiles WHERE role = 'admin'")
     .get() as { c: number };
-  if (adminCount.c > 0) return;
+  if (adminCount.c > 0) {
+    if (process.env.NODE_ENV === 'production') {
+      const admins = db.prepare("SELECT password_hash FROM profiles WHERE role = 'admin' AND account_status = 'active'")
+        .all() as Array<{ password_hash: string }>;
+      if (admins.some((admin) => verifyPassword('saqo1234', admin.password_hash))) {
+        throw new Error('Change the default admin password before starting in production.');
+      }
+    }
+    return;
+  }
 
   const now = new Date().toISOString();
+  const initialPassword = process.env.SAQO_ADMIN_PASSWORD;
+  if (process.env.NODE_ENV === 'production' &&
+      (!initialPassword || initialPassword.length < 16 || initialPassword === 'saqo1234' || !process.env.SAQO_ADMIN_EMAIL?.trim())) {
+    throw new Error('Set SAQO_ADMIN_EMAIL and a unique SAQO_ADMIN_PASSWORD of at least 16 characters for the initial admin.');
+  }
   const adminEmail = (process.env.SAQO_ADMIN_EMAIL || 'admin@saqo.ng').trim().toLowerCase();
-  const adminPass = hashPassword(process.env.SAQO_ADMIN_PASSWORD || 'saqo1234');
+  const adminPass = hashPassword(initialPassword || 'saqo1234');
   const adminName = process.env.SAQO_ADMIN_NAME || 'SAQO Operations Admin';
   const adminPhone = process.env.SAQO_ADMIN_PHONE || '+2348007276000';
 
@@ -334,6 +619,7 @@ export function getPlatformSettings(): PlatformSettings {
   const row = db.prepare('SELECT * FROM platform_settings WHERE id = 1').get() as any;
   return {
     maxActiveParcelsPerRider: row.max_active_parcels_per_rider,
+    showDeliveryStateSelectors: Boolean(row.show_delivery_state_selectors),
     searchRadiusKm: row.search_radius_km,
     offerTimeoutSeconds: row.offer_timeout_seconds,
     baseLocalFeeNgn: row.base_local_fee_ngn,
@@ -429,7 +715,8 @@ export function getDeliveryById(deliveryId: string): DeliveryRequest | null {
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
       r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
-      r.current_lat as rider_lat, r.current_lng as rider_lng
+      CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
+      CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
     JOIN parcels pa ON pa.delivery_id = dr.id
     JOIN customers c ON c.id = dr.customer_id
@@ -443,6 +730,27 @@ export function getDeliveryById(deliveryId: string): DeliveryRequest | null {
   return mapDeliveryRow(row);
 }
 
+export function publicTrackingDelivery(delivery: DeliveryRequest) {
+  const {
+    id, trackingCode, pickupState, pickupAddress, pickupLat, pickupLng,
+    destinationState, destinationAddress, destinationLat, destinationLng,
+    parcelCategory, weightKg, serviceTier, distanceKm, estimatedMinutes, deliveryFeeNgn,
+    status, otpVerified, assignedRiderId, assignedRiderName, assignedRiderVehicle,
+    assignedRiderVerified, assignedRiderLat, assignedRiderLng, updatedAt,
+  } = delivery;
+  return {
+    id, trackingCode, pickupState, pickupAddress, pickupLat, pickupLng,
+    destinationState, destinationAddress, destinationLat, destinationLng,
+    parcelCategory, weightKg, serviceTier, distanceKm, estimatedMinutes, deliveryFeeNgn,
+    status, otpVerified, assignedRiderId, assignedRiderName, assignedRiderVehicle,
+    assignedRiderVerified, assignedRiderLat, assignedRiderLng, updatedAt,
+  };
+}
+
+export function publicTrackingHistory(deliveryId: string) {
+  return getDeliveryHistory(deliveryId).map(({ id, status, createdAt }) => ({ id, status, createdAt }));
+}
+
 export function getDeliveryByTrackingCode(trackingCode: string): DeliveryRequest | null {
   const row = db.prepare(`
     SELECT dr.*,
@@ -450,7 +758,8 @@ export function getDeliveryByTrackingCode(trackingCode: string): DeliveryRequest
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
       r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
-      r.current_lat as rider_lat, r.current_lng as rider_lng
+      CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
+      CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
     JOIN parcels pa ON pa.delivery_id = dr.id
     JOIN customers c ON c.id = dr.customer_id
@@ -471,7 +780,8 @@ export function listDeliveries(filter?: { customerId?: string; riderId?: string 
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
       r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
-      r.current_lat as rider_lat, r.current_lng as rider_lng
+      CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
+      CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
     JOIN parcels pa ON pa.delivery_id = dr.id
     JOIN customers c ON c.id = dr.customer_id
@@ -516,6 +826,9 @@ function mapDeliveryRow(row: any): DeliveryRequest {
     distanceKm: row.distance_km,
     estimatedMinutes: row.estimated_minutes,
     deliveryFeeNgn: row.delivery_fee_ngn,
+    paymentMethod: (row.payment_method || 'cash') as PaymentMethodCode,
+    paymentStatus: (row.payment_status || 'pending') as DeliveryPaymentStatus,
+    paymentReference: row.payment_reference || null,
     deliveryOtp: row.delivery_otp,
     otpVerified: Boolean(row.otp_verified),
     status: row.status as DeliveryStatus,
@@ -545,6 +858,11 @@ export function getDeliveryHistory(deliveryId: string): DeliveryStatusHistoryIte
   }));
 }
 
+export function riderDelivery(delivery: DeliveryRequest | null): DeliveryRequest | undefined {
+  if (!delivery) return undefined;
+  return { ...delivery, deliveryOtp: '' };
+}
+
 export function getAssignmentsForRider(riderId: string): DeliveryAssignment[] {
   const rows = db.prepare(`
     SELECT da.*, dr.tracking_code, rp.full_name as rider_name
@@ -569,13 +887,13 @@ export function getAssignmentsForRider(riderId: string): DeliveryAssignment[] {
     offeredAt: row.offered_at,
     expiresAt: row.expires_at,
     respondedAt: row.responded_at,
-    delivery: getDeliveryById(row.delivery_id) || undefined,
+    delivery: riderDelivery(getDeliveryById(row.delivery_id)),
   }));
 }
 
 export function getAllPayments(): PaymentRecord[] {
   const rows = db.prepare(`
-    SELECT py.*, dr.tracking_code, cp.full_name as customer_name
+    SELECT py.*, dr.tracking_code, dr.payment_method, cp.full_name as customer_name
     FROM payments py
     JOIN delivery_requests dr ON dr.id = py.delivery_id
     JOIN customers c ON c.id = dr.customer_id
@@ -591,6 +909,7 @@ export function getAllPayments(): PaymentRecord[] {
     amountNgn: r.amount_ngn,
     riderPayoutNgn: r.rider_payout_ngn,
     platformFeeNgn: r.platform_fee_ngn,
+    paymentMethod: (r.payment_method || 'cash') as PaymentMethodCode,
     status: r.status,
     createdAt: r.created_at,
   }));

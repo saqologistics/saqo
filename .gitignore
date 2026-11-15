@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+/saqo.db
+/saqo.db-shm
+/saqo.db-wal
+/backups/
+/.vercel/

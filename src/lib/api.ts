@@ -1,4 +1,13 @@
+import { staticPreview } from './deployment';
+
 const TOKEN_KEY = 'saqo_auth_token';
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
 
 export function getStoredToken(): string | null {
   try {
@@ -15,6 +24,9 @@ export function setStoredToken(token: string | null): void {
     } else {
       localStorage.removeItem(TOKEN_KEY);
     }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saqo:auth-changed', { detail: { token } }));
+    }
   } catch {
     // ignore storage quota errors
   }
@@ -24,6 +36,7 @@ export async function apiRequest<T = any>(
   url: string,
   options: RequestInit = {}
 ): Promise<T> {
+  if (staticPreview) throw new ApiError('This feature is unavailable in the SAQO preview.', 503);
   const token = getStoredToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -43,7 +56,10 @@ export async function apiRequest<T = any>(
   }
 
   if (!res.ok) {
-    throw new Error(data?.error || `Request failed (${res.status})`);
+    throw new ApiError(data?.error || `Request failed (${res.status})`, res.status, data?.code);
+  }
+  if (!(res.headers.get('content-type') || '').includes('application/json')) {
+    throw new ApiError('SAQO returned an unexpected response. Please try again.', res.status);
   }
   return data as T;
 }

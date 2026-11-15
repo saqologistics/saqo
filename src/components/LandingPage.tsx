@@ -1,3 +1,4 @@
+import type { publicTrackingDelivery, publicTrackingHistory } from '../server/db';
 import React, { useEffect, useState } from 'react';
 import {
   ArrowRight,
@@ -21,12 +22,12 @@ import heroCourierImg from '../assets/images/hero_saqo_dispatch_1794561358037.jp
 import hubImg from '../assets/images/interstate_parcel_hub_1794561359146.jpg';
 import { useRealtime } from '../hooks/useRealtime';
 import { apiRequest } from '../lib/api';
-import { NIGERIA_STATES } from '../shared/nigeria';
+import { NIGERIA_STATES, resolveAddressCoordinates } from '../shared/nigeria';
 import { formatEta, formatNaira } from '../shared/pricing';
 import { formatDeliveryStatusLabel, getTrackingProgress } from '../shared/tracking';
 import type {
   DeliveryRequest,
-  DeliveryStatusHistoryItem,
+
   PriceQuote,
   Profile,
 } from '../shared/types';
@@ -39,22 +40,28 @@ import { buildWhatsAppUrl } from './WhatsAppWidget';
 export interface QuickDraft {
   pickupState: string;
   pickupAddress: string;
+  pickupCoords?: { lat: number; lng: number } | null;
   destinationState: string;
   destinationAddress: string;
+  destinationCoords?: { lat: number; lng: number } | null;
 }
 
 interface LandingPageProps {
   currentUser: Profile | null;
   whatsappNumber: string;
+  showDeliveryStateSelectors: boolean;
+  whatsAppOrderNumber: string | null;
   initialTrackCode?: string;
   onNavigateAuth: (mode?: 'login' | 'register', role?: 'client' | 'rider', draft?: QuickDraft) => void;
-  onOpenDashboard: () => void;
+  onOpenDashboard: (draft?: QuickDraft) => void;
   onOpenSupportChat?: (trackingCode?: string) => void;
 }
 
 export const LandingPage: React.FC<LandingPageProps> = ({
   currentUser,
   whatsappNumber,
+  showDeliveryStateSelectors,
+  whatsAppOrderNumber,
   initialTrackCode,
   onNavigateAuth,
   onOpenDashboard,
@@ -62,15 +69,21 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 }) => {
   const [heroTab, setHeroTab] = useState<'send' | 'track'>(initialTrackCode ? 'track' : 'send');
   const [pickupState, setPickupState] = useState('Katsina');
-  const [pickupAddress, setPickupAddress] = useState('Kofar Kaura');
+  const [pickupAddress, setPickupAddress] = useState('Kofar Kaura, Katsina');
+  const [pickupCoords, setPickupCoords] = useState<{ lat: number; lng: number } | null>(() =>
+    resolveAddressCoordinates('Katsina', 'Kofar Kaura, Katsina')
+  );
   const [destinationState, setDestinationState] = useState('Katsina');
-  const [destinationAddress, setDestinationAddress] = useState('Batagarawa');
+  const [destinationAddress, setDestinationAddress] = useState('Batagarawa, Katsina');
+  const [destinationCoords, setDestinationCoords] = useState<{ lat: number; lng: number } | null>(() =>
+    resolveAddressCoordinates('Katsina', 'Batagarawa, Katsina')
+  );
   const [quote, setQuote] = useState<PriceQuote | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
 
   const [trackCode, setTrackCode] = useState(initialTrackCode || '');
-  const [trackedDelivery, setTrackedDelivery] = useState<Omit<DeliveryRequest, 'deliveryOtp'> | null>(null);
-  const [trackedHistory, setTrackedHistory] = useState<DeliveryStatusHistoryItem[]>([]);
+  const [trackedDelivery, setTrackedDelivery] = useState<ReturnType<typeof publicTrackingDelivery> | null>(null);
+  const [trackedHistory, setTrackedHistory] = useState<ReturnType<typeof publicTrackingHistory>>([]);
   const [trackError, setTrackError] = useState<string | null>(null);
   const [trackLoading, setTrackLoading] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -84,30 +97,51 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [hubImgFailed, setHubImgFailed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const fetchQuote = async (pState: string, pAddr: string, dState: string, dAddr: string) => {
-    setQuoteLoading(true);
-    try {
-      const res = await apiRequest<PriceQuote>('/api/quote', {
-        method: 'POST',
-        body: JSON.stringify({
-          pickupState: pState,
-          pickupAddress: pAddr,
-          destinationState: dState,
-          destinationAddress: dAddr,
-          weightKg: 1.5,
-        }),
-      });
-      setQuote(res);
-    } catch {
-      // ignore transient error
-    } finally {
-      setQuoteLoading(false);
+  useEffect(() => {
+    if (showDeliveryStateSelectors) return;
+    if (pickupState !== 'Katsina') {
+      setPickupState('Katsina');
+      setPickupAddress('');
+      setPickupCoords(null);
     }
-  };
+    if (destinationState !== 'Katsina') {
+      setDestinationState('Katsina');
+      setDestinationAddress('');
+      setDestinationCoords(null);
+    }
+  }, [showDeliveryStateSelectors, pickupState, destinationState]);
 
   useEffect(() => {
-    fetchQuote(pickupState, pickupAddress, destinationState, destinationAddress);
-  }, [pickupState, destinationState]);
+    setQuote(null);
+    setQuoteLoading(Boolean(pickupCoords && destinationCoords));
+    if (!pickupCoords || !destinationCoords) return;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await apiRequest<PriceQuote>('/api/quote', {
+          method: 'POST',
+          signal: controller.signal,
+          body: JSON.stringify({
+            pickupState, pickupAddress,
+            pickupLat: pickupCoords.lat, pickupLng: pickupCoords.lng,
+            destinationState, destinationAddress,
+            destinationLat: destinationCoords.lat, destinationLng: destinationCoords.lng,
+            weightKg: 1.5,
+          }),
+        });
+        if (!controller.signal.aborted) setQuote(result);
+      } catch {
+        // The next address selection can request a fresh quote.
+      } finally {
+        if (!controller.signal.aborted) setQuoteLoading(false);
+      }
+    }, 200);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [pickupState, pickupAddress, pickupCoords, destinationState, destinationAddress, destinationCoords]);
 
   const handleTrackSearch = async (codeToSearch?: string) => {
     const code = (codeToSearch ?? trackCode).trim();
@@ -121,8 +155,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setOtpError(null);
     try {
       const res = await apiRequest<{
-        delivery: Omit<DeliveryRequest, 'deliveryOtp'>;
-        history: DeliveryStatusHistoryItem[];
+        delivery: ReturnType<typeof publicTrackingDelivery>;
+        history: ReturnType<typeof publicTrackingHistory>;
       }>(`/api/track/${encodeURIComponent(code)}`);
       setTrackedDelivery(res.delivery);
       setTrackedHistory(res.history);
@@ -142,16 +176,15 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   }, [initialTrackCode]);
 
   // Live real-time tracking updates for the currently tracked parcel
-  useRealtime((evt) => {
+  const { connected, sendEvent } = useRealtime((evt) => {
     if (!trackedDelivery) return;
     if (evt.type === 'delivery:updated') {
-      const updated = evt.payload as DeliveryRequest;
+      const updated = evt.payload as ReturnType<typeof publicTrackingDelivery>;
       if (updated?.id === trackedDelivery.id) {
-        const { deliveryOtp: _otp, ...publicDel } = updated;
-        setTrackedDelivery(publicDel);
+        if (updated.status) setTrackedDelivery(updated);
         apiRequest<{
-          delivery: Omit<DeliveryRequest, 'deliveryOtp'>;
-          history: DeliveryStatusHistoryItem[];
+          delivery: ReturnType<typeof publicTrackingDelivery>;
+          history: ReturnType<typeof publicTrackingHistory>;
         }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}`)
           .then((res) => {
             setTrackedDelivery(res.delivery);
@@ -176,6 +209,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     }
   });
 
+  useEffect(() => {
+    if (!connected || !trackedDelivery?.trackingCode) return;
+    sendEvent({ type: 'track', trackingCode: trackedDelivery.trackingCode });
+    return () => sendEvent({ type: 'track', trackingCode: '' });
+  }, [connected, sendEvent, trackedDelivery?.trackingCode]);
+
   const handleConfirmOtp = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!trackedDelivery) return;
@@ -188,8 +227,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setOtpMessage(null);
     try {
       const res = await apiRequest<{
-        delivery: DeliveryRequest;
-        history: DeliveryStatusHistoryItem[];
+        delivery: ReturnType<typeof publicTrackingDelivery>;
+        history: ReturnType<typeof publicTrackingHistory>;
       }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}/confirm-otp`, {
         method: 'POST',
         body: JSON.stringify({ otp: otpInput.trim() }),
@@ -254,7 +293,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             {currentUser ? (
               <button
                 type="button"
-                onClick={onOpenDashboard}
+                onClick={() => onOpenDashboard()}
                 className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold bg-white text-black rounded-lg hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Open Dashboard
@@ -346,8 +385,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     onNavigateAuth('login', 'client', {
                       pickupState,
                       pickupAddress,
+                      pickupCoords,
                       destinationState,
                       destinationAddress,
+                      destinationCoords,
                     });
                   }
                 }}
@@ -393,6 +434,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 </button>
               </div>
 
+              {heroTab === 'send' && whatsAppOrderNumber && (
+                <a href={buildWhatsAppUrl(whatsAppOrderNumber, 'ORDER')} target="_blank" rel="noreferrer"
+                  className="mb-3 inline-flex items-center gap-2 rounded-lg border border-neutral-300 px-3 py-2 text-xs font-semibold hover:bg-neutral-100">
+                  Order on WhatsApp
+                </a>
+              )}
+
               {heroTab === 'send' ? (
                 <div className="space-y-3">
                   <div className="space-y-2.5">
@@ -403,61 +451,88 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                           <span aria-hidden="true" className="w-2 h-2 rounded-full bg-black shrink-0" />
                           <span>From · Pickup</span>
                         </span>
-                        <span className="text-[11px] text-neutral-500">Origin state & address</span>
+                        <span className="text-[11px] text-neutral-500">{showDeliveryStateSelectors ? pickupState : "Katsina State"}</span>
                       </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
-                        <label className="sr-only" htmlFor="hero-pickup-state">
-                          Pickup state
-                        </label>
-                        <select
-                          id="hero-pickup-state"
-                          value={pickupState}
-                          onChange={(e) => setPickupState(e.target.value)}
-                          className="sm:col-span-2 bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
-                        >
-                          {NIGERIA_STATES.map((s) => (
-                            <option key={s.name} value={s.name}>
-                              {s.name}
-                            </option>
-                          ))}
-                        </select>
-                        <div className="sm:col-span-3">
+                      <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-5 gap-2" : undefined}>
+                        {showDeliveryStateSelectors && (
+                          <div className="sm:col-span-2">
+                            <label className="sr-only" htmlFor="hero-pickup-state">
+                              Pickup state
+                            </label>
+                            <select
+                              id="hero-pickup-state"
+                              value={pickupState}
+                              onChange={(e) => {
+                                const nextState = e.target.value;
+                                setPickupState(nextState);
+                                setPickupAddress('');
+                                setPickupCoords(null);
+                              }}
+                              className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
+                            >
+                              <option value="Katsina">Katsina (Live Hub)</option>
+                              {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
+                                <option key={s.name} value={s.name}>
+                                  {s.name}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                        <div className={showDeliveryStateSelectors ? "sm:col-span-3" : undefined}>
                           <label className="sr-only" htmlFor="hero-pickup-address">
                             Pickup address
                           </label>
                           <AddressPickerField
                             id="hero-pickup-address"
                             label="Pickup address"
+                            variant="pickup"
                             stateName={pickupState}
+                            restrictToState={!showDeliveryStateSelectors}
                             value={pickupAddress}
-                            placeholder="Pickup street or landmark"
+                            oppositeAddress={destinationCoords ? destinationAddress : undefined}
+                            selectedCoords={pickupCoords}
+                            placeholder="Type Katsina street, gate, or LGA..."
                             surfaceClassName="bg-white border border-neutral-300"
-                            onChange={setPickupAddress}
+                            onChange={(value) => {
+                              setPickupAddress(value);
+                              setPickupCoords(null);
+                            }}
                             onStateDetected={setPickupState}
-                            onCommit={(val) =>
-                              fetchQuote(pickupState, val, destinationState, destinationAddress)
-                            }
+                            onLocationResolved={(place) => {
+                              setPickupCoords({ lat: place.lat, lng: place.lng });
+                            }}
                           />
                         </div>
                       </div>
                     </div>
 
-                    {/* Swap From & To Divider */}
-                    <div className="flex items-center justify-center -my-1">
+                    {/* Swap From & To Divider (clean spacing, zero overlap) */}
+                    <div className="flex items-center justify-center gap-3 py-2">
+                      <div className="h-px flex-1 bg-neutral-200" />
                       <button
                         type="button"
                         onClick={() => {
-                          setPickupState(destinationState);
-                          setDestinationState(pickupState);
-                          setPickupAddress(destinationAddress);
-                          setDestinationAddress(pickupAddress);
+                          const nextPState = destinationState;
+                          const nextDState = pickupState;
+                          const nextPAddr = destinationAddress;
+                          const nextDAddr = pickupAddress;
+                          const nextPCoords = destinationCoords;
+                          const nextDCoords = pickupCoords;
+                          setPickupState(nextPState);
+                          setDestinationState(nextDState);
+                          setPickupAddress(nextPAddr);
+                          setDestinationAddress(nextDAddr);
+                          setPickupCoords(nextPCoords);
+                          setDestinationCoords(nextDCoords);
                         }}
                         aria-label="Swap From and To locations"
-                        className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white hover:border-black px-3 py-1 rounded-full text-[11px] font-semibold text-neutral-700 hover:text-black cursor-pointer transition-colors"
+                        className="inline-flex items-center gap-1.5 min-h-10 border border-neutral-300 bg-white hover:border-black px-3.5 py-1.5 rounded-full text-[11px] font-semibold text-neutral-700 hover:text-black shadow-xs cursor-pointer transition-colors shrink-0"
                       >
                         <ArrowUpDown className="w-3 h-3" />
                         <span>Swap From / To</span>
                       </button>
+                      <div className="h-px flex-1 bg-neutral-200" />
                     </div>
 
                     {/* TO: DESTINATION */}
@@ -467,54 +542,72 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                           <span aria-hidden="true" className="w-2 h-2 border-2 border-black bg-white shrink-0" />
                           <span>To · Destination</span>
                         </span>
-                        <span className="text-[11px] text-neutral-500">Drop-off state & address</span>
+                        <span className="text-[11px] text-neutral-500">{showDeliveryStateSelectors ? destinationState : "Katsina State"}</span>
                       </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
-                        <label className="sr-only" htmlFor="hero-dest-state">
-                          Destination state
-                        </label>
-                        <select
-                          id="hero-dest-state"
-                          value={destinationState}
-                          onChange={(e) => setDestinationState(e.target.value)}
-                          className="sm:col-span-2 bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
-                        >
-                          {NIGERIA_STATES.map((s) => (
-                            <option key={s.name} value={s.name}>
-                              {s.name}
-                            </option>
-                          ))}
-                        </select>
-                        <div className="sm:col-span-3">
+                      <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-5 gap-2" : undefined}>
+                        {showDeliveryStateSelectors && (
+                          <div className="sm:col-span-2">
+                            <label className="sr-only" htmlFor="hero-dest-state">
+                              Destination state
+                            </label>
+                            <select
+                              id="hero-dest-state"
+                              value={destinationState}
+                              onChange={(e) => {
+                                const nextState = e.target.value;
+                                setDestinationState(nextState);
+                                setDestinationAddress('');
+                                setDestinationCoords(null);
+                              }}
+                              className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
+                            >
+                              <option value="Katsina">Katsina (Live Hub)</option>
+                              {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
+                                <option key={s.name} value={s.name}>
+                                  {s.name}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                        <div className={showDeliveryStateSelectors ? "sm:col-span-3" : undefined}>
                           <label className="sr-only" htmlFor="hero-dest-address">
                             Destination address
                           </label>
                           <AddressPickerField
                             id="hero-dest-address"
                             label="Destination address"
+                            variant="destination"
                             stateName={destinationState}
+                            restrictToState={!showDeliveryStateSelectors}
                             value={destinationAddress}
-                            placeholder="Destination street or landmark"
+                            oppositeAddress={pickupCoords ? pickupAddress : undefined}
+                            selectedCoords={destinationCoords}
+                            placeholder="Type drop-off street, campus, or town..."
                             surfaceClassName="bg-white border border-neutral-300"
-                            onChange={setDestinationAddress}
+                            onChange={(value) => {
+                              setDestinationAddress(value);
+                              setDestinationCoords(null);
+                            }}
                             onStateDetected={setDestinationState}
-                            onCommit={(val) =>
-                              fetchQuote(pickupState, pickupAddress, destinationState, val)
-                            }
+                            onLocationResolved={(place) => {
+                              setDestinationCoords({ lat: place.lat, lng: place.lng });
+                            }}
                           />
                         </div>
                       </div>
                     </div>
                   </div>
 
-                  {quote && (
+                  {quoteLoading && <p role="status" className="text-sm text-neutral-500">Calculating quote…</p>}
+                  {quote && pickupCoords && destinationCoords && (
                     <div className="pt-2 flex flex-wrap items-center justify-between gap-4 border-t border-neutral-200">
                       <div>
                         <p className="text-xs text-neutral-500 font-medium">
                           {quote.targetLabel} · <span className="tabular-nums">{quote.distanceKm} km</span>
                         </p>
                         <p className="font-display font-bold text-lg tabular-nums">
-                          {quoteLoading ? 'Calculating...' : formatNaira(quote.deliveryFeeNgn)}{' '}
+                          {formatNaira(quote.deliveryFeeNgn)}{' '}
                           <span className="text-sm font-normal text-neutral-600">
                             · Est. {formatEta(quote.estimatedMinutes)}
                           </span>
@@ -522,16 +615,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                       </div>
                       <button
                         type="button"
-                        onClick={() =>
-                          currentUser?.role === 'client'
-                            ? onOpenDashboard()
-                            : onNavigateAuth('login', 'client', {
-                                pickupState,
-                                pickupAddress,
-                                destinationState,
-                                destinationAddress,
-                              })
-                        }
+                        onClick={() => {
+                          const draft = { pickupState, pickupAddress, pickupCoords, destinationState, destinationAddress, destinationCoords };
+                          if (currentUser?.role === 'client') onOpenDashboard(draft);
+                          else onNavigateAuth('login', 'client', draft);
+                        }}
                         className="bg-black text-white px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-neutral-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                       >
                         Request Rider
@@ -559,7 +647,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                       type="text"
                       value={trackCode}
                       onChange={(e) => setTrackCode(e.target.value)}
-                      placeholder="e.g. SQ-2026-1234"
+                      placeholder="e.g. SQ-2026-A1B2C3D4E5F6071829"
                       className="flex-1 min-w-0 w-full bg-neutral-100 border border-neutral-200 rounded-lg px-3.5 py-2.5 text-base sm:text-sm font-mono uppercase focus:outline-none focus:ring-2 focus:ring-black"
                     />
                     <button
@@ -581,7 +669,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               {!heroImgFailed ? (
                 <img
                   src={heroCourierImg}
-                  alt="SAQO parcel courier rider dispatching a sealed package in Lagos"
+                  alt="SAQO parcel courier rider dispatching a sealed package in Katsina"
                   referrerPolicy="no-referrer"
                   onError={() => setHeroImgFailed(true)}
                   className="w-full h-full object-cover"
@@ -599,7 +687,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     Request · Assign · Track · Deliver
                   </p>
                   <p className="font-display font-bold text-lg text-white mt-0.5">
-                    37 Nigerian states & FCT connected
+                    One state at a time · Live in Katsina
                   </p>
                 </div>
               </div>
@@ -614,19 +702,19 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           <div>
             <p className="font-display font-bold text-2xl tabular-nums">From ₦600</p>
             <p className="text-sm text-neutral-600 mt-1">
-              Local dispatch from ₦600 with a 15-minute target completion window across Katsina & Nigeria.
+              Local dispatch from ₦600 with a 15-minute target completion window across Katsina State.
             </p>
           </div>
           <div>
             <p className="font-display font-bold text-2xl">Inter-City</p>
             <p className="text-sm text-neutral-600 mt-1">
-              Realistic same-day highway corridors tailored to distance and rider availability.
+              Same-day highway corridors linking Katsina City, Daura, Funtua, Malumfashi, Dutsin-Ma & LGAs.
             </p>
           </div>
           <div>
-            <p className="font-display font-bold text-2xl">Inter-State</p>
+            <p className="font-display font-bold text-2xl">Starting with One State at a Time.</p>
             <p className="text-sm text-neutral-600 mt-1">
-              Lagos, Abuja, Rivers, Kano, Oyo, Enugu, Kaduna & all 36 states plus FCT.
+              Now serving Katsina State.
             </p>
           </div>
           <div>
@@ -760,8 +848,39 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
           {!trackedDelivery ? (
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-              <div className="lg:col-span-7">
-                <LiveNigeriaMap deliveries={[]} riders={[]} heightClass="h-[380px]" />
+              <div className="lg:col-span-7 space-y-2">
+                <LiveNigeriaMap
+                  deliveries={[]}
+                  riders={[]}
+                  previewRoute={
+                    pickupCoords || destinationCoords
+                      ? {
+                          pickupLat: pickupCoords?.lat,
+                          pickupLng: pickupCoords?.lng,
+                          pickupAddress,
+                          pickupState,
+                          destinationLat: destinationCoords?.lat,
+                          destinationLng: destinationCoords?.lng,
+                          destinationAddress,
+                          destinationState,
+                        }
+                      : null
+                  }
+                  heightClass="h-[380px]"
+                />
+                {pickupCoords && destinationCoords && (
+                  <p className="text-xs text-neutral-500 flex items-center justify-between gap-2 px-1">
+                    <span className="truncate">
+                      Selected route: <strong className="text-black">{pickupAddress}</strong> →{' '}
+                      <strong className="text-black">{destinationAddress}</strong>
+                    </span>
+                    {quote && (
+                      <span className="font-mono text-black font-semibold shrink-0 tabular-nums">
+                        {quote.distanceKm} km · {formatNaira(quote.deliveryFeeNgn)}
+                      </span>
+                    )}
+                  </p>
+                )}
               </div>
               <div className="lg:col-span-5 bg-white border border-neutral-200 rounded-xl p-6 sm:p-8 space-y-4">
                 <Package className="w-7 h-7" />
@@ -805,7 +924,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                             riderId: trackedDelivery.assignedRiderId,
                             email: '',
                             fullName: trackedDelivery.assignedRiderName || 'Rider',
-                            phone: trackedDelivery.assignedRiderPhone || '',
+                            phone: '',
                             role: 'rider',
                             accountStatus: 'active',
                             createdAt: '',
@@ -965,14 +1084,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     <Package className="w-4 h-4 mt-0.5 shrink-0" />
                     <div>
                       <p className="text-xs text-neutral-500">
-                        Destination ({trackedDelivery.recipientName})
+                        Destination
                       </p>
                       <p className="font-medium">
                         {trackedDelivery.destinationAddress}, {trackedDelivery.destinationState}
                       </p>
                       <p className="text-xs text-neutral-500 mt-0.5">
-                        {trackedDelivery.parcelCategory} · {trackedDelivery.weightKg} kg ·{' '}
-                        {trackedDelivery.parcelDescription}
+                        {trackedDelivery.parcelCategory} · {trackedDelivery.weightKg} kg
                       </p>
                     </div>
                   </div>
@@ -994,24 +1112,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                           · {trackedDelivery.assignedRiderVehicle}
                         </span>
                       </p>
-                      <p className="font-mono text-xs text-neutral-600 mt-0.5">
-                        {trackedDelivery.assignedRiderPhone}
-                      </p>
                     </div>
-                    {trackedDelivery.assignedRiderPhone && (
-                      <a
-                        href={`tel:${trackedDelivery.assignedRiderPhone}`}
-                        className="inline-flex items-center gap-1.5 border border-black bg-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-neutral-100 shrink-0"
-                      >
-                        <Phone className="w-3.5 h-3.5" />
-                        <span>Call</span>
-                      </a>
-                    )}
                   </div>
                 )}
 
                 {/* Recipient OTP Confirmation */}
-                {trackedDelivery.status !== 'delivered' && trackedDelivery.status !== 'cancelled' ? (
+                {trackedDelivery.status === 'arrived_at_destination' ? (
                   <form onSubmit={handleConfirmOtp} className="border-t border-neutral-200 pt-4 space-y-2.5">
                     <label htmlFor="track-otp-input" className="block text-xs font-semibold">
                       Recipient Delivery OTP Confirmation
@@ -1038,7 +1144,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     {otpError && <p className="text-xs text-black font-medium">{otpError}</p>}
                     {otpMessage && <p className="text-xs text-black font-semibold">{otpMessage}</p>}
                   </form>
-                ) : (
+                ) : ['delivered', 'cancelled'].includes(trackedDelivery.status) && (
                   <div className="flex items-center gap-2 text-sm font-semibold border-t border-neutral-200 pt-4">
                     <CheckCircle2 className="w-4 h-4" />
                     <span>
@@ -1056,7 +1162,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     <ul className="space-y-2.5">
                       {trackedHistory.map((item) => (
                         <li key={item.id} className="text-xs flex justify-between gap-3">
-                          <span className="text-neutral-800">{item.note}</span>
+                          <span className="text-neutral-800">{formatDeliveryStatusLabel(item.status)}</span>
                           <span className="font-mono text-neutral-400 shrink-0 tabular-nums">
                             {new Date(item.createdAt).toLocaleTimeString([], {
                               hour: '2-digit',
@@ -1161,7 +1267,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           <div className="flex items-center gap-4">
             <SaqoLogo />
             <span>·</span>
-            <span>Nigeria Inter-State Parcel Delivery</span>
+            <span>Katsina Parcel Delivery · Starting with One State at a Time</span>
           </div>
           <div className="flex items-center gap-6">
             <a href="#track-section" className="hover:text-black">

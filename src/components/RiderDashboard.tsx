@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   BadgeCheck,
+  Banknote,
   Bell,
   CheckCircle2,
   Clock,
@@ -38,7 +39,6 @@ interface RiderDashboardProps {
 }
 
 const NEXT_STATUS_STEP: Record<string, { status: DeliveryStatus; label: string } | undefined> = {
-  assigned: { status: 'heading_to_pickup', label: 'Start Heading to Pickup' },
   accepted: { status: 'heading_to_pickup', label: 'Heading to Pickup' },
   heading_to_pickup: { status: 'parcel_picked_up', label: 'Confirm Parcel Picked Up' },
   parcel_picked_up: { status: 'in_transit', label: 'Mark In Transit' },
@@ -65,6 +65,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   const [nowTick, setNowTick] = useState(Date.now());
   const [busyAssignmentId, setBusyAssignmentId] = useState<string | null>(null);
   const [busyDeliveryId, setBusyDeliveryId] = useState<string | null>(null);
+  const [confirmingCashId, setConfirmingCashId] = useState<string | null>(null);
   const [otpInputs, setOtpInputs] = useState<Record<string, string>>({});
 
   const loadDashboard = useCallback(async () => {
@@ -107,6 +108,10 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   }, [liveToast]);
 
   useRealtime((evt) => {
+    if (evt.type === 'notifications:refresh' || evt.type === 'connected') {
+      loadDashboard();
+      return;
+    }
     if (evt.type === 'notification:created') {
       const notif = evt.payload as NotificationItem;
       if (notif && notif.userId === profile.id) {
@@ -141,39 +146,56 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
     }
   };
 
-  const handleShareGps = async () => {
-    if (!rider) return;
-    if (!navigator.geolocation) {
+  const [sharingGps, setSharingGps] = useState(false);
+  const handleShareGps = () => {
+    if (sharingGps) {
+      setSharingGps(false);
+      setGpsStatus('GPS sharing paused.');
+    } else if (navigator.geolocation) {
+      setGpsStatus('Reading device GPS…');
+      setSharingGps(true);
+    } else {
       setGpsStatus('Device GPS is not supported in this browser.');
-      return;
     }
-    setGpsStatus('Reading device GPS...');
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
+  };
+
+  useEffect(() => {
+    if (!sharingGps) return;
+    let lastUpdate = 0;
+    const request = new AbortController();
+    const watcher = navigator.geolocation.watchPosition(
+      async ({ coords }) => {
+        if (Date.now() - lastUpdate < 5000 || request.signal.aborted) return;
+        lastUpdate = Date.now();
         try {
-          const res = await apiRequest<{ rider: RiderProfile }>('/api/rider/location', {
+          const result = await apiRequest<{ rider: RiderProfile }>('/api/rider/location', {
             method: 'POST',
-            body: JSON.stringify({
-              lat: pos.coords.latitude,
-              lng: pos.coords.longitude,
-            }),
+            signal: request.signal,
+            body: JSON.stringify({ lat: coords.latitude, lng: coords.longitude }),
           });
-          setRider(res.rider);
-          setGpsStatus('Live device GPS synced.');
-        } catch (err: any) {
-          setGpsStatus(err.message || 'Could not sync GPS coordinates.');
+          if (!request.signal.aborted) {
+            setRider(result.rider);
+            setGpsStatus('Live device GPS synced.');
+          }
+        } catch (error) {
+          if (!request.signal.aborted) {
+            setGpsStatus(error instanceof Error ? error.message : 'Could not sync GPS coordinates.');
+          }
         }
       },
-      (geoErr) => {
-        setGpsStatus(
-          geoErr.code === geoErr.PERMISSION_DENIED
-            ? 'Location permission denied — enable browser GPS to broadcast coordinates.'
-            : 'Unable to acquire device GPS signal right now.'
-        );
+      (error) => {
+        if (error.code === error.PERMISSION_DENIED) setSharingGps(false);
+        setGpsStatus(error.code === error.PERMISSION_DENIED
+          ? 'Location permission denied. Enable GPS to share your location.'
+          : 'Waiting for a device GPS signal…');
       },
-      { enableHighAccuracy: true, timeout: 6000 }
+      { enableHighAccuracy: true, timeout: 10000 }
     );
-  };
+    return () => {
+      request.abort();
+      navigator.geolocation.clearWatch(watcher);
+    };
+  }, [sharingGps]);
 
   const handleRespondOffer = async (assignmentId: string, action: 'accept' | 'reject') => {
     setBusyAssignmentId(assignmentId);
@@ -215,6 +237,22 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
       setError(err.message);
     } finally {
       setBusyDeliveryId(null);
+    }
+  };
+
+  const handleConfirmCashCollected = async (deliveryId: string, expectedAmountNgn: number) => {
+    setConfirmingCashId(deliveryId);
+    setError(null);
+    try {
+      await apiRequest(`/api/rider/deliveries/${deliveryId}/collect-cash`, {
+        method: 'POST',
+        body: JSON.stringify({ collectedAmountNgn: expectedAmountNgn }),
+      });
+      await loadDashboard();
+    } catch (err: any) {
+      setError(err.message || 'Could not confirm cash collection.');
+    } finally {
+      setConfirmingCashId(null);
     }
   };
 
@@ -424,7 +462,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
                   className="inline-flex items-center gap-2 border border-neutral-300 px-4 py-2.5 rounded-lg text-xs font-semibold hover:border-black transition-colors cursor-pointer"
                 >
                   <Navigation className="w-3.5 h-3.5" />
-                  <span>Sync GPS Location</span>
+                  <span>{sharingGps ? 'Pause GPS Sharing' : 'Share Live GPS'}</span>
                 </button>
                 <button
                   type="button"
@@ -509,7 +547,11 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
                             Your Payout: {formatNaira(estPayout)} · Est. {formatEta(d.estimatedMinutes)}
                           </p>
                           <p className="text-[11px] text-neutral-400 font-mono tabular-nums">
-                            Customer Fee: {formatNaira(d.deliveryFeeNgn)}
+                            Customer Fee: {formatNaira(d.deliveryFeeNgn)} ·{' '}
+                            <span className="uppercase text-white">
+                              {(d.paymentMethod || 'cash').replace(/_/g, ' ')}
+                            </span>{' '}
+                            ({(d.paymentStatus || 'pending').replace(/_/g, ' ')})
                           </p>
                         </div>
 
@@ -579,6 +621,10 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
                                 Status:{' '}
                                 <span className="font-semibold text-black">
                                   {del.status.replace(/_/g, ' ')}
+                                </span>
+                                <span className="ml-2 font-mono uppercase text-[10px] px-2 py-0.5 rounded-full bg-neutral-100 border border-neutral-300 text-neutral-800">
+                                  {(del.paymentMethod || 'cash').replace(/_/g, ' ')} ·{' '}
+                                  {(del.paymentStatus || 'pending').replace(/_/g, ' ')}
                                 </span>
                               </p>
                             </div>
@@ -668,6 +714,44 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
                             <p className="text-xs text-neutral-600 pt-1 border-t border-neutral-100">
                               Parcel: {del.parcelDescription} ({del.weightKg} kg)
                             </p>
+
+                            {del.paymentMethod === 'cash' && (
+                              <div className="rounded-lg border border-neutral-300 bg-neutral-50 p-3 flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 text-xs">
+                                  <Banknote className="w-4 h-4 shrink-0" />
+                                  <div>
+                                    <p className="font-bold text-black">
+                                      {del.paymentStatus === 'pending'
+                                        ? `Collect Cash: ${formatNaira(del.deliveryFeeNgn)}`
+                                        : 'Cash Collection Recorded'}
+                                    </p>
+                                    <p className="text-[11px] text-neutral-600">
+                                      Status: {(del.paymentStatus || 'pending').replace(/_/g, ' ').toUpperCase()}
+                                    </p>
+                                  </div>
+                                </div>
+                                {del.paymentStatus === 'pending' && (
+                                  <button
+                                    type="button"
+                                    disabled={confirmingCashId === del.id}
+                                    onClick={() =>
+                                      handleConfirmCashCollected(del.id, del.deliveryFeeNgn)
+                                    }
+                                    className="bg-black text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-neutral-800 disabled:opacity-45 cursor-pointer"
+                                  >
+                                    {confirmingCashId === del.id
+                                      ? 'Recording...'
+                                      : `Confirm Cash Collected (${formatNaira(del.deliveryFeeNgn)})`}
+                                  </button>
+                                )}
+                              </div>
+                            )}
+
+                            {del.paymentMethod === 'bank_transfer' && del.paymentStatus !== 'paid' && (
+                              <div className="rounded-lg border border-neutral-300 bg-neutral-50 p-2.5 text-xs text-neutral-700">
+                                Bank transfer awaiting admin verification ({del.paymentReference || 'No ref'}).
+                              </div>
+                            )}
                           </div>
 
                           {del.status === 'arrived_at_destination' ? (

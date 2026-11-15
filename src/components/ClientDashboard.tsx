@@ -1,13 +1,18 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
+  ArrowDownLeft,
   ArrowUpDown,
+  ArrowUpRight,
   BadgeCheck,
+  Banknote,
   Bell,
+  Building2,
   Check,
   CheckCircle2,
   Clock,
   Copy,
+  CreditCard,
   LogOut,
   MapPin,
   MessageCircle,
@@ -15,12 +20,15 @@ import {
   Package,
   Phone,
   Plus,
+  Receipt,
   RefreshCw,
   Search,
+  Wallet,
 } from 'lucide-react';
 import { apiRequest } from '../lib/api';
+import type { SaqoReceiptData } from '../lib/receipt';
 import { useRealtime } from '../hooks/useRealtime';
-import { NIGERIA_STATES } from '../shared/nigeria';
+import { NIGERIA_STATES, resolveAddressCoordinates } from '../shared/nigeria';
 import { formatEta, formatNaira, isValidNigerianPhone } from '../shared/pricing';
 import { formatDeliveryStatusLabel, getTrackingProgress } from '../shared/tracking';
 import type {
@@ -29,14 +37,20 @@ import type {
   DeliveryStatusHistoryItem,
   NotificationItem,
   ParcelCategory,
+  PaymentGatewayPublicConfig,
+  PaymentMethodCode,
+  PaymentTransaction,
   PriceQuote,
   Profile,
   TicketType,
+  WalletAccount,
+  WalletTransaction,
 } from '../shared/types';
 import { AddressPickerField } from './AddressPickerField';
 import type { QuickDraft } from './LandingPage';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
 import { PWAInstallButton } from './PWAInstallButton';
+import { ReceiptModal } from './ReceiptModal';
 import { SaqoLogo } from './SaqoLogo';
 import { buildWhatsAppUrl } from './WhatsAppWidget';
 
@@ -47,6 +61,7 @@ interface DeliveryWithHistory extends DeliveryRequest {
 interface ClientDashboardProps {
   profile: Profile;
   whatsappNumber: string;
+  showDeliveryStateSelectors: boolean;
   initialDraft?: QuickDraft | null;
   onGoHome: () => void;
   onLogout: () => void;
@@ -64,13 +79,14 @@ const PARCEL_CATEGORIES: ParcelCategory[] = [
 export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   profile,
   whatsappNumber,
+  showDeliveryStateSelectors,
   initialDraft,
   onGoHome,
   onLogout,
 }) => {
-  const [tab, setTab] = useState<'active' | 'send' | 'history' | 'notifications' | 'tickets'>(
-    initialDraft ? 'send' : 'active'
-  );
+  const [tab, setTab] = useState<
+    'active' | 'send' | 'wallet' | 'history' | 'notifications' | 'tickets'
+  >(initialDraft ? 'send' : 'active');
   const [deliveries, setDeliveries] = useState<DeliveryWithHistory[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [tickets, setTickets] = useState<ComplaintRecord[]>([]);
@@ -78,14 +94,51 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Wallet & Payment states
+  const [wallet, setWallet] = useState<WalletAccount | null>(null);
+  const [walletTransactions, setWalletTransactions] = useState<WalletTransaction[]>([]);
+  const [paymentTransactions, setPaymentTransactions] = useState<PaymentTransaction[]>([]);
+  const [paymentConfig, setPaymentConfig] = useState<PaymentGatewayPublicConfig | null>(null);
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<PaymentMethodCode>('wallet');
+  const [transferReference, setTransferReference] = useState('');
+  const [transferProofNote, setTransferProofNote] = useState('');
+  const [checkoutIdempotencyKey, setCheckoutIdempotencyKey] = useState(() => crypto.randomUUID());
+  const [fundIdempotencyKey, setFundIdempotencyKey] = useState(() => crypto.randomUUID());
+  const [walletFilter, setWalletFilter] = useState<'all' | 'credit' | 'debit' | 'pending' | 'failed'>('all');
+  const handledFlwCallbackRef = useRef<string | null>(null);
+  const [fundModalOpen, setFundModalOpen] = useState(false);
+  const [fundAmount, setFundAmount] = useState('5000');
+  const [fundingSubmitting, setFundingSubmitting] = useState(false);
+  const [verifyingRef, setVerifyingRef] = useState<string | null>(null);
+  const [paymentBanner, setPaymentBanner] = useState<string | null>(null);
+  const [activeReceipt, setActiveReceipt] = useState<SaqoReceiptData | null>(null);
+  const [payNowOpenFor, setPayNowOpenFor] = useState(false);
+  const [payingDeliveryId, setPayingDeliveryId] = useState<string | null>(null);
+  const [copiedBank, setCopiedBank] = useState(false);
+
   // Send parcel form
   const [pickupState, setPickupState] = useState(initialDraft?.pickupState || 'Katsina');
   const [pickupAddress, setPickupAddress] = useState(initialDraft?.pickupAddress || '');
+  const [pickupCoords, setPickupCoords] = useState<{ lat: number; lng: number } | null>(
+    initialDraft?.pickupCoords ||
+      (initialDraft?.pickupAddress
+        ? resolveAddressCoordinates(initialDraft.pickupState || 'Katsina', initialDraft.pickupAddress)
+        : null)
+  );
   const [destinationState, setDestinationState] = useState(
     initialDraft?.destinationState || 'Katsina'
   );
   const [destinationAddress, setDestinationAddress] = useState(
     initialDraft?.destinationAddress || ''
+  );
+  const [destinationCoords, setDestinationCoords] = useState<{ lat: number; lng: number } | null>(
+    initialDraft?.destinationCoords ||
+      (initialDraft?.destinationAddress
+        ? resolveAddressCoordinates(
+            initialDraft.destinationState || 'Katsina',
+            initialDraft.destinationAddress
+          )
+        : null)
   );
   const [liveToast, setLiveToast] = useState<NotificationItem | null>(null);
   const [recipientName, setRecipientName] = useState('');
@@ -124,14 +177,28 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
   const loadData = useCallback(async () => {
     try {
-      const [delRes, notifRes, ticketsRes] = await Promise.all([
+      const [delRes, notifRes, ticketsRes, walletRes, payCfgRes] = await Promise.all([
         apiRequest<{ deliveries: DeliveryWithHistory[] }>('/api/client/deliveries'),
         apiRequest<{ notifications: NotificationItem[] }>('/api/notifications'),
         apiRequest<{ tickets: ComplaintRecord[] }>('/api/client/tickets'),
+        apiRequest<{
+          wallet: WalletAccount;
+          walletTransactions: WalletTransaction[];
+          paymentTransactions: PaymentTransaction[];
+        }>('/api/wallet').catch(() => null),
+        apiRequest<PaymentGatewayPublicConfig>('/api/payments/config').catch(() => null),
       ]);
       setDeliveries(delRes.deliveries);
       setNotifications(notifRes.notifications);
       setTickets(ticketsRes.tickets);
+      if (walletRes) {
+        setWallet(walletRes.wallet);
+        setWalletTransactions(walletRes.walletTransactions);
+        setPaymentTransactions(walletRes.paymentTransactions);
+      }
+      if (payCfgRes) {
+        setPaymentConfig(payCfgRes);
+      }
       if (!selectedDeliveryId && delRes.deliveries.length > 0) {
         const firstActive =
           delRes.deliveries.find((d) => !['delivered', 'cancelled'].includes(d.status)) ||
@@ -147,7 +214,94 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   }, [selectedDeliveryId]);
 
   useEffect(() => {
+    if (showDeliveryStateSelectors) return;
+    if (pickupState !== 'Katsina') {
+      setPickupState('Katsina');
+      setPickupAddress('');
+      setPickupCoords(null);
+    }
+    if (destinationState !== 'Katsina') {
+      setDestinationState('Katsina');
+      setDestinationAddress('');
+      setDestinationCoords(null);
+    }
+  }, [showDeliveryStateSelectors, pickupState, destinationState]);
+
+  useEffect(() => {
     loadData();
+  }, [loadData]);
+
+  const isMethodEnabled = useCallback(
+    (code: PaymentMethodCode): boolean => {
+      if (code === 'flutterwave' && paymentConfig && !paymentConfig.isEnabled) return false;
+      const cfg = paymentConfig?.methods?.find((m) => m.code === code);
+      return cfg ? cfg.isEnabled : true;
+    },
+    [paymentConfig]
+  );
+
+  useEffect(() => {
+    if (!paymentConfig) return;
+    if (!isMethodEnabled(selectedPaymentMethod)) {
+      const fallback = (['wallet', 'flutterwave', 'cash', 'bank_transfer'] as PaymentMethodCode[]).find(
+        isMethodEnabled
+      );
+      if (fallback) setSelectedPaymentMethod(fallback);
+    }
+  }, [paymentConfig, selectedPaymentMethod, isMethodEnabled]);
+
+  useEffect(() => {
+    if (fundModalOpen) {
+      setFundIdempotencyKey(crypto.randomUUID());
+    }
+  }, [fundModalOpen]);
+
+  // Verify Flutterwave redirect callback automatically on return
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const hasCallback = params.get('flw_callback') === '1' || Boolean(params.get('tx_ref'));
+    const txRef = params.get('tx_ref');
+    const transactionId = params.get('transaction_id');
+    const flwStatus = params.get('status');
+    if (!hasCallback || (!txRef && !transactionId)) return;
+
+    const callbackSig = `${txRef || ''}:${transactionId || ''}:${flwStatus || ''}`;
+    if (handledFlwCallbackRef.current === callbackSig) return;
+    handledFlwCallbackRef.current = callbackSig;
+
+    if (flwStatus === 'cancelled' && !transactionId) {
+      window.history.replaceState({}, '', '/');
+      setTab('wallet');
+      setPaymentBanner('Flutterwave checkout was cancelled before completion.');
+      return;
+    }
+
+    setTab('wallet');
+    setVerifyingRef(txRef || transactionId || 'callback');
+    apiRequest<{ paymentTransaction: PaymentTransaction }>('/api/wallet/verify', {
+      method: 'POST',
+      body: JSON.stringify({ txRef, transactionId }),
+    })
+      .then((res) => {
+        window.history.replaceState({}, '', '/');
+        const st = res.paymentTransaction.status;
+        if (st === 'paid') {
+          setPaymentBanner(
+            `Payment ${res.paymentTransaction.reference} verified (${formatNaira(res.paymentTransaction.amountNgn)}).`
+          );
+        } else {
+          setPaymentBanner(
+            `Payment ${res.paymentTransaction.reference} status: ${st.replace(/_/g, ' ')}.`
+          );
+        }
+        return loadData();
+      })
+      .catch((err: any) => {
+        setError(err?.message || 'Unable to verify Flutterwave transaction yet.');
+      })
+      .finally(() => {
+        setVerifyingRef(null);
+      });
   }, [loadData]);
 
   useEffect(() => {
@@ -157,6 +311,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   }, [liveToast]);
 
   useRealtime((evt) => {
+    if (evt.type === 'notifications:refresh' || evt.type === 'connected') {
+      loadData();
+      return;
+    }
     if (evt.type === 'notification:created') {
       const notif = evt.payload as NotificationItem;
       if (notif && notif.userId === profile.id) {
@@ -171,7 +329,11 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       evt.type === 'delivery:updated' ||
       evt.type === 'rider:location' ||
       evt.type === 'notification:created' ||
-      evt.type === 'complaint:updated'
+      evt.type === 'complaint:updated' ||
+      evt.type === 'wallet:updated' ||
+      evt.type === 'payment:updated' ||
+      evt.type === 'cash_collection:updated' ||
+      evt.type === 'gateway:updated'
     ) {
       loadData();
     }
@@ -179,34 +341,61 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
   // Live quote calculation
   useEffect(() => {
-    let active = true;
+    setQuote(null);
+    if (!pickupCoords || !destinationCoords) return;
+    const controller = new AbortController();
     const timer = setTimeout(async () => {
       try {
         const q = await apiRequest<PriceQuote>('/api/quote', {
           method: 'POST',
+          signal: controller.signal,
           body: JSON.stringify({
             pickupState,
             pickupAddress: pickupAddress || pickupState,
+            pickupLat: pickupCoords?.lat,
+            pickupLng: pickupCoords?.lng,
             destinationState,
             destinationAddress: destinationAddress || destinationState,
+            destinationLat: destinationCoords?.lat,
+            destinationLng: destinationCoords?.lng,
             weightKg: Number(weightKg) || 1,
           }),
         });
-        if (active) setQuote(q);
+        if (!controller.signal.aborted) setQuote(q);
       } catch {
         // ignore transient quote error
       }
     }, 200);
     return () => {
-      active = false;
+      controller.abort();
       clearTimeout(timer);
     };
-  }, [pickupState, pickupAddress, destinationState, destinationAddress, weightKg]);
+  }, [
+    pickupState,
+    pickupAddress,
+    pickupCoords,
+    destinationState,
+    destinationAddress,
+    destinationCoords,
+    weightKg,
+  ]);
 
   const handleCreateDelivery = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!pickupCoords || !destinationCoords) {
+      setError('Select a pickup and a destination from the address suggestions.');
+      return;
+    }
+    if (pickupCoords.lat === destinationCoords.lat && pickupCoords.lng === destinationCoords.lng) {
+      setError('Choose different pickup and destination locations.');
+      return;
+    }
     if (!isValidNigerianPhone(recipientPhone)) {
       setError('Please enter a valid recipient phone number (at least 10 digits).');
+      return;
+    }
+    if (selectedPaymentMethod === 'bank_transfer' && !transferReference.trim()) {
+      setError('Please enter your bank transfer reference or session ID before submitting.');
       return;
     }
     setSubmitting(true);
@@ -216,32 +405,137 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       const res = await apiRequest<{
         delivery: DeliveryWithHistory;
         history: DeliveryStatusHistoryItem[];
+        checkoutUrl?: string | null;
       }>('/api/deliveries', {
         method: 'POST',
         body: JSON.stringify({
           pickupState,
           pickupAddress,
+          pickupLat: pickupCoords.lat,
+          pickupLng: pickupCoords.lng,
           destinationState,
           destinationAddress,
+          destinationLat: destinationCoords.lat,
+          destinationLng: destinationCoords.lng,
           recipientName,
           recipientPhone,
           parcelCategory,
           parcelDescription,
           weightKg: Number(weightKg) || 1,
+          paymentMethod: selectedPaymentMethod,
+          idempotencyKey: checkoutIdempotencyKey,
+          transferReference: selectedPaymentMethod === 'bank_transfer' ? transferReference.trim() : undefined,
+          transferProofNote: selectedPaymentMethod === 'bank_transfer' ? transferProofNote.trim() : undefined,
         }),
       });
+      setCheckoutIdempotencyKey(crypto.randomUUID());
       setSelectedDeliveryId(res.delivery.id);
       setPickupAddress('');
+      setPickupCoords(null);
       setDestinationAddress('');
+      setDestinationCoords(null);
       setRecipientName('');
       setRecipientPhone('');
       setParcelDescription('');
+      setTransferReference('');
+      setTransferProofNote('');
+      if (selectedPaymentMethod === 'flutterwave' && res.checkoutUrl) {
+        window.location.href = res.checkoutUrl;
+        return;
+      }
       setTab('active');
       await loadData();
     } catch (err: any) {
+      if (err?.code === 'INSUFFICIENT_WALLET_BALANCE') {
+        setFundAmount(String(Math.max(1000, Math.ceil((quote?.deliveryFeeNgn || 1000) - (wallet?.balanceNgn || 0)))));
+      }
       setError(err.message || 'Could not create parcel request.');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleFundWallet = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const numericAmount = Number(fundAmount);
+    if (!Number.isFinite(numericAmount) || numericAmount < 100) {
+      setError('Minimum wallet funding amount is ₦100.');
+      return;
+    }
+    setFundingSubmitting(true);
+    setError(null);
+    try {
+      const res = await apiRequest<{ checkoutUrl?: string; paymentTransaction: PaymentTransaction }>(
+        '/api/wallet/fund/initialize',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            amountNgn: numericAmount,
+            idempotencyKey: `fund:${profile.id}:${numericAmount}:${fundIdempotencyKey}`,
+          }),
+        }
+      );
+      if (res.checkoutUrl) {
+        window.location.href = res.checkoutUrl;
+        return;
+      }
+      setFundIdempotencyKey(crypto.randomUUID());
+      setFundModalOpen(false);
+      await loadData();
+    } catch (err: any) {
+      setError(err.message || 'Failed to initialize Flutterwave wallet funding.');
+    } finally {
+      setFundingSubmitting(false);
+    }
+  };
+
+  const handleVerifyPayment = async (tx: PaymentTransaction) => {
+    setVerifyingRef(tx.reference);
+    setError(null);
+    try {
+      const res = await apiRequest<{ paymentTransaction: PaymentTransaction }>('/api/wallet/verify', {
+        method: 'POST',
+        body: JSON.stringify({ txRef: tx.reference, transactionId: tx.providerTxId }),
+      });
+      setPaymentBanner(
+        `Transaction ${res.paymentTransaction.reference} status: ${res.paymentTransaction.status.replace(/_/g, ' ')}.`
+      );
+      await loadData();
+    } catch (err: any) {
+      setError(err.message || 'Could not verify transaction with Flutterwave.');
+    } finally {
+      setVerifyingRef(null);
+    }
+  };
+
+  const handlePayExistingDelivery = async (
+    deliveryId: string,
+    method: 'wallet' | 'flutterwave'
+  ) => {
+    setPayingDeliveryId(deliveryId);
+    setError(null);
+    try {
+      const res = await apiRequest<{ checkoutUrl?: string | null; delivery?: DeliveryRequest }>(
+        `/api/deliveries/${deliveryId}/pay`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            paymentMethod: method,
+            idempotencyKey: `pay:${deliveryId}:${method}:${crypto.randomUUID()}`,
+          }),
+        }
+      );
+      if (method === 'flutterwave' && res.checkoutUrl) {
+        window.location.href = res.checkoutUrl;
+        return;
+      }
+      setPaymentBanner('Delivery payment completed from your SAQO wallet.');
+      setPayNowOpenFor(false);
+      await loadData();
+    } catch (err: any) {
+      setError(err.message || 'Unable to process delivery payment.');
+    } finally {
+      setPayingDeliveryId(null);
     }
   };
 
@@ -301,8 +595,18 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const handleRepeatDeliveryRoute = (d: DeliveryWithHistory) => {
     setPickupState(d.pickupState);
     setPickupAddress(d.pickupAddress);
+    setPickupCoords(
+      typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number'
+        ? { lat: d.pickupLat, lng: d.pickupLng }
+        : resolveAddressCoordinates(d.pickupState, d.pickupAddress)
+    );
     setDestinationState(d.destinationState);
     setDestinationAddress(d.destinationAddress);
+    setDestinationCoords(
+      typeof d.destinationLat === 'number' && typeof d.destinationLng === 'number'
+        ? { lat: d.destinationLat, lng: d.destinationLng }
+        : resolveAddressCoordinates(d.destinationState, d.destinationAddress)
+    );
     setRecipientName(d.recipientName);
     setRecipientPhone(d.recipientPhone);
     setTab('send');
@@ -422,6 +726,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           </button>
           <button
             type="button"
+            onClick={() => setTab('wallet')}
+            className={`whitespace-nowrap shrink-0 cursor-pointer ${
+              tab === 'wallet' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
+            }`}
+          >
+            Wallet
+          </button>
+          <button
+            type="button"
             onClick={() => setTab('history')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
               tab === 'history' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
@@ -454,6 +767,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         </nav>
 
         <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => setTab('wallet')}
+            className="inline-flex items-center gap-1.5 border border-white/25 bg-white/10 text-white px-3 py-1.5 rounded-lg text-xs font-mono font-bold tabular-nums hover:bg-white/20 transition-colors cursor-pointer"
+            title="Open SAQO Wallet"
+          >
+            <Wallet className="w-3.5 h-3.5" />
+            <span>{formatNaira(wallet?.balanceNgn ?? 0)}</span>
+          </button>
           <PWAInstallButton inverted compact />
           <button
             type="button"
@@ -522,6 +844,14 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             </button>
           </div>
         )}
+        {paymentBanner && (
+          <div role="status" className="mb-6 bg-black text-white rounded-xl p-4 text-sm font-medium flex items-center justify-between">
+            <span>{paymentBanner}</span>
+            <button type="button" onClick={() => setPaymentBanner(null)} className="text-xs underline cursor-pointer">
+              Dismiss
+            </button>
+          </div>
+        )}
         {issueSaved && (
           <div className="mb-6 bg-black text-white rounded-xl p-4 text-sm font-medium flex items-center justify-between">
             <span>{issueSaved}</span>
@@ -552,15 +882,17 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="text-xs font-semibold text-neutral-500">01. Route: From &amp; To</p>
-                  {deliveries.length > 0 && (
+                  {deliveries.length > 0 && (showDeliveryStateSelectors || (deliveries[0].pickupState === 'Katsina' && deliveries[0].destinationState === 'Katsina')) && (
                     <button
                       type="button"
                       onClick={() => {
                         const last = deliveries[0];
                         setPickupState(last.pickupState);
                         setPickupAddress(last.pickupAddress);
+                        setPickupCoords({ lat: last.pickupLat, lng: last.pickupLng });
                         setDestinationState(last.destinationState);
                         setDestinationAddress(last.destinationAddress);
+                        setDestinationCoords({ lat: last.destinationLat, lng: last.destinationLng });
                         setRecipientName(last.recipientName);
                         setRecipientPhone(last.recipientPhone);
                       }}
@@ -580,58 +912,87 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                     </span>
                     <span className="text-[11px] text-neutral-500">Where rider collects parcel</span>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div>
-                      <label htmlFor="send-pickup-state" className="block text-xs font-semibold mb-1">
-                        Pickup State
-                      </label>
-                      <select
-                        id="send-pickup-state"
-                        value={pickupState}
-                        onChange={(e) => setPickupState(e.target.value)}
-                        className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black"
-                      >
-                        {NIGERIA_STATES.map((s) => (
-                          <option key={s.name} value={s.name}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="sm:col-span-2">
+                  <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-3 gap-3" : undefined}>
+                    {showDeliveryStateSelectors && (
+                      <div>
+                        <label htmlFor="send-pickup-state" className="block text-xs font-semibold mb-1">
+                          Pickup State
+                        </label>
+                        <select
+                          id="send-pickup-state"
+                          value={pickupState}
+                          onChange={(e) => {
+                            const nextState = e.target.value;
+                            setPickupState(nextState);
+                            setPickupAddress('');
+                            setPickupCoords(null);
+                          }}
+                          className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black"
+                        >
+                          <option value="Katsina">Katsina (Live Hub)</option>
+                          {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
+                            <option key={s.name} value={s.name}>
+                              {s.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className={showDeliveryStateSelectors ? "sm:col-span-2" : undefined}>
                       <label htmlFor="send-pickup-addr" className="block text-xs font-semibold mb-1">
                         Pickup Street / Landmark
                       </label>
                       <AddressPickerField
                         id="send-pickup-addr"
                         label="Pickup Address"
+                        variant="pickup"
                         stateName={pickupState}
+                        restrictToState={!showDeliveryStateSelectors}
                         value={pickupAddress}
+                        oppositeAddress={destinationCoords ? destinationAddress : undefined}
+                        selectedCoords={pickupCoords}
                         required
                         surfaceClassName="bg-white border border-neutral-300"
-                        placeholder="e.g. Kofar Kaura"
-                        onChange={setPickupAddress}
+                        placeholder="Type Katsina street, gate, or LGA..."
+                        onChange={(val) => {
+                          setPickupAddress(val);
+                          setPickupCoords(null);
+                        }}
                         onStateDetected={(st) => setPickupState(st)}
+                        onLocationResolved={(place) =>
+                          setPickupCoords({ lat: place.lat, lng: place.lng })
+                        }
                       />
                     </div>
                   </div>
                 </div>
 
-                {/* Swap From & To */}
-                <div className="flex items-center justify-center -my-1">
+                {/* Swap From & To (clean hairline divider, zero overlap) */}
+                <div className="flex items-center justify-center gap-3 py-2">
+                  <div className="h-px flex-1 bg-neutral-200" />
                   <button
                     type="button"
                     onClick={() => {
-                      setPickupState(destinationState);
-                      setDestinationState(pickupState);
-                      setPickupAddress(destinationAddress);
-                      setDestinationAddress(pickupAddress);
+                      const nextPState = destinationState;
+                      const nextDState = pickupState;
+                      const nextPAddr = destinationAddress;
+                      const nextDAddr = pickupAddress;
+                      const nextPCoords = destinationCoords;
+                      const nextDCoords = pickupCoords;
+                      setPickupState(nextPState);
+                      setDestinationState(nextDState);
+                      setPickupAddress(nextPAddr);
+                      setDestinationAddress(nextDAddr);
+                      setPickupCoords(nextPCoords);
+                      setDestinationCoords(nextDCoords);
                     }}
-                    className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white hover:border-black px-3.5 py-1.5 rounded-full text-xs font-semibold text-neutral-700 hover:text-black cursor-pointer transition-colors"
+                    aria-label="Swap From and To locations"
+                    className="inline-flex items-center gap-1.5 min-h-10 border border-neutral-300 bg-white hover:border-black px-3.5 py-1.5 rounded-full text-xs font-semibold text-neutral-700 hover:text-black shadow-xs cursor-pointer transition-colors shrink-0"
                   >
                     <ArrowUpDown className="w-3.5 h-3.5" />
                     <span>Swap From &amp; To</span>
                   </button>
+                  <div className="h-px flex-1 bg-neutral-200" />
                 </div>
 
                 {/* TO — DELIVERY DESTINATION */}
@@ -643,38 +1004,56 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                     </span>
                     <span className="text-[11px] text-neutral-500">Where parcel will be delivered</span>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div>
-                      <label htmlFor="send-dest-state" className="block text-xs font-semibold mb-1">
-                        Destination State
-                      </label>
-                      <select
-                        id="send-dest-state"
-                        value={destinationState}
-                        onChange={(e) => setDestinationState(e.target.value)}
-                        className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black"
-                      >
-                        {NIGERIA_STATES.map((s) => (
-                          <option key={s.name} value={s.name}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="sm:col-span-2">
+                  <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-3 gap-3" : undefined}>
+                    {showDeliveryStateSelectors && (
+                      <div>
+                        <label htmlFor="send-dest-state" className="block text-xs font-semibold mb-1">
+                          Destination State
+                        </label>
+                        <select
+                          id="send-dest-state"
+                          value={destinationState}
+                          onChange={(e) => {
+                            const nextState = e.target.value;
+                            setDestinationState(nextState);
+                            setDestinationAddress('');
+                            setDestinationCoords(null);
+                          }}
+                          className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black"
+                        >
+                          <option value="Katsina">Katsina (Live Hub)</option>
+                          {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
+                            <option key={s.name} value={s.name}>
+                              {s.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className={showDeliveryStateSelectors ? "sm:col-span-2" : undefined}>
                       <label htmlFor="send-dest-addr" className="block text-xs font-semibold mb-1">
                         Destination Street / Landmark
                       </label>
                       <AddressPickerField
                         id="send-dest-addr"
                         label="Destination Address"
+                        variant="destination"
                         stateName={destinationState}
+                        restrictToState={!showDeliveryStateSelectors}
                         value={destinationAddress}
+                        oppositeAddress={pickupCoords ? pickupAddress : undefined}
+                        selectedCoords={destinationCoords}
                         required
                         surfaceClassName="bg-white border border-neutral-300"
-                        placeholder="e.g. Batagarawa"
-                        onChange={setDestinationAddress}
+                        placeholder="Type drop-off street, campus, or town..."
+                        onChange={(val) => {
+                          setDestinationAddress(val);
+                          setDestinationCoords(null);
+                        }}
                         onStateDetected={(st) => setDestinationState(st)}
+                        onLocationResolved={(place) =>
+                          setDestinationCoords({ lat: place.lat, lng: place.lng })
+                        }
                       />
                     </div>
                   </div>
@@ -769,12 +1148,258 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 </div>
               </div>
 
+              {/* 04. Payment Method Selection */}
+              <div className="space-y-4 border-t border-neutral-200 pt-5">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold text-neutral-500">04. Payment Method</p>
+                  <span className="font-mono text-xs text-neutral-600 tabular-nums">
+                    Wallet: {formatNaira(wallet?.balanceNgn ?? 0)}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {/* A. Wallet */}
+                  <button
+                    type="button"
+                    disabled={!isMethodEnabled('wallet')}
+                    onClick={() => setSelectedPaymentMethod('wallet')}
+                    className={`text-left rounded-xl border p-3.5 transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                      selectedPaymentMethod === 'wallet'
+                        ? 'border-black bg-black text-white shadow-sm'
+                        : 'border-neutral-200 bg-white text-black hover:border-neutral-400'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <Wallet className="w-4 h-4" />
+                      <span className="font-mono text-[10px] uppercase tracking-wider opacity-80">
+                        {!isMethodEnabled('wallet') ? 'Off' : 'Instant'}
+                      </span>
+                    </div>
+                    <p className="font-display font-bold text-sm mt-2">SAQO Wallet</p>
+                    <p className="font-mono text-[11px] mt-0.5 tabular-nums opacity-85">
+                      Bal: {formatNaira(wallet?.balanceNgn ?? 0)}
+                    </p>
+                  </button>
+
+                  {/* B. Flutterwave Direct */}
+                  <button
+                    type="button"
+                    disabled={!isMethodEnabled('flutterwave')}
+                    onClick={() => setSelectedPaymentMethod('flutterwave')}
+                    className={`text-left rounded-xl border p-3.5 transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                      selectedPaymentMethod === 'flutterwave'
+                        ? 'border-black bg-black text-white shadow-sm'
+                        : 'border-neutral-200 bg-white text-black hover:border-neutral-400'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <CreditCard className="w-4 h-4" />
+                      <span className="font-mono text-[10px] uppercase tracking-wider opacity-80">
+                        {!isMethodEnabled('flutterwave') ? 'Off' : 'Card / USSD'}
+                      </span>
+                    </div>
+                    <p className="font-display font-bold text-sm mt-2">Pay Online</p>
+                    <p className="text-[11px] mt-0.5 opacity-80">Flutterwave Direct</p>
+                  </button>
+
+                  {/* C. Cash / Bank Transfer */}
+                  <button
+                    type="button"
+                    disabled={!isMethodEnabled('cash') && !isMethodEnabled('bank_transfer')}
+                    onClick={() =>
+                      setSelectedPaymentMethod(
+                        selectedPaymentMethod === 'bank_transfer' && isMethodEnabled('bank_transfer')
+                          ? 'bank_transfer'
+                          : isMethodEnabled('cash')
+                            ? 'cash'
+                            : 'bank_transfer'
+                      )
+                    }
+                    className={`text-left rounded-xl border p-3.5 transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                      selectedPaymentMethod === 'cash' || selectedPaymentMethod === 'bank_transfer'
+                        ? 'border-black bg-black text-white shadow-sm'
+                        : 'border-neutral-200 bg-white text-black hover:border-neutral-400'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <Banknote className="w-4 h-4" />
+                      <span className="font-mono text-[10px] uppercase tracking-wider opacity-80">
+                        {!isMethodEnabled('cash') && !isMethodEnabled('bank_transfer') ? 'Off' : 'Manual'}
+                      </span>
+                    </div>
+                    <p className="font-display font-bold text-sm mt-2">Cash / Transfer</p>
+                    <p className="text-[11px] mt-0.5 opacity-80">Rider or Bank</p>
+                  </button>
+                </div>
+
+                {/* Insufficient Wallet Balance Warning */}
+                {selectedPaymentMethod === 'wallet' &&
+                  quote &&
+                  (wallet?.balanceNgn ?? 0) < quote.deliveryFeeNgn && (
+                    <div className="rounded-xl border border-neutral-900 bg-neutral-100 p-3.5 flex flex-wrap items-center justify-between gap-3">
+                      <div className="text-xs">
+                        <p className="font-bold text-black">Insufficient wallet balance</p>
+                        <p className="text-neutral-700 mt-0.5">
+                          Fee is {formatNaira(quote.deliveryFeeNgn)}, available balance is{' '}
+                          {formatNaira(wallet?.balanceNgn ?? 0)}. Fund your wallet or pick another method.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFundAmount(
+                            String(Math.max(1000, Math.ceil(quote.deliveryFeeNgn - (wallet?.balanceNgn ?? 0))))
+                          );
+                          setFundModalOpen(true);
+                        }}
+                        className="bg-black text-white px-3.5 py-2 rounded-lg text-xs font-semibold hover:bg-neutral-800 cursor-pointer shrink-0"
+                      >
+                        Fund Wallet
+                      </button>
+                    </div>
+                  )}
+
+                {/* Cash vs Bank Transfer sub-selector */}
+                {(selectedPaymentMethod === 'cash' || selectedPaymentMethod === 'bank_transfer') && (
+                  <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 space-y-3">
+                    <div className="grid grid-cols-2 gap-2 p-1 bg-white border border-neutral-200 rounded-lg">
+                      <button
+                        type="button"
+                        disabled={!isMethodEnabled('cash')}
+                        onClick={() => setSelectedPaymentMethod('cash')}
+                        className={`py-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                          selectedPaymentMethod === 'cash'
+                            ? 'bg-black text-white'
+                            : 'text-neutral-600 hover:text-black'
+                        }`}
+                      >
+                        <Banknote className="w-3.5 h-3.5" />
+                        <span>Cash to Rider</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!isMethodEnabled('bank_transfer')}
+                        onClick={() => setSelectedPaymentMethod('bank_transfer')}
+                        className={`py-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                          selectedPaymentMethod === 'bank_transfer'
+                            ? 'bg-black text-white'
+                            : 'text-neutral-600 hover:text-black'
+                        }`}
+                      >
+                        <Building2 className="w-3.5 h-3.5" />
+                        <span>Bank Transfer</span>
+                      </button>
+                    </div>
+
+                    {selectedPaymentMethod === 'cash' ? (
+                      <p className="text-xs text-neutral-600">
+                        Pay cash directly to the assigned SAQO rider upon pickup or delivery. Rider confirmation will be recorded for admin reconciliation.
+                      </p>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="rounded-lg border border-neutral-300 bg-white p-3 space-y-1.5 text-xs">
+                          <div className="flex items-center justify-between">
+                            <span className="text-neutral-500">Bank</span>
+                            <span className="font-semibold text-black">
+                              {paymentConfig?.bankDetails.bankName || 'Access Bank'}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-neutral-500">Account Name</span>
+                            <span className="font-semibold text-black">
+                              {paymentConfig?.bankDetails.accountName || 'SAQO Logistics Ltd'}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-neutral-500">Account Number</span>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono font-bold text-black">
+                                {paymentConfig?.bankDetails.accountNumber || '0000000000'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    await navigator.clipboard?.writeText(
+                                      paymentConfig?.bankDetails.accountNumber || '0000000000'
+                                    );
+                                    setCopiedBank(true);
+                                    setTimeout(() => setCopiedBank(false), 1800);
+                                  } catch {
+                                    // Ignore clipboard permission errors
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1 rounded border border-neutral-300 px-2 py-0.5 text-[10px] font-semibold hover:border-black cursor-pointer"
+                              >
+                                {copiedBank ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                                <span>{copiedBank ? 'Copied' : 'Copy'}</span>
+                              </button>
+                            </div>
+                          </div>
+                          {paymentConfig?.bankDetails.instructions && (
+                            <p className="text-[11px] text-neutral-500 pt-1 border-t border-neutral-100">
+                              {paymentConfig.bankDetails.instructions}
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label htmlFor="bank-ref" className="block text-xs font-semibold mb-1">
+                              Transfer Reference / Session ID *
+                            </label>
+                            <input
+                              id="bank-ref"
+                              type="text"
+                              required={selectedPaymentMethod === 'bank_transfer'}
+                              value={transferReference}
+                              onChange={(e) => setTransferReference(e.target.value)}
+                              placeholder="e.g. TRF-99881234"
+                              className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-xs font-mono"
+                            />
+                          </div>
+                          <div>
+                            <label htmlFor="bank-note" className="block text-xs font-semibold mb-1">
+                              Sender Bank / Proof Note (optional)
+                            </label>
+                            <input
+                              id="bank-note"
+                              type="text"
+                              value={transferProofNote}
+                              onChange={(e) => setTransferProofNote(e.target.value)}
+                              placeholder="e.g. Sent from GTBank"
+                              className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-xs"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <button
                 type="submit"
-                disabled={submitting}
-                className="hidden lg:block w-full bg-black text-white py-3.5 rounded-lg text-sm font-bold hover:bg-neutral-800 transition-colors cursor-pointer"
+                disabled={
+                  submitting ||
+                  !pickupCoords ||
+                  !destinationCoords ||
+                  !isMethodEnabled(selectedPaymentMethod) ||
+                  Boolean(
+                    selectedPaymentMethod === 'wallet' &&
+                      quote &&
+                      (wallet?.balanceNgn ?? 0) < quote.deliveryFeeNgn
+                  )
+                }
+                className="hidden lg:block w-full bg-black text-white py-3.5 rounded-lg text-sm font-bold hover:bg-neutral-800 disabled:opacity-45 transition-colors cursor-pointer"
               >
-                {submitting ? 'Dispatching Rider...' : 'Confirm & Request Rider'}
+                {submitting
+                  ? 'Processing Request...'
+                  : selectedPaymentMethod === 'wallet'
+                    ? 'Pay from Wallet & Dispatch Rider'
+                    : selectedPaymentMethod === 'flutterwave'
+                      ? 'Continue to Flutterwave Payment'
+                      : 'Confirm & Request Rider'}
               </button>
 
               {/* Sticky Native Mobile Fare & Dispatch Bar */}
@@ -784,30 +1409,64 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                     {pickupState} → {destinationState}
                   </p>
                   <p className="font-display font-extrabold text-lg leading-tight tabular-nums">
-                    {quote ? formatNaira(quote.deliveryFeeNgn) : '₦600'}
+                    {quote ? formatNaira(quote.deliveryFeeNgn) : 'Calculating...'}
                     <span className="text-xs font-normal text-neutral-300 ml-2">
-                      {quote ? formatEta(quote.estimatedMinutes) : '16 min'}
+                      {quote ? formatEta(quote.estimatedMinutes) : 'Estimating ETA'}
                     </span>
                   </p>
                 </div>
                 <button
                   type="submit"
-                  disabled={submitting}
-                  className="bg-white text-black px-4 py-2.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer"
+                  disabled={
+                    submitting ||
+                    !pickupCoords ||
+                    !destinationCoords ||
+                    !isMethodEnabled(selectedPaymentMethod) ||
+                    Boolean(
+                      selectedPaymentMethod === 'wallet' &&
+                        quote &&
+                        (wallet?.balanceNgn ?? 0) < quote.deliveryFeeNgn
+                    )
+                  }
+                  className="bg-white text-black px-4 py-2.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 disabled:opacity-45 cursor-pointer"
                 >
-                  {submitting ? 'Dispatching...' : 'Request Rider'}
+                  {submitting
+                    ? 'Dispatching...'
+                    : selectedPaymentMethod === 'flutterwave'
+                      ? 'Pay Online'
+                      : 'Request Rider'}
                 </button>
               </div>
             </form>
 
-            {/* Quote Summary Panel */}
-            <aside className="lg:col-span-5 bg-black text-white rounded-xl p-6 sm:p-8 space-y-6">
+            {/* Quote Summary + Live Route Map Panel */}
+            <aside className="lg:col-span-5 bg-black text-white rounded-xl p-6 sm:p-8 space-y-5">
               <div>
                 <p className="text-xs text-neutral-400 font-medium">Estimated Dispatch Summary</p>
                 <h2 className="font-display font-bold text-2xl mt-1">
                   {pickupState} → {destinationState}
                 </h2>
               </div>
+
+              <LiveNigeriaMap
+                deliveries={[]}
+                riders={[]}
+                previewRoute={
+                  pickupCoords || destinationCoords
+                    ? {
+                        pickupLat: pickupCoords?.lat,
+                        pickupLng: pickupCoords?.lng,
+                        pickupAddress: pickupAddress || `${pickupState} Hub`,
+                        pickupState,
+                        destinationLat: destinationCoords?.lat,
+                        destinationLng: destinationCoords?.lng,
+                        destinationAddress: destinationAddress || `${destinationState} Hub`,
+                        destinationState,
+                      }
+                    : null
+                }
+                heightClass="h-[230px]"
+              />
 
               {quote ? (
                 <div className="space-y-4 border-t border-white/15 pt-5">
@@ -823,6 +1482,12 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                     <span className="text-neutral-400">Estimated Delivery Time</span>
                     <span className="font-mono tabular-nums">
                       {formatEta(quote.estimatedMinutes)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-neutral-400">Payment Method</span>
+                    <span className="font-mono uppercase text-xs font-semibold">
+                      {selectedPaymentMethod.replace(/_/g, ' ')}
                     </span>
                   </div>
                   <div className="border-t border-white/15 pt-4 flex items-baseline justify-between">
@@ -1119,6 +1784,81 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                               {selectedDelivery.deliveryOtp}
                             </span>
                           </div>
+                          <div className="border-t border-neutral-200 pt-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div>
+                              <span className="text-neutral-500">Payment: </span>
+                              <span className="font-mono font-bold uppercase text-black">
+                                {(selectedDelivery.paymentMethod || 'cash').replace(/_/g, ' ')}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-bold uppercase ${
+                                  selectedDelivery.paymentStatus === 'paid'
+                                    ? 'bg-black text-white'
+                                    : 'bg-neutral-200 text-neutral-800'
+                                }`}
+                              >
+                                {(selectedDelivery.paymentStatus || 'pending').replace(/_/g, ' ')}
+                              </span>
+                              {selectedDelivery.paymentReference && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setActiveReceipt({
+                                      reference: selectedDelivery.paymentReference!,
+                                      title: `Delivery ${selectedDelivery.trackingCode}`,
+                                      receiptType: 'Delivery Payment',
+                                      amountNgn: selectedDelivery.deliveryFeeNgn,
+                                      status: selectedDelivery.paymentStatus || 'pending',
+                                      paymentMethod: selectedDelivery.paymentMethod || 'cash',
+                                      createdAt: selectedDelivery.createdAt,
+                                      customerName: selectedDelivery.customerName,
+                                      customerPhone: selectedDelivery.customerPhone,
+                                      trackingCode: selectedDelivery.trackingCode,
+                                      description: `${selectedDelivery.pickupState} → ${selectedDelivery.destinationState}`,
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-1 border border-neutral-300 bg-white hover:border-black px-2 py-0.5 rounded font-semibold cursor-pointer"
+                                >
+                                  <Receipt className="w-3 h-3" />
+                                  <span>Receipt</span>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          {['unpaid', 'pending', 'failed', 'reversed'].includes(
+                            selectedDelivery.paymentStatus || 'pending'
+                          ) &&
+                            selectedDelivery.status !== 'cancelled' && (
+                              <div className="flex flex-wrap gap-2 pt-1">
+                                {isMethodEnabled('wallet') && (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      payingDeliveryId === selectedDelivery.id ||
+                                      (wallet?.balanceNgn ?? 0) < selectedDelivery.deliveryFeeNgn
+                                    }
+                                    onClick={() => handlePayExistingDelivery(selectedDelivery.id, 'wallet')}
+                                    className="bg-black text-white px-3 py-1.5 rounded-lg text-[11px] font-semibold hover:bg-neutral-800 disabled:opacity-40 cursor-pointer"
+                                  >
+                                    Pay with Wallet
+                                  </button>
+                                )}
+                                {isMethodEnabled('flutterwave') && (
+                                  <button
+                                    type="button"
+                                    disabled={payingDeliveryId === selectedDelivery.id}
+                                    onClick={() =>
+                                      handlePayExistingDelivery(selectedDelivery.id, 'flutterwave')
+                                    }
+                                    className="border border-black bg-white text-black px-3 py-1.5 rounded-lg text-[11px] font-semibold hover:bg-neutral-100 disabled:opacity-40 cursor-pointer"
+                                  >
+                                    Pay via Flutterwave
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           {selectedDelivery.assignedRiderName ? (
                             <div className="border-t border-neutral-200 pt-2.5 text-xs space-y-1.5">
                               <p className="text-neutral-500">Assigned Rider</p>
@@ -1288,6 +2028,391 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           </div>
         )}
 
+        {/* WALLET TAB */}
+        {tab === 'wallet' && (
+          <div className="space-y-6">
+            {/* Hero Balance & Primary Actions */}
+            <div className="bg-black text-white rounded-2xl p-6 sm:p-8 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+              <div>
+                <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-neutral-400">
+                  SAQO Customer Wallet · NGN
+                </p>
+                <p className="font-display font-extrabold text-4xl sm:text-5xl tracking-tight tabular-nums mt-2">
+                  {formatNaira(wallet?.balanceNgn ?? 0)}
+                </p>
+                <p className="text-xs text-neutral-400 mt-2">
+                  Status: <span className="text-white font-semibold uppercase">{wallet?.status || 'active'}</span>
+                  {verifyingRef && (
+                    <span className="ml-3 font-mono text-white">· Verifying {verifyingRef}...</span>
+                  )}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setFundModalOpen(true)}
+                  className="inline-flex items-center gap-2 bg-white text-black px-5 py-3 rounded-xl text-sm font-bold hover:bg-neutral-200 transition-colors cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Add Money</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPayNowOpenFor((v) => !v)}
+                  className="inline-flex items-center gap-2 border border-white/30 bg-white/10 text-white px-5 py-3 rounded-xl text-sm font-bold hover:bg-white/20 transition-colors cursor-pointer"
+                >
+                  <Package className="w-4 h-4" />
+                  <span>Pay for Delivery</span>
+                </button>
+                <a
+                  href="#wallet-transactions-list"
+                  className="inline-flex items-center gap-2 border border-white/20 text-neutral-200 px-4 py-3 rounded-xl text-sm font-semibold hover:bg-white/10 transition-colors"
+                >
+                  <Clock className="w-4 h-4" />
+                  <span>Transaction History</span>
+                </a>
+              </div>
+            </div>
+
+            {/* Unpaid / Pending Deliveries Quick Pay Panel */}
+            {(payNowOpenFor ||
+              deliveries.some(
+                (d) =>
+                  d.status !== 'cancelled' &&
+                  ['unpaid', 'pending', 'failed', 'reversed'].includes(d.paymentStatus || 'pending')
+              )) && (
+              <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
+                <div className="px-6 py-4 border-b border-neutral-200 flex items-center justify-between">
+                  <div>
+                    <h2 className="font-display font-bold text-base">Deliveries Awaiting Payment</h2>
+                    <p className="text-xs text-neutral-500">
+                      Settle unpaid or pending parcel deliveries directly from your wallet or via Flutterwave.
+                    </p>
+                  </div>
+                </div>
+                {(() => {
+                  const unpaidList = deliveries.filter(
+                    (d) =>
+                      d.status !== 'cancelled' &&
+                      ['unpaid', 'pending', 'failed', 'reversed'].includes(d.paymentStatus || 'pending')
+                  );
+                  if (unpaidList.length === 0) {
+                    return (
+                      <div className="p-6 text-xs text-neutral-500">
+                        All your parcel deliveries are paid or settled.
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="divide-y divide-neutral-200">
+                      {unpaidList.map((d) => (
+                        <div
+                          key={d.id}
+                          className="px-6 py-4 flex flex-wrap items-center justify-between gap-4"
+                        >
+                          <div>
+                            <p className="font-mono font-bold text-sm">{d.trackingCode}</p>
+                            <p className="text-xs text-neutral-600 mt-0.5">
+                              {d.pickupState} → {d.destinationState} ·{' '}
+                              <span className="uppercase font-mono">
+                                {(d.paymentMethod || 'cash').replace(/_/g, ' ')}
+                              </span>{' '}
+                              ·{' '}
+                              <span className="uppercase font-semibold">
+                                {(d.paymentStatus || 'pending').replace(/_/g, ' ')}
+                              </span>
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono font-bold text-sm tabular-nums mr-2">
+                              {formatNaira(d.deliveryFeeNgn)}
+                            </span>
+                            {isMethodEnabled('wallet') && (
+                              <button
+                                type="button"
+                                disabled={
+                                  payingDeliveryId === d.id ||
+                                  (wallet?.balanceNgn ?? 0) < d.deliveryFeeNgn
+                                }
+                                onClick={() => handlePayExistingDelivery(d.id, 'wallet')}
+                                className="bg-black text-white px-3.5 py-2 rounded-lg text-xs font-semibold hover:bg-neutral-800 disabled:opacity-40 cursor-pointer"
+                              >
+                                {payingDeliveryId === d.id ? 'Processing...' : 'Pay from Wallet'}
+                              </button>
+                            )}
+                            {isMethodEnabled('flutterwave') && (
+                              <button
+                                type="button"
+                                disabled={payingDeliveryId === d.id}
+                                onClick={() => handlePayExistingDelivery(d.id, 'flutterwave')}
+                                className="border border-neutral-300 hover:border-black px-3.5 py-2 rounded-lg text-xs font-semibold cursor-pointer"
+                              >
+                                Pay Online
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Filterable Transaction & Ledger History */}
+            <div
+              id="wallet-transactions-list"
+              className="bg-white border border-neutral-200 rounded-xl overflow-hidden"
+            >
+              <div className="px-6 py-4 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="font-display font-bold text-lg">Wallet & Payment History</h2>
+                  <p className="text-xs text-neutral-500">
+                    Immutable wallet credits, debits, refunds, and gateway checkout records.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(['all', 'credit', 'debit', 'pending', 'failed'] as const).map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      onClick={() => setWalletFilter(f)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold capitalize cursor-pointer ${
+                        walletFilter === f
+                          ? 'bg-black text-white'
+                          : 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
+                      }`}
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-neutral-200">
+                {/* Immutable Wallet Ledger */}
+                <div className="p-5 sm:p-6 space-y-3">
+                  <h3 className="font-mono text-xs uppercase tracking-wider text-neutral-500 font-bold">
+                    Wallet Ledger Entries
+                  </h3>
+                  {(() => {
+                    const filteredLedger = walletTransactions.filter((wt) => {
+                      if (walletFilter === 'all') return true;
+                      if (walletFilter === 'credit') return wt.type === 'credit' || wt.type === 'refund';
+                      if (walletFilter === 'debit') return wt.type === 'debit';
+                      if (walletFilter === 'pending') return wt.status === 'pending';
+                      if (walletFilter === 'failed') return wt.status === 'failed';
+                      return true;
+                    });
+                    if (filteredLedger.length === 0) {
+                      return (
+                        <p className="text-xs text-neutral-500 py-6 text-center">
+                          No wallet ledger transactions match this filter.
+                        </p>
+                      );
+                    }
+                    return (
+                      <div className="divide-y divide-neutral-200">
+                        {filteredLedger.map((wt) => {
+                          const isPositive =
+                            wt.type === 'credit' ||
+                            wt.type === 'refund' ||
+                            (wt.type === 'adjustment' && wt.balanceAfterNgn >= wt.balanceBeforeNgn);
+                          return (
+                            <div
+                              key={wt.id}
+                              className="py-3.5 flex items-center justify-between gap-3"
+                            >
+                              <div className="flex items-start gap-3 min-w-0">
+                                <div
+                                  className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                                    isPositive
+                                      ? 'bg-black text-white'
+                                      : 'bg-neutral-100 text-black border border-neutral-300'
+                                  }`}
+                                >
+                                  {isPositive ? (
+                                    <ArrowDownLeft className="w-4 h-4" />
+                                  ) : (
+                                    <ArrowUpRight className="w-4 h-4" />
+                                  )}
+                                </div>
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold text-black truncate">
+                                    {wt.description}
+                                  </p>
+                                  <p className="font-mono text-[11px] text-neutral-500 truncate">
+                                    {wt.reference} · {new Date(wt.createdAt).toLocaleString()}
+                                  </p>
+                                  <p className="font-mono text-[10px] text-neutral-400 tabular-nums mt-0.5">
+                                    {formatNaira(wt.balanceBeforeNgn)} → {formatNaira(wt.balanceAfterNgn)}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="text-right shrink-0 space-y-1">
+                                <p className="font-mono font-bold text-sm tabular-nums">
+                                  {isPositive ? '+' : '-'}
+                                  {formatNaira(wt.amountNgn)}
+                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setActiveReceipt({
+                                      reference: wt.reference,
+                                      title: wt.category === 'funding' ? 'Wallet Funding Receipt' : 'Wallet Transaction',
+                                      receiptType:
+                                        wt.category === 'funding'
+                                          ? 'Wallet Funding'
+                                          : wt.category === 'refund'
+                                            ? 'Refund Receipt'
+                                            : 'Wallet Transaction',
+                                      amountNgn: wt.amountNgn,
+                                      status: wt.status,
+                                      paymentMethod: 'wallet',
+                                      createdAt: wt.createdAt,
+                                      customerName: profile.fullName,
+                                      customerEmail: profile.email,
+                                      customerPhone: profile.phone,
+                                      trackingCode: wt.trackingCode,
+                                      balanceBeforeNgn: wt.balanceBeforeNgn,
+                                      balanceAfterNgn: wt.balanceAfterNgn,
+                                      description: wt.description,
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-1 text-[11px] font-semibold border border-neutral-300 hover:border-black px-2 py-0.5 rounded cursor-pointer"
+                                >
+                                  <Receipt className="w-3 h-3" />
+                                  <span>Receipt</span>
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* Gateway & Checkout Transactions */}
+                <div className="p-5 sm:p-6 space-y-3">
+                  <h3 className="font-mono text-xs uppercase tracking-wider text-neutral-500 font-bold">
+                    Checkout & Funding Transactions
+                  </h3>
+                  {(() => {
+                    const filteredPay = paymentTransactions.filter((pt) => {
+                      if (walletFilter === 'all') return true;
+                      if (walletFilter === 'credit') return pt.purpose === 'wallet_funding' && pt.status === 'paid';
+                      if (walletFilter === 'debit') return pt.purpose === 'delivery_payment';
+                      if (walletFilter === 'pending') {
+                        return ['pending', 'pending_verification', 'collected_by_rider'].includes(pt.status);
+                      }
+                      if (walletFilter === 'failed') return pt.status === 'failed' || pt.status === 'reversed';
+                      return true;
+                    });
+                    if (filteredPay.length === 0) {
+                      return (
+                        <p className="text-xs text-neutral-500 py-6 text-center">
+                          No payment gateway transactions match this filter.
+                        </p>
+                      );
+                    }
+                    return (
+                      <div className="divide-y divide-neutral-200">
+                        {filteredPay.map((pt) => (
+                          <div
+                            key={pt.id}
+                            className="py-3.5 flex items-center justify-between gap-3"
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-mono font-bold text-xs text-black">
+                                  {pt.reference}
+                                </span>
+                                <span
+                                  className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-bold uppercase ${
+                                    pt.status === 'paid'
+                                      ? 'bg-black text-white'
+                                      : pt.status === 'failed' || pt.status === 'reversed'
+                                        ? 'border border-black text-black'
+                                        : 'bg-neutral-200 text-neutral-800'
+                                  }`}
+                                >
+                                  {pt.status.replace(/_/g, ' ')}
+                                </span>
+                              </div>
+                              <p className="text-xs text-neutral-600 mt-1">
+                                {pt.purpose === 'wallet_funding' ? 'Wallet Funding' : `Delivery ${pt.trackingCode || ''}`}{' '}
+                                · {pt.paymentMethod.replace(/_/g, ' ').toUpperCase()}
+                              </p>
+                              <p className="font-mono text-[10px] text-neutral-400">
+                                {new Date(pt.createdAt).toLocaleString()}
+                              </p>
+                            </div>
+
+                            <div className="text-right shrink-0 space-y-1.5">
+                              <p className="font-mono font-bold text-sm tabular-nums">
+                                {formatNaira(pt.amountNgn)}
+                              </p>
+                              <div className="flex items-center justify-end gap-1.5">
+                                {pt.provider === 'flutterwave' && pt.status === 'pending' && (
+                                  <button
+                                    type="button"
+                                    disabled={verifyingRef === pt.reference}
+                                    onClick={() => handleVerifyPayment(pt)}
+                                    className="bg-black text-white px-2.5 py-1 rounded text-[10px] font-semibold cursor-pointer"
+                                  >
+                                    {verifyingRef === pt.reference ? 'Checking...' : 'Verify'}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setActiveReceipt({
+                                      reference: pt.reference,
+                                      title:
+                                        pt.purpose === 'wallet_funding'
+                                          ? 'Wallet Funding Receipt'
+                                          : 'Delivery Payment Receipt',
+                                      receiptType:
+                                        pt.purpose === 'wallet_funding'
+                                          ? 'Wallet Funding'
+                                          : 'Delivery Payment',
+                                      amountNgn: pt.amountNgn,
+                                      status: pt.status,
+                                      paymentMethod: pt.paymentMethod,
+                                      createdAt: pt.createdAt,
+                                      customerName: pt.customerName || profile.fullName,
+                                      customerEmail: pt.customerEmail || profile.email,
+                                      customerPhone: pt.customerPhone || profile.phone,
+                                      trackingCode: pt.trackingCode,
+                                      providerTxId: pt.providerTxId,
+                                      transferReference: pt.transferReference,
+                                      verifiedAt: pt.verifiedAt,
+                                      description:
+                                        pt.purpose === 'wallet_funding'
+                                          ? 'Customer wallet deposit'
+                                          : `Parcel delivery payment (${pt.trackingCode || pt.deliveryId || ''})`,
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-1 border border-neutral-300 hover:border-black px-2 py-1 rounded text-[10px] font-semibold cursor-pointer"
+                                >
+                                  <Receipt className="w-3 h-3" />
+                                  <span>Receipt</span>
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* HISTORY TAB */}
         {tab === 'history' && (
           <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
@@ -1335,12 +2460,43 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                         {d.pickupState} → {d.destinationState}
                       </p>
                       <div className="flex items-center justify-between text-xs text-neutral-600">
-                        <span>To {d.recipientName}</span>
+                        <span>
+                          To {d.recipientName} ·{' '}
+                          <span className="font-mono uppercase text-black font-semibold">
+                            {(d.paymentMethod || 'cash').replace(/_/g, ' ')} ·{' '}
+                            {(d.paymentStatus || 'pending').replace(/_/g, ' ')}
+                          </span>
+                        </span>
                         <span className="font-mono font-bold text-black tabular-nums">
                           {formatNaira(d.deliveryFeeNgn)}
                         </span>
                       </div>
-                      <div className="pt-1 flex justify-end">
+                      <div className="pt-1 flex justify-end gap-2">
+                        {d.paymentStatus === 'paid' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setActiveReceipt({
+                                receiptType: 'Delivery Payment',
+                                reference: d.paymentReference || d.trackingCode,
+                                title: 'SAQO Delivery Payment Receipt',
+                                status: d.paymentStatus || 'paid',
+                                amountNgn: d.deliveryFeeNgn,
+                                paymentMethod: d.paymentMethod || 'cash',
+                                createdAt: d.updatedAt || d.createdAt,
+                                customerName: profile.fullName,
+                                customerEmail: profile.email,
+                                customerPhone: profile.phone,
+                                trackingCode: d.trackingCode,
+                                description: `${d.pickupState} → ${d.destinationState} · ${d.parcelDescription}`,
+                              })
+                            }
+                            className="inline-flex items-center gap-1 border border-neutral-300 hover:border-black px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer"
+                          >
+                            <Receipt className="w-3.5 h-3.5" />
+                            <span>Receipt</span>
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => handleRepeatDeliveryRoute(d)}
@@ -1361,6 +2517,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                         <th className="py-3 px-4 font-semibold">Tracking</th>
                         <th className="py-3 px-4 font-semibold">Route</th>
                         <th className="py-3 px-4 font-semibold">Recipient</th>
+                        <th className="py-3 px-4 font-semibold">Payment</th>
                         <th className="py-3 px-4 font-semibold">Status</th>
                         <th className="py-3 px-4 font-semibold text-right">Fee</th>
                         <th className="py-3 px-4 font-semibold text-right">Action</th>
@@ -1374,6 +2531,12 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                             {d.pickupState} → {d.destinationState}
                           </td>
                           <td className="py-3 px-4">{d.recipientName}</td>
+                          <td className="py-3 px-4 font-mono text-[11px] uppercase">
+                            {(d.paymentMethod || 'cash').replace(/_/g, ' ')} ·{' '}
+                            <span className="font-bold">
+                              {(d.paymentStatus || 'pending').replace(/_/g, ' ')}
+                            </span>
+                          </td>
                           <td className="py-3 px-4 capitalize">
                             <span className="inline-flex items-center gap-1">
                               {d.status === 'delivered' && <CheckCircle2 className="w-3.5 h-3.5" />}
@@ -1383,7 +2546,32 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                           <td className="py-3 px-4 text-right font-mono tabular-nums">
                             {formatNaira(d.deliveryFeeNgn)}
                           </td>
-                          <td className="py-3 px-4 text-right">
+                          <td className="py-3 px-4 text-right whitespace-nowrap space-x-1.5">
+                            {d.paymentStatus === 'paid' && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setActiveReceipt({
+                                    receiptType: 'Delivery Payment',
+                                    reference: d.paymentReference || d.trackingCode,
+                                    title: 'SAQO Delivery Payment Receipt',
+                                    status: d.paymentStatus || 'paid',
+                                    amountNgn: d.deliveryFeeNgn,
+                                    paymentMethod: d.paymentMethod || 'cash',
+                                    createdAt: d.updatedAt || d.createdAt,
+                                    customerName: profile.fullName,
+                                    customerEmail: profile.email,
+                                    customerPhone: profile.phone,
+                                    trackingCode: d.trackingCode,
+                                    description: `${d.pickupState} → ${d.destinationState} · ${d.parcelDescription}`,
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 border border-neutral-300 hover:border-black px-2.5 py-1 rounded text-xs font-semibold cursor-pointer"
+                              >
+                                <Receipt className="w-3 h-3" />
+                                <span>Receipt</span>
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => handleRepeatDeliveryRoute(d)}
@@ -1667,17 +2855,112 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             </form>
           </div>
         )}
+        {/* Add Money Modal (Flutterwave Wallet Funding) */}
+        {fundModalOpen && (
+          <div className="fixed inset-0 bg-black/65 z-50 flex items-center justify-center p-4">
+            <form
+              onSubmit={handleFundWallet}
+              className="bg-white border-2 border-black rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-widest text-neutral-500">
+                    SAQO Wallet Top-Up
+                  </p>
+                  <h2 className="font-display font-bold text-xl mt-0.5">Add Money to Wallet</h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setFundModalOpen(false)}
+                  className="text-xs font-semibold border border-neutral-300 px-2.5 py-1 rounded-lg hover:border-black cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200 px-4 py-3 flex items-center justify-between text-xs">
+                <span className="text-neutral-500">Current Balance</span>
+                <span className="font-mono font-bold text-sm tabular-nums text-black">
+                  {formatNaira(wallet?.balanceNgn ?? 0)}
+                </span>
+              </div>
+
+              <div className="space-y-2">
+                <label htmlFor="fund-amount-input" className="block text-xs font-semibold">
+                  Amount to Add (NGN)
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[1000, 2500, 5000, 10000].map((amt) => (
+                    <button
+                      key={amt}
+                      type="button"
+                      onClick={() => setFundAmount(String(amt))}
+                      className={`py-2 rounded-lg text-xs font-mono font-bold border transition-colors cursor-pointer ${
+                        Number(fundAmount) === amt
+                          ? 'bg-black text-white border-black'
+                          : 'bg-white text-black border-neutral-300 hover:border-black'
+                      }`}
+                    >
+                      ₦{(amt / 1000).toFixed(amt % 1000 === 0 ? 0 : 1)}k
+                    </button>
+                  ))}
+                </div>
+                <input
+                  id="fund-amount-input"
+                  type="number"
+                  min={100}
+                  step="50"
+                  required
+                  value={fundAmount}
+                  onChange={(e) => setFundAmount(e.target.value)}
+                  className="w-full border border-neutral-300 rounded-xl px-3.5 py-2.5 text-lg font-mono font-bold tabular-nums focus:outline-none focus:ring-2 focus:ring-black"
+                />
+              </div>
+
+              {paymentConfig && !paymentConfig.isEnabled ? (
+                <div className="rounded-xl border border-black bg-neutral-100 p-3 text-xs text-black font-medium">
+                  Flutterwave online top-up is currently disabled by an administrator. Please check back shortly or choose Cash / Bank Transfer at checkout.
+                </div>
+              ) : (
+                <p className="text-[11px] text-neutral-500 leading-relaxed">
+                  Secured via Flutterwave{paymentConfig?.mode === 'test' ? ' (Test Mode)' : ''}. Your wallet is credited immediately after server verification.
+                </p>
+              )}
+
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setFundModalOpen(false)}
+                  className="px-4 py-2.5 rounded-xl border border-neutral-300 text-xs font-semibold cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={fundingSubmitting || Boolean(paymentConfig && !paymentConfig.isEnabled)}
+                  className="px-5 py-2.5 rounded-xl bg-black text-white text-xs font-bold hover:bg-neutral-800 disabled:opacity-50 cursor-pointer"
+                >
+                  {fundingSubmitting
+                    ? 'Connecting to Flutterwave...'
+                    : `Proceed (${formatNaira(Number(fundAmount) || 0)})`}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        <ReceiptModal receipt={activeReceipt} onClose={() => setActiveReceipt(null)} />
       </main>
 
       {/* Native Mobile Bottom Navigation */}
       <nav
         aria-label="Client mobile navigation"
-        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-5 pb-[env(safe-area-inset-bottom)]"
+        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-6 pb-[env(safe-area-inset-bottom)]"
       >
         <button
           type="button"
           onClick={() => setTab('active')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
             tab === 'active' ? 'text-black' : 'text-neutral-600'
           }`}
         >
@@ -1687,7 +2970,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('send')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
             tab === 'send' ? 'text-black' : 'text-neutral-600'
           }`}
         >
@@ -1696,8 +2979,18 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         </button>
         <button
           type="button"
+          onClick={() => setTab('wallet')}
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
+            tab === 'wallet' ? 'text-black' : 'text-neutral-600'
+          }`}
+        >
+          <Wallet className="w-4 h-4" />
+          <span>Wallet</span>
+        </button>
+        <button
+          type="button"
           onClick={() => setTab('history')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
             tab === 'history' ? 'text-black' : 'text-neutral-600'
           }`}
         >
@@ -1707,7 +3000,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('notifications')}
-          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
             tab === 'notifications' ? 'text-black' : 'text-neutral-600'
           }`}
         >
@@ -1717,7 +3010,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('tickets')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
             tab === 'tickets' ? 'text-black' : 'text-neutral-600'
           }`}
         >

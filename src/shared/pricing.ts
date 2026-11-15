@@ -2,6 +2,7 @@ import { haversineKm } from './geo';
 import type { PlatformSettings, PriceQuote, ServiceTier } from './types';
 
 export const DEFAULT_PLATFORM_SETTINGS: PlatformSettings = {
+  showDeliveryStateSelectors: false,
   maxActiveParcelsPerRider: 3,
   searchRadiusKm: 85,
   offerTimeoutSeconds: 45,

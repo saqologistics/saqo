@@ -61,6 +61,7 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
     adminOnline: false,
     onlineAdminCount: 0,
   });
+  const [presenceLoaded, setPresenceLoaded] = useState(false);
   const [conversations, setConversations] = useState<SupportConversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [messages, setMessages] = useState<SupportMessage[]>([]);
@@ -82,6 +83,7 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const typingTimerRef = useRef<number | null>(null);
   const lastTypingEmitRef = useRef<number>(0);
+  const presenceEventCount = useRef(0);
 
   useEffect(() => {
     if (currentUser) {
@@ -96,10 +98,8 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
     try {
       const res = await apiRequest<{
         conversations: SupportConversation[];
-        presence: SupportPresence;
       }>(`/api/support/conversations?visitorToken=${encodeURIComponent(visitorToken)}`);
       setConversations(res.conversations);
-      if (res.presence) setPresence(res.presence);
       return res.conversations;
     } catch {
       return [];
@@ -116,14 +116,12 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
         const res = await apiRequest<{
           conversation: SupportConversation;
           messages: SupportMessage[];
-          presence: SupportPresence;
         }>(
           `/api/support/conversations/${encodeURIComponent(convId)}/messages?visitorToken=${encodeURIComponent(
             visitorToken
           )}`
         );
         setMessages(res.messages);
-        if (res.presence) setPresence(res.presence);
         setConversations((prev) =>
           prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
         );
@@ -190,10 +188,12 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
     }
   }, [messages.length, adminTyping, open, view]);
 
-  const { sendEvent } = useRealtime((evt) => {
+  const { sendEvent, connected } = useRealtime((evt) => {
     if (evt.type === 'support:presence') {
+      presenceEventCount.current += 1;
       const p = evt.payload as SupportPresence;
       setPresence(p);
+      setPresenceLoaded(true);
     } else if (evt.type === 'support:conversation') {
       const conv = evt.payload as SupportConversation;
       const belongsToMe =
@@ -237,6 +237,45 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
     }
   });
 
+  useEffect(() => {
+    if (!connected) return;
+    sendEvent({ type: 'support:subscribe', visitorToken });
+    return () => sendEvent({ type: 'support:subscribe', visitorToken: '' });
+  }, [connected, sendEvent, visitorToken]);
+
+  useEffect(() => {
+    if (connected) return;
+    let active = true;
+    let timer: number;
+    let request: AbortController;
+    const refreshPresence = async () => {
+      const eventCount = presenceEventCount.current;
+      request = new AbortController();
+      const timeout = window.setTimeout(() => request.abort(), 5000);
+      try {
+        const result = await apiRequest<SupportPresence>('/api/support/presence', {
+          cache: 'no-store',
+          signal: request.signal,
+        });
+        if (active && eventCount === presenceEventCount.current && typeof result.adminOnline === 'boolean') {
+          setPresence(result);
+          setPresenceLoaded(true);
+        }
+      } catch {
+        // Preserve the last known presence until the desk can be reached again.
+      } finally {
+        window.clearTimeout(timeout);
+        if (active) timer = window.setTimeout(refreshPresence, 10000);
+      }
+    };
+    refreshPresence();
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      request?.abort();
+    };
+  }, [connected]);
+
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeConvId) || null,
     [conversations, activeConvId]
@@ -263,7 +302,6 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
       const res = await apiRequest<{
         conversation: SupportConversation;
         messages: SupportMessage[];
-        presence: SupportPresence;
       }>('/api/support/conversations', {
         method: 'POST',
         body: JSON.stringify({
@@ -281,7 +319,6 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
       ]);
       setActiveConvId(res.conversation.id);
       setMessages(res.messages);
-      if (res.presence) setPresence(res.presence);
       setFirstMessage('');
       setView('thread');
     } catch (err: any) {
@@ -414,7 +451,9 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
                     }`}
                   />
                   <span className="truncate">
-                    {presence.adminOnline
+                    {!presenceLoaded
+                      ? 'Connecting to support...'
+                      : presence.adminOnline
                       ? 'Admin Online · Live replies'
                       : 'Agents Offline · Reply queued'}
                   </span>
@@ -445,7 +484,7 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
           </div>
 
           {/* Offline Notice Banner whenever no Admin is currently online */}
-          {!presence.adminOnline && (
+          {presenceLoaded && !presence.adminOnline && (
             <div
               role="status"
               className="px-4 py-2.5 bg-neutral-100 border-b border-neutral-200 text-xs text-neutral-700 leading-relaxed shrink-0 flex items-start gap-2"
@@ -785,20 +824,22 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
       >
         <MessageCircle className="w-4 h-4 shrink-0" />
         <span className="text-xs sm:text-sm font-semibold">Support Chat</span>
-        <span
-          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
-            presence.adminOnline
-              ? 'bg-white text-black'
-              : 'bg-neutral-800 text-neutral-300 border border-white/20'
-          }`}
-        >
+        {presenceLoaded && (
           <span
-            className={`w-1.5 h-1.5 rounded-full ${
-              presence.adminOnline ? 'bg-black' : 'bg-neutral-400'
+            className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+              presence.adminOnline
+                ? 'bg-white text-black'
+                : 'bg-neutral-800 text-neutral-300 border border-white/20'
             }`}
-          />
-          <span>{presence.adminOnline ? 'Online' : 'Offline'}</span>
-        </span>
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                presence.adminOnline ? 'bg-black' : 'bg-neutral-400'
+              }`}
+            />
+            <span>{presence.adminOnline ? 'Online' : 'Offline'}</span>
+          </span>
+        )}
         {totalUnread > 0 && (
           <span className="absolute -top-1 -right-1 min-w-5 h-5 px-1 rounded-full bg-white text-black border border-black text-[10px] font-bold flex items-center justify-center tabular-nums">
             {totalUnread}

@@ -2,20 +2,29 @@ import crypto from 'node:crypto';
 import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
 import type { WebSocket } from 'ws';
 import { rankEligibleRiders } from '../shared/dispatch';
-import type { LiveWsEvent, SupportPresence, UserRole } from '../shared/types';
+import { sendOpsAlert } from './opsAlerts';
+import type { DeliveryRequest, LiveWsEvent, SupportPresence, UserRole } from '../shared/types';
 import {
   createNotification,
   db,
+  persistDispatchChange,
   getAllRiders,
   getDeliveryById,
+  publicTrackingDelivery,
   getPlatformSettings,
+  getProfileById,
+  getSupportConversationById,
   listDeliveries,
 } from './db';
 
 const wsClients = new Set<WebSocket>();
-const wsAuthMeta = new Map<WebSocket, { userId: string; role: UserRole }>();
+const wsSupportVisitors = new Map<WebSocket, string>();
+const wsTracking = new Map<WebSocket, string>();
+const wsAuthMeta = new Map<WebSocket, { userId: string; role: UserRole; expiresAt: number }>();
 let adminAcceptingChats = true;
 const offerTimers = new Map<string, NodeJS.Timeout>();
+let adminOfflineGraceTimer: NodeJS.Timeout | null = null;
+let lastBroadcastPresence: SupportPresence | null = null;
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const supabaseKey =
@@ -34,10 +43,10 @@ if (supabaseUrl && supabaseKey) {
   }
 }
 
-export function getSupportPresence(): SupportPresence {
+function getConnectedAdminPresence(): SupportPresence {
   const uniqueAdminIds = new Set<string>();
   for (const [client, meta] of wsAuthMeta.entries()) {
-    if (meta.role === 'admin' && client.readyState === 1) {
+    if (meta.role === 'admin' && meta.expiresAt > Date.now() && client.readyState === 1) {
       uniqueAdminIds.add(meta.userId);
     }
   }
@@ -48,23 +57,93 @@ export function getSupportPresence(): SupportPresence {
   };
 }
 
+export function getSupportPresence(): SupportPresence {
+  const connected = getConnectedAdminPresence();
+  if (adminAcceptingChats && adminOfflineGraceTimer && !connected.adminOnline && lastBroadcastPresence) {
+    return lastBroadcastPresence;
+  }
+  return connected;
+}
+
+function cancelOfflineGrace(): void {
+  if (adminOfflineGraceTimer) clearTimeout(adminOfflineGraceTimer);
+  adminOfflineGraceTimer = null;
+}
+
+function broadcastPresenceIfChanged(): SupportPresence {
+  const presence = getSupportPresence();
+  if (
+    !lastBroadcastPresence ||
+    lastBroadcastPresence.adminOnline !== presence.adminOnline ||
+    lastBroadcastPresence.onlineAdminCount !== presence.onlineAdminCount
+  ) {
+    lastBroadcastPresence = presence;
+    broadcastWsEvent('support:presence', presence);
+  }
+  return presence;
+}
+
 export function setAdminChatAvailability(available: boolean): SupportPresence {
   adminAcceptingChats = available;
-  const presence = getSupportPresence();
-  broadcastWsEvent('support:presence', presence);
-  return presence;
+  cancelOfflineGrace();
+  return broadcastPresenceIfChanged();
 }
 
 export function isAdminChatAvailableFlag(): boolean {
   return adminAcceptingChats;
 }
 
-export function setWsClientAuth(ws: WebSocket, userId: string, role: UserRole): void {
+export function setWsClientAuth(ws: WebSocket, userId: string, role: UserRole, expiresAt: number): void {
   const prev = wsAuthMeta.get(ws);
-  wsAuthMeta.set(ws, { userId, role });
-  if (role === 'admin' || prev?.role === 'admin') {
-    broadcastWsEvent('support:presence', getSupportPresence());
+  wsAuthMeta.set(ws, { userId, role, expiresAt });
+  if (role === 'admin') {
+    cancelOfflineGrace();
+    broadcastPresenceIfChanged();
+  } else if (prev?.role === 'admin') {
+    broadcastPresenceIfChanged();
   }
+}
+
+export function clearWsClientAuth(ws: WebSocket): void {
+  const prev = wsAuthMeta.get(ws);
+  wsAuthMeta.delete(ws);
+  if (prev?.role === 'admin') {
+    cancelOfflineGrace();
+    broadcastPresenceIfChanged();
+  }
+}
+
+export function setWsTracking(ws: WebSocket, trackingCode: string): void {
+  if (trackingCode) wsTracking.set(ws, trackingCode);
+  else wsTracking.delete(ws);
+}
+
+export function setWsSupportVisitor(ws: WebSocket, token: string): void {
+  if (token && token.length <= 128) wsSupportVisitors.set(ws, token);
+  else wsSupportVisitors.delete(ws);
+}
+
+function canReadSupport(ws: WebSocket, conversation: ReturnType<typeof getSupportConversationById>): boolean {
+  if (!conversation) return false;
+  const auth = wsAuthMeta.get(ws);
+  if (auth && auth.expiresAt > Date.now()) {
+    if (auth.role === 'admin' || auth.userId === conversation.userId) return true;
+  }
+  return Boolean(conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
+}
+
+export function sendSupportTyping(ws: WebSocket, conversationId: string, isTyping: boolean): void {
+  const conversation = getSupportConversationById(conversationId);
+  if (!conversation || !canReadSupport(ws, conversation)) return;
+  const auth = wsAuthMeta.get(ws);
+  const profile = auth && auth.expiresAt > Date.now() ? getProfileById(auth.userId) : null;
+  const admin = profile?.role === 'admin' && profile.accountStatus === 'active';
+  broadcastWsEvent('support:typing', {
+    conversationId,
+    senderRole: admin ? 'admin' : 'visitor',
+    senderName: admin ? profile.fullName : conversation.visitorName,
+    isTyping,
+  });
 }
 
 export function registerWsClient(ws: WebSocket): void {
@@ -73,8 +152,20 @@ export function registerWsClient(ws: WebSocket): void {
     const meta = wsAuthMeta.get(ws);
     wsAuthMeta.delete(ws);
     wsClients.delete(ws);
-    if (meta?.role === 'admin') {
-      broadcastWsEvent('support:presence', getSupportPresence());
+    wsTracking.delete(ws);
+    wsSupportVisitors.delete(ws);
+    if (meta?.role !== 'admin') return;
+
+    if (getConnectedAdminPresence().adminOnline || !lastBroadcastPresence?.adminOnline) {
+      broadcastPresenceIfChanged();
+      return;
+    }
+    // Keep API reads and WebSocket events consistent during short reconnects.
+    if (!adminOfflineGraceTimer) {
+      adminOfflineGraceTimer = setTimeout(() => {
+        adminOfflineGraceTimer = null;
+        broadcastPresenceIfChanged();
+      }, 5000);
     }
   });
 }
@@ -85,24 +176,67 @@ export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): v
     payload,
     timestamp: new Date().toISOString(),
   };
-  const msg = JSON.stringify(eventObj);
+  const data = payload as Record<string, unknown> | null;
+  const isDelivery = type === 'delivery:created' || type === 'delivery:updated';
+  if (isDelivery && data) {
+    const { deliveryOtp: _otp, ...delivery } = data;
+    eventObj.payload = delivery;
+  }
+  const supportId = type === 'support:conversation' ? data?.id :
+    type === 'support:message' || type === 'support:typing' ? data?.conversationId : undefined;
+  const conversation = typeof supportId === 'string' ? getSupportConversationById(supportId) : null;
+  const message = JSON.stringify(eventObj);
 
   for (const client of wsClients) {
-    if (client.readyState === 1) {
-      client.send(msg);
+    if (client.readyState !== 1) continue;
+    const session = wsAuthMeta.get(client);
+    const auth = session && session.expiresAt > Date.now() ? session : undefined;
+    const tracked = wsTracking.get(client);
+    let allowed = Boolean(auth);
+    if (type === 'notification:created' || type === 'wallet:updated') {
+      allowed = Boolean(auth && data?.userId === auth.userId);
+    } else if (type === 'assignment:offered') {
+      allowed = Boolean(auth && (auth.role === 'admin' || data?.riderProfileId === auth.userId));
+    } else if (isDelivery) {
+      allowed = auth?.role === 'admin';
+      if (!allowed && tracked && tracked === data?.trackingCode) {
+        client.send(JSON.stringify({ ...eventObj, payload: publicTrackingDelivery(payload as DeliveryRequest) }));
+        continue;
+      }
+      if (auth && !allowed) {
+        // Other authenticated clients refresh from their role-scoped endpoint.
+        client.send(JSON.stringify({ ...eventObj, payload: { id: data?.id } }));
+      }
+    } else if (type === 'rider:location') {
+      allowed = Boolean(auth?.role === 'admin');
+      if (!allowed && tracked) {
+        const current = db.prepare(`
+          SELECT 1 FROM delivery_requests
+          WHERE tracking_code = ? AND assigned_rider_id = ? AND status NOT IN ('delivered','cancelled')
+        `).get(tracked, String(data?.riderId ?? ''));
+        allowed = Boolean(current);
+      }
+      if (!allowed && auth) client.send(JSON.stringify({ ...eventObj, payload: { riderId: data?.riderId } }));
+    } else if (type === 'settings:updated' && !auth) {
+      client.send(JSON.stringify({ ...eventObj, payload: { showDeliveryStateSelectors: data?.showDeliveryStateSelectors } }));
+      continue;
+    } else if (type === 'support:presence') {
+      allowed = true;
+    } else if (type.startsWith('support:')) {
+      allowed = canReadSupport(client, conversation);
+    } else if (type === 'payment:updated' || type === 'cash_collection:updated') {
+      allowed = auth?.role === 'admin';
     }
+    if (allowed) client.send(message);
   }
 
-  if (supabaseChannel) {
-    supabaseChannel
-      .send({
-        type: 'broadcast',
-        event: 'saqo-event',
-        payload: eventObj,
-      })
-      .catch(() => {
-        // Non-blocking fallback when Supabase Realtime is unreachable
-      });
+  if (supabaseChannel && type === 'notification:created') {
+    // This shared channel only signals a refresh. The authenticated API returns the recipient's inbox.
+    void supabaseChannel.send({
+      type: 'broadcast',
+      event: 'saqo-event',
+      payload: { type: 'notifications:refresh', payload: null, timestamp: eventObj.timestamp },
+    }).catch(() => {});
   }
 }
 
@@ -114,14 +248,93 @@ export function clearOfferTimer(assignmentId: string): void {
   }
 }
 
+const queuedStatuses = ['pending_dispatch', 'no_rider_available'];
+const activeStatuses = ['assigned', 'accepted', 'heading_to_pickup', 'parcel_picked_up', 'in_transit', 'arrived_at_destination'];
+
+export function canDispatch(delivery: { paymentMethod: string; paymentStatus: string }): boolean {
+  return delivery.paymentMethod === 'cash' || delivery.paymentStatus === 'paid';
+}
+
+export function dispatchWaitingDeliveries(): void {
+  const waiting = db.prepare(`
+    SELECT id FROM delivery_requests
+    WHERE status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+    ORDER BY created_at, rowid
+  `).all() as Array<{ id: string }>;
+  for (const { id } of waiting) dispatchNextRiderForDelivery(id);
+}
+
+function scheduleOfferExpiry(assignmentId: string, expiresAt: string): void {
+  clearOfferTimer(assignmentId);
+  const timer = setTimeout(() => {
+    offerTimers.delete(assignmentId);
+    const now = new Date().toISOString();
+    const expired = persistDispatchChange(() => {
+      const assignment = db.prepare(`
+        UPDATE delivery_assignments SET status = 'timed_out', responded_at = ?
+        WHERE id = ? AND status = 'offered'
+        RETURNING delivery_id, rider_id
+      `).get(now, assignmentId) as { delivery_id: string; rider_id: string } | undefined;
+      if (assignment) releaseOffer(assignment.delivery_id, assignment.rider_id);
+      return assignment;
+    });
+    if (!expired) return;
+    broadcastWsEvent('assignment:updated', { id: assignmentId, status: 'timed_out' });
+    dispatchWaitingDeliveries();
+  }, Math.max(0, Date.parse(expiresAt) - Date.now()));
+  timer.unref();
+  offerTimers.set(assignmentId, timer);
+}
+
+export function releaseOffer(deliveryId: string, riderId: string): void {
+  db.prepare(`
+    UPDATE delivery_requests SET status = 'pending_dispatch', assigned_rider_id = NULL, updated_at = ?
+    WHERE id = ? AND assigned_rider_id = ? AND status = 'assigned'
+  `).run(new Date().toISOString(), deliveryId, riderId);
+}
+
+export function resumeDispatch(): () => void {
+  db.prepare(`
+    UPDATE delivery_requests SET status = 'pending_dispatch', assigned_rider_id = NULL, updated_at = ?
+    WHERE status = 'assigned' AND NOT EXISTS (
+      SELECT 1 FROM delivery_assignments a WHERE a.delivery_id = delivery_requests.id
+        AND a.rider_id = delivery_requests.assigned_rider_id AND a.status IN ('offered', 'accepted')
+    )
+  `).run(new Date().toISOString());
+  const offers = db.prepare(`SELECT id, expires_at FROM delivery_assignments WHERE status = 'offered'`)
+    .all() as Array<{ id: string; expires_at: string }>;
+  for (const offer of offers) scheduleOfferExpiry(offer.id, offer.expires_at);
+  dispatchWaitingDeliveries();
+  const configuredDelay = Number(process.env.SAQO_DISPATCH_ALERT_SECONDS);
+  const delaySeconds = configuredDelay > 0 && Number.isFinite(configuredDelay) ? configuredDelay : 300;
+  const checkQueue = () => {
+    const cutoff = new Date(Date.now() - delaySeconds * 1000).toISOString();
+    const { total } = db.prepare(`
+      SELECT COUNT(*) AS total FROM delivery_requests
+      WHERE status IN ('pending_dispatch', 'no_rider_available')
+        AND (payment_method = 'cash' OR payment_status = 'paid') AND created_at <= ?
+    `).get(cutoff) as { total: number };
+    if (total) void sendOpsAlert('dispatch_delay', { waitingDeliveries: total, delaySeconds });
+  };
+  checkQueue();
+  const poll = setInterval(() => {
+    dispatchWaitingDeliveries();
+    checkQueue();
+  }, 10_000).unref();
+  return () => {
+    clearInterval(poll);
+    for (const timer of offerTimers.values()) clearTimeout(timer);
+    offerTimers.clear();
+  };
+}
+
 export function dispatchNextRiderForDelivery(deliveryId: string): {
   offered: boolean;
   riderId?: string;
   riderName?: string;
 } {
   const delivery = getDeliveryById(deliveryId);
-  if (!delivery) return { offered: false };
-  if (delivery.status === 'cancelled' || delivery.status === 'delivered') {
+  if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
     return { offered: false };
   }
 
@@ -141,14 +354,7 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
     activeDeliveries: allDeliveries.filter(
       (d) =>
         d.assignedRiderId === rider.riderId &&
-        [
-          'assigned',
-          'accepted',
-          'heading_to_pickup',
-          'parcel_picked_up',
-          'in_transit',
-          'arrived_at_destination',
-        ].includes(d.status)
+        activeStatuses.includes(d.status)
     ),
   }));
 
@@ -160,6 +366,7 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
   });
 
   if (ranked.length === 0) {
+    if (delivery.status === 'no_rider_available') return { offered: false };
     const now = new Date().toISOString();
     db.prepare(`UPDATE delivery_requests SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ? WHERE id = ?`).run(
       now,
@@ -171,7 +378,7 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
     `).run(
       `hist-${crypto.randomUUID().slice(0, 8)}`,
       deliveryId,
-      'No eligible riders currently available within dispatch radius. You can retry dispatch or contact support.',
+      'Queued until an eligible rider has capacity.',
       now
     );
 
@@ -182,7 +389,7 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
       const notif = createNotification(
         custRow.profile_id,
         'No rider available right now',
-        `Parcel ${delivery.trackingCode} is awaiting an eligible rider. Tap Retry Dispatch anytime.`,
+        `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
         deliveryId
       );
       broadcastWsEvent('notification:created', notif);
@@ -198,39 +405,41 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1000);
 
-  db.prepare(`
-    INSERT INTO delivery_assignments (
-      id, delivery_id, rider_id, status, score, distance_to_pickup_km,
-      route_compatibility_score, offered_at, expires_at
-    ) VALUES (?, ?, ?, 'offered', ?, ?, ?, ?, ?)
-  `).run(
-    assignmentId,
-    deliveryId,
-    topCandidate.rider.riderId,
-    topCandidate.compositeScore,
-    topCandidate.distanceToPickupKm,
-    topCandidate.routeCompatibilityScore,
-    now.toISOString(),
-    expiresAt.toISOString()
-  );
+  persistDispatchChange(() => {
+    db.prepare(`
+      INSERT INTO delivery_assignments (
+        id, delivery_id, rider_id, status, score, distance_to_pickup_km,
+        route_compatibility_score, offered_at, expires_at
+      ) VALUES (?, ?, ?, 'offered', ?, ?, ?, ?, ?)
+    `).run(
+      assignmentId,
+      deliveryId,
+      topCandidate.rider.riderId,
+      topCandidate.compositeScore,
+      topCandidate.distanceToPickupKm,
+      topCandidate.routeCompatibilityScore,
+      now.toISOString(),
+      expiresAt.toISOString()
+    );
 
-  db.prepare(`
-    UPDATE delivery_requests
-    SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
-    WHERE id = ?
-  `).run(topCandidate.rider.riderId, now.toISOString(), deliveryId);
+    db.prepare(`
+      UPDATE delivery_requests
+      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
+      WHERE id = ?
+    `).run(topCandidate.rider.riderId, now.toISOString(), deliveryId);
 
-  db.prepare(`
-    INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-    VALUES (?, ?, 'assigned', ?, 'system', ?)
-  `).run(
-    `hist-${crypto.randomUUID().slice(0, 8)}`,
-    deliveryId,
-    `Smart dispatch offered parcel to ${topCandidate.rider.fullName} (${topCandidate.distanceToPickupKm} km away, route fit ${Math.round(
-      topCandidate.routeCompatibilityScore * 100
-    )}%).`,
-    now.toISOString()
-  );
+    db.prepare(`
+      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+      VALUES (?, ?, 'assigned', ?, 'system', ?)
+    `).run(
+      `hist-${crypto.randomUUID().slice(0, 8)}`,
+      deliveryId,
+      `Smart dispatch offered parcel to ${topCandidate.rider.fullName} (${topCandidate.distanceToPickupKm} km away, route fit ${Math.round(
+        topCandidate.routeCompatibilityScore * 100
+      )}%).`,
+      now.toISOString()
+    );
+  });
 
   const riderNotif = createNotification(
     topCandidate.rider.id,
@@ -268,34 +477,10 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
     routeCompatibilityScore: topCandidate.routeCompatibilityScore,
     offeredAt: now.toISOString(),
     expiresAt: expiresAt.toISOString(),
-    delivery: updatedDelivery,
+    delivery: updatedDelivery && { ...updatedDelivery, deliveryOtp: undefined },
   });
 
-  // Configurable timeout fallback to next eligible rider
-  const timer = setTimeout(() => {
-    offerTimers.delete(assignmentId);
-    const current = db
-      .prepare('SELECT status FROM delivery_assignments WHERE id = ?')
-      .get(assignmentId) as { status: string } | undefined;
-    if (current && current.status === 'offered') {
-      const tNow = new Date().toISOString();
-      db.prepare(
-        `UPDATE delivery_assignments SET status = 'timed_out', responded_at = ? WHERE id = ?`
-      ).run(tNow, assignmentId);
-      db.prepare(`
-        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-        VALUES (?, ?, 'pending_dispatch', ?, 'system', ?)
-      `).run(
-        `hist-${crypto.randomUUID().slice(0, 8)}`,
-        deliveryId,
-        `${topCandidate.rider.fullName} did not respond within ${settings.offerTimeoutSeconds}s. Trying next eligible rider.`,
-        tNow
-      );
-      dispatchNextRiderForDelivery(deliveryId);
-    }
-  }, settings.offerTimeoutSeconds * 1000);
-
-  offerTimers.set(assignmentId, timer);
+  scheduleOfferExpiry(assignmentId, expiresAt.toISOString());
 
   return {
     offered: true,

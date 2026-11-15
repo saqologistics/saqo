@@ -1,11 +1,14 @@
 import 'dotenv/config';
+import { createBookingRows } from './src/server/deliveryBooking';
+import { checkLoginThrottle } from './src/server/loginThrottle';
+import { sendOpsAlert } from './src/server/opsAlerts';
+import { getWhatsAppOrderNumber, registerTwilioWhatsAppWebhook, sendWhatsAppSupportReply } from './src/server/whatsapp';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import { WebSocketServer } from 'ws';
-import { createServer as createViteServer } from 'vite';
 import {
   addSupportMessage,
   createNotification,
@@ -19,7 +22,10 @@ import {
   getAssignmentsForRider,
   getDeliveryById,
   getDeliveryByTrackingCode,
+  publicTrackingDelivery,
+  publicTrackingHistory,
   getDeliveryHistory,
+  riderDelivery,
   getNotificationsForUser,
   getPlatformSettings,
   getProfileById,
@@ -40,21 +46,56 @@ import {
 import {
   broadcastWsEvent,
   clearOfferTimer,
+  canDispatch,
+  dispatchWaitingDeliveries,
+  releaseOffer,
+  resumeDispatch,
+  clearWsClientAuth,
   dispatchNextRiderForDelivery,
   getSupportPresence,
   isAdminChatAvailableFlag,
   registerWsClient,
+  setWsTracking,
+  setWsSupportVisitor,
+  sendSupportTyping,
   setAdminChatAvailability,
   setWsClientAuth,
 } from './src/server/dispatchEngine';
 import { findStateHub, resolveAddressCoordinates } from './src/shared/nigeria';
 import {
   calculateDeliveryQuote,
-  calculateRiderPayoutNgn,
   isValidNigerianPhone,
   matchesDeliveryOtp,
 } from './src/shared/pricing';
-import type { DeliveryStatus, SupportConversationStatus, UserRole } from './src/shared/types';
+import type { DeliveryStatus, PaymentMethodCode, SupportConversationStatus, UserRole } from './src/shared/types';
+import {
+  adjustWalletAtomic,
+  cancelDeliveryPayments,
+  confirmFlutterwaveTransaction,
+  confirmRiderCashCollection,
+  createDeliveryPaymentRecords,
+  ensureWallet,
+  exportPaymentsCsv,
+  getAdminPaymentsOverview,
+  getCustomerWalletSummary,
+  getGatewayAdminView,
+  getGatewayPublicConfig,
+  getPaymentTransactionByKey,
+  reuseFlutterwaveCheckout,
+  getWalletAuditLogs,
+  initializeDeliveryFlutterwavePayment,
+  initializeWalletFunding,
+  InsufficientWalletBalanceError,
+  payDeliveryWithWallet,
+  PaymentConfigError,
+  PaymentVerificationError,
+  processAdminRefund,
+  refreshFlutterwaveRefund,
+  processFlutterwaveWebhook,
+  reconcileCashOrBankCollection,
+  submitBankTransferProof,
+  updateGatewaySettings,
+} from './src/server/paymentService';
 
 initDatabase();
 
@@ -108,12 +149,123 @@ function tryAuthenticate(req: Request): { userId: string; role: UserRole } | nul
   return { userId: profile.id, role: profile.role };
 }
 
+function isValidNigeriaCoordPair(lat: unknown, lng: unknown): boolean {
+  const nLat = Number(lat);
+  const nLng = Number(lng);
+  return (
+    Number.isFinite(nLat) &&
+    Number.isFinite(nLng) &&
+    nLat >= 4.0 &&
+    nLat <= 14.5 &&
+    nLng >= 2.0 &&
+    nLng <= 15.0
+  );
+}
+
+function verifyHandoffOtp(
+  res: Response,
+  delivery: { id: string; deliveryOtp: string },
+  otp: unknown
+): boolean {
+  const now = Date.now();
+  const resetAt = now + 15 * 60 * 1000;
+  const attempt = db.prepare(`
+    INSERT INTO delivery_otp_attempts (delivery_id, attempts, reset_at) VALUES (?, 1, ?)
+    ON CONFLICT(delivery_id) DO UPDATE SET
+      attempts = CASE WHEN reset_at <= ? THEN 1 ELSE attempts + 1 END,
+      reset_at = CASE WHEN reset_at <= ? THEN excluded.reset_at ELSE reset_at END
+    RETURNING attempts, reset_at
+  `).get(delivery.id, resetAt, now, now) as { attempts: number; reset_at: number };
+
+  if (attempt.attempts > 5) {
+    res.set('Retry-After', String(Math.ceil((attempt.reset_at - now) / 1000)))
+      .status(429).json({ error: 'Too many delivery code attempts. Please try again later.' });
+    return false;
+  }
+  if (!matchesDeliveryOtp(typeof otp === 'string' ? otp : '', delivery.deliveryOtp)) {
+    res.status(400).json({ error: 'Invalid delivery OTP. Please check the 4-digit code.' });
+    return false;
+  }
+  return true;
+}
+
+function asyncRoute(handler: (req: AuthedRequest, res: Response) => Promise<unknown>) {
+  return (req: AuthedRequest, res: Response, next: NextFunction) => {
+    void handler(req, res).catch(next);
+  };
+}
+
+function getRequestOrigin(req: Request): string {
+  const configured = process.env.APP_URL;
+  if (configured) {
+    try {
+      const url = new URL(configured);
+      if (url.protocol === 'https:' || (process.env.NODE_ENV !== 'production' && url.protocol === 'http:')) {
+        return url.origin;
+      }
+    } catch {
+      // Development can run without a public origin.
+    }
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new PaymentConfigError('Set APP_URL to the public HTTPS URL before enabling payment checkout.');
+  }
+  return `${req.protocol}://${req.get('host') || `localhost:${process.env.PORT || 3000}`}`;
+}
+
+function sendPaymentError(res: Response, err: unknown): void {
+  if (err instanceof InsufficientWalletBalanceError) {
+    res.status(400).json({
+      error: err.message,
+      code: err.code,
+      requiredAmountNgn: err.requiredAmountNgn,
+      availableBalanceNgn: err.availableBalanceNgn,
+    });
+    return;
+  }
+  if (err instanceof PaymentConfigError || err instanceof PaymentVerificationError) {
+    res.status(err.statusCode).json({ error: err.message, code: err.code });
+    return;
+  }
+  const message = err instanceof Error ? err.message : 'Payment operation failed.';
+  res.status(400).json({ error: message });
+}
+
 async function startServer() {
   const app = express();
-  app.use(express.json());
+  if (process.env.SAQO_TRUST_PROXY === '1') app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+  app.use('/api', (_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+  app.use(
+    express.json({
+      verify: (req: any, _res, buf) => {
+        req.rawBody = buf.toString('utf8');
+      },
+    })
+  );
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
+  const wsAlive = new WeakMap<import('ws').WebSocket, boolean>();
+
+  const wsHeartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      if (wsAlive.get(client) === false) {
+        client.terminate();
+        continue;
+      }
+      wsAlive.set(client, false);
+      try {
+        client.ping();
+      } catch {
+        client.terminate();
+      }
+    }
+  }, 25000);
+  wss.on('close', () => clearInterval(wsHeartbeat));
 
   server.on('upgrade', (req, socket, head) => {
     const pathname = new URL(req.url || '/', 'http://localhost').pathname;
@@ -125,6 +277,9 @@ async function startServer() {
   });
 
   wss.on('connection', (ws) => {
+    wsAlive.set(ws, true);
+    ws.on('pong', () => wsAlive.set(ws, true));
+
     registerWsClient(ws);
     ws.send(
       JSON.stringify({
@@ -149,16 +304,19 @@ async function startServer() {
           if (payload) {
             const prof = getProfileById(payload.userId);
             if (prof && prof.accountStatus === 'active') {
-              setWsClientAuth(ws, prof.id, prof.role);
+              setWsClientAuth(ws, prof.id, prof.role, payload.expiresAt);
+              return;
             }
           }
+          clearWsClientAuth(ws);
+        } else if (msg?.type === 'track' && typeof msg.trackingCode === 'string') {
+          setWsTracking(ws, msg.trackingCode.trim().toUpperCase().slice(0, 32));
+        } else if (msg?.type === 'logout') {
+          clearWsClientAuth(ws);
+        } else if (msg?.type === 'support:subscribe' && typeof msg.visitorToken === 'string') {
+          setWsSupportVisitor(ws, msg.visitorToken);
         } else if (msg?.type === 'support:typing' && typeof msg.conversationId === 'string') {
-          broadcastWsEvent('support:typing', {
-            conversationId: msg.conversationId,
-            senderRole: msg.senderRole === 'admin' ? 'admin' : 'visitor',
-            senderName: typeof msg.senderName === 'string' ? msg.senderName : 'Support',
-            isTyping: Boolean(msg.isTyping),
-          });
+          sendSupportTyping(ws, msg.conversationId, Boolean(msg.isTyping));
         }
       } catch {
         // ignore malformed frames
@@ -168,7 +326,7 @@ async function startServer() {
 
   // Healthcheck
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'saqo-dispatch' });
+    res.set('Cache-Control', 'no-store').json({ ok: true, service: 'saqo-dispatch' });
   });
 
   // Public settings
@@ -176,25 +334,60 @@ async function startServer() {
     const s = getPlatformSettings();
     res.json({
       whatsappSupportNumber: s.whatsappSupportNumber,
+      showDeliveryStateSelectors: s.showDeliveryStateSelectors,
+      whatsAppOrderNumber: getWhatsAppOrderNumber(),
       maxActiveParcelsPerRider: s.maxActiveParcelsPerRider,
       offerTimeoutSeconds: s.offerTimeoutSeconds,
+      payments: getGatewayPublicConfig(),
     });
   });
 
+  app.get('/api/payments/config', (_req, res) => {
+    res.set('Cache-Control', 'no-store').json(getGatewayPublicConfig());
+  });
+
+  registerTwilioWhatsAppWebhook(app);
+
   // Quote endpoint
   app.post('/api/quote', (req, res) => {
-    const { pickupState, pickupAddress, destinationState, destinationAddress, weightKg } =
-      req.body || {};
+    const settings = getPlatformSettings();
+    const {
+      pickupState = 'Katsina',
+      pickupAddress,
+      pickupLat,
+      pickupLng,
+      destinationState = 'Katsina',
+      destinationAddress,
+      destinationLat,
+      destinationLng,
+      weightKg,
+    } = req.body || {};
+    if (!settings.showDeliveryStateSelectors && (pickupState !== 'Katsina' || destinationState !== 'Katsina')) {
+      res.status(400).json({ error: 'SAQO currently accepts pickup and destination locations within Katsina State.' });
+      return;
+    }
+
     if (!pickupState || !destinationState) {
       res.status(400).json({ error: 'Pickup and destination states are required.' });
       return;
     }
-    const pCoords = resolveAddressCoordinates(pickupState, pickupAddress || pickupState);
-    const dCoords = resolveAddressCoordinates(
-      destinationState,
-      destinationAddress || destinationState
-    );
-    const settings = getPlatformSettings();
+    const pCoords = isValidNigeriaCoordPair(pickupLat, pickupLng)
+      ? { lat: Number(Number(pickupLat).toFixed(5)), lng: Number(Number(pickupLng).toFixed(5)) }
+      : resolveAddressCoordinates(pickupState, pickupAddress || pickupState);
+    const dCoords = isValidNigeriaCoordPair(destinationLat, destinationLng)
+      ? {
+          lat: Number(Number(destinationLat).toFixed(5)),
+          lng: Number(Number(destinationLng).toFixed(5)),
+        }
+      : resolveAddressCoordinates(destinationState, destinationAddress || destinationState);
+    if (!pCoords || !dCoords) {
+      res.status(400).json({ error: 'Select a recognized pickup and destination location.' });
+      return;
+    }
+    if (pCoords.lat === dCoords.lat && pCoords.lng === dCoords.lng) {
+      res.status(400).json({ error: 'Choose different pickup and destination locations.' });
+      return;
+    }
     const quote = calculateDeliveryQuote({
       pickupState,
       pickupLat: pCoords.lat,
@@ -215,8 +408,15 @@ async function startServer() {
   // Auth: Login
   app.post('/api/auth/login', (req, res) => {
     const { email, password } = req.body || {};
-    if (!email || !password) {
+    if (typeof email !== 'string' || !email.trim() || email.length > 254 ||
+        typeof password !== 'string' || !password || password.length > 1024) {
       res.status(400).json({ error: 'Email and password are required.' });
+      return;
+    }
+    const throttle = checkLoginThrottle(req.ip || req.socket.remoteAddress || 'unknown', email);
+    if (throttle.retryAfter) {
+      res.set('Retry-After', String(throttle.retryAfter)).status(429)
+        .json({ error: 'Too many sign-in attempts. Please try again later.' });
       return;
     }
     const row = db
@@ -230,6 +430,7 @@ async function startServer() {
       res.status(403).json({ error: 'Account is suspended. Please contact SAQO support.' });
       return;
     }
+    throttle.clearAccount();
     const token = signSessionToken({ userId: row.id, role: row.role });
     const profile = getProfileById(row.id)!;
     const rider = profile.role === 'rider' ? getRiderByProfileId(profile.id) : null;
@@ -309,10 +510,7 @@ async function startServer() {
       res.status(404).json({ error: 'Tracking code not found.' });
       return;
     }
-    const history = getDeliveryHistory(delivery.id);
-    // Redact raw OTP on unauthenticated public lookup while exposing verification status
-    const { deliveryOtp: _otp, ...publicDelivery } = delivery;
-    res.json({ delivery: publicDelivery, history });
+    res.json({ delivery: publicTrackingDelivery(delivery), history: publicTrackingHistory(delivery.id) });
   });
 
   // Confirm OTP (public recipient or client)
@@ -331,10 +529,11 @@ async function startServer() {
       res.status(400).json({ error: 'Cancelled deliveries cannot be confirmed.' });
       return;
     }
-    if (!otp || !matchesDeliveryOtp(String(otp), delivery.deliveryOtp)) {
-      res.status(400).json({ error: 'Invalid delivery OTP. Please check the 4-digit code.' });
+    if (delivery.status !== 'arrived_at_destination') {
+      res.status(409).json({ error: 'The rider must arrive at the destination before handoff.' });
       return;
     }
+    if (!verifyHandoffOtp(res, delivery, otp)) return;
 
     const now = new Date().toISOString();
     db.prepare(`
@@ -349,7 +548,7 @@ async function startServer() {
     `).run(
       `hist-${crypto.randomUUID().slice(0, 8)}`,
       delivery.id,
-      `Parcel receipt confirmed via 4-digit delivery OTP (${delivery.deliveryOtp}).`,
+      `Parcel receipt confirmed with a verified recipient OTP.`,
       now
     );
 
@@ -369,8 +568,8 @@ async function startServer() {
 
     const updated = getDeliveryById(delivery.id)!;
     broadcastWsEvent('delivery:updated', updated);
-    const { deliveryOtp: _otp, ...publicDelivery } = updated;
-    res.json({ delivery: publicDelivery, history: getDeliveryHistory(delivery.id) });
+    dispatchWaitingDeliveries();
+    res.json({ delivery: publicTrackingDelivery(updated), history: publicTrackingHistory(delivery.id) });
   });
 
   // Notifications
@@ -400,19 +599,33 @@ async function startServer() {
     res.json({ deliveries: withHistory });
   });
 
-  // Client: Create delivery request + trigger Smart Dispatch
-  app.post('/api/deliveries', authenticate, requireRole('client'), (req: AuthedRequest, res) => {
+  // Client: Create delivery request + process payment method + trigger Smart Dispatch
+  app.post('/api/deliveries', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
+    const settings = getPlatformSettings();
     const {
-      pickupState,
+      pickupState = 'Katsina',
       pickupAddress,
-      destinationState,
+      pickupLat,
+      pickupLng,
+      destinationState = 'Katsina',
       destinationAddress,
+      destinationLat,
+      destinationLng,
       recipientName,
       recipientPhone,
       parcelCategory,
       parcelDescription,
       weightKg,
+      paymentMethod,
+      idempotencyKey,
+      transferReference,
+      transferProofNote,
     } = req.body || {};
+    if (!settings.showDeliveryStateSelectors && (pickupState !== 'Katsina' || destinationState !== 'Katsina')) {
+      res.status(400).json({ error: 'SAQO currently accepts pickup and destination locations within Katsina State.' });
+      return;
+    }
+
 
     if (
       !pickupState ||
@@ -431,17 +644,94 @@ async function startServer() {
       return;
     }
 
+    const chosenMethod: PaymentMethodCode = ['wallet', 'flutterwave', 'cash', 'bank_transfer'].includes(
+      paymentMethod
+    )
+      ? (paymentMethod as PaymentMethodCode)
+      : 'cash';
+
+    const cleanIdempotencyKey =
+      typeof idempotencyKey === 'string' && idempotencyKey.trim() ? idempotencyKey.trim() : null;
+    if (cleanIdempotencyKey) {
+      const existingPayment = db
+        .prepare('SELECT delivery_id, user_id FROM payment_transactions WHERE idempotency_key = ? AND delivery_id IS NOT NULL')
+        .get(cleanIdempotencyKey) as { delivery_id: string; user_id: string } | undefined;
+      if (existingPayment?.delivery_id) {
+        if (existingPayment.user_id !== req.auth!.userId) {
+          res.status(409).json({ error: 'This request key is already in use.' });
+          return;
+        }
+        const existingDelivery = getDeliveryById(existingPayment.delivery_id);
+        if (existingDelivery) {
+          let replayPaymentTx = getPaymentTransactionByKey(cleanIdempotencyKey);
+          if (replayPaymentTx?.provider === 'flutterwave') {
+            try {
+              replayPaymentTx = await reuseFlutterwaveCheckout(replayPaymentTx);
+            } catch (error) {
+              sendPaymentError(res, error);
+              return;
+            }
+          }
+          res.status(200).json({
+            delivery: getDeliveryById(existingDelivery.id) ?? existingDelivery,
+            history: getDeliveryHistory(existingDelivery.id),
+            paymentTransaction: replayPaymentTx,
+            checkoutUrl: replayPaymentTx?.checkoutUrl || null,
+            idempotentReplay: true,
+          });
+          return;
+        }
+      }
+    }
+
+    const methodRow = db
+      .prepare('SELECT is_enabled FROM payment_methods WHERE code = ?')
+      .get(chosenMethod) as { is_enabled: number } | undefined;
+    if (methodRow && !methodRow.is_enabled) {
+      res.status(400).json({ error: `${chosenMethod.replace('_', ' ')} payment method is currently disabled.` });
+      return;
+    }
+
     const cust = db
       .prepare('SELECT id FROM customers WHERE profile_id = ?')
       .get(req.auth!.userId) as { id: string } | undefined;
-    if (!cust) {
+    const customerProfile = getProfileById(req.auth!.userId);
+    if (!cust || !customerProfile) {
       res.status(400).json({ error: 'Customer profile not initialized.' });
       return;
     }
 
-    const settings = getPlatformSettings();
-    const pCoords = resolveAddressCoordinates(pickupState, pickupAddress);
-    const dCoords = resolveAddressCoordinates(destinationState, destinationAddress);
+    const publicPayConfig = getGatewayPublicConfig();
+    const methodConfig = publicPayConfig.methods.find((m) => m.code === chosenMethod);
+    if (methodConfig && !methodConfig.isEnabled) {
+      res.status(400).json({ error: `${methodConfig.name} is currently disabled.` });
+      return;
+    }
+    if (chosenMethod === 'flutterwave' && !publicPayConfig.isEnabled) {
+      res.status(400).json({
+        error: 'Online payment via Flutterwave is not currently enabled. Choose Wallet or Cash / Bank Transfer.',
+        code: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+      });
+      return;
+    }
+
+    const pCoords = isValidNigeriaCoordPair(pickupLat, pickupLng)
+      ? { lat: Number(Number(pickupLat).toFixed(5)), lng: Number(Number(pickupLng).toFixed(5)) }
+      : resolveAddressCoordinates(pickupState, pickupAddress);
+    const dCoords = isValidNigeriaCoordPair(destinationLat, destinationLng)
+      ? {
+          lat: Number(Number(destinationLat).toFixed(5)),
+          lng: Number(Number(destinationLng).toFixed(5)),
+        }
+      : resolveAddressCoordinates(destinationState, destinationAddress);
+    if (!pCoords || !dCoords) {
+      res.status(400).json({ error: 'Select a recognized pickup and destination location.' });
+      return;
+    }
+    if (pCoords.lat === dCoords.lat && pCoords.lng === dCoords.lng) {
+      res.status(400).json({ error: 'Choose different pickup and destination locations.' });
+      return;
+    }
     const parsedWeight = Math.max(0.5, Number(weightKg) || 1);
 
     const quote = calculateDeliveryQuote({
@@ -455,85 +745,91 @@ async function startServer() {
       settings,
     });
 
-    const deliveryId = `del-${crypto.randomUUID().slice(0, 8)}`;
-    const trackingCode = `SQ-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    const otp = String(Math.floor(1000 + Math.random() * 9000));
-    const now = new Date().toISOString();
+    if (chosenMethod === 'wallet') {
+      const wallet = ensureWallet(req.auth!.userId);
+      if (wallet.balanceNgn < quote.deliveryFeeNgn) {
+        res.status(400).json({
+          error: `Insufficient wallet balance. Delivery fee is ₦${quote.deliveryFeeNgn.toLocaleString()}, available balance is ₦${wallet.balanceNgn.toLocaleString()}. Fund your wallet to proceed.`,
+          code: 'INSUFFICIENT_WALLET_BALANCE',
+          requiredAmountNgn: quote.deliveryFeeNgn,
+          availableBalanceNgn: wallet.balanceNgn,
+        });
+        return;
+      }
+    }
 
-    db.prepare(`
-      INSERT INTO delivery_requests (
-        id, tracking_code, customer_id, pickup_state, pickup_address, pickup_lat, pickup_lng,
-        destination_state, destination_address, destination_lat, destination_lng,
-        recipient_name, recipient_phone, service_tier, distance_km, estimated_minutes,
-        delivery_fee_ngn, delivery_otp, otp_verified, status, assigned_rider_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending_dispatch', NULL, ?, ?)
-    `).run(
-      deliveryId,
-      trackingCode,
-      cust.id,
-      pickupState,
-      String(pickupAddress).trim(),
-      pCoords.lat,
-      pCoords.lng,
-      destinationState,
-      String(destinationAddress).trim(),
-      dCoords.lat,
-      dCoords.lng,
-      String(recipientName).trim(),
-      String(recipientPhone).trim(),
-      quote.serviceTier,
-      quote.distanceKm,
-      quote.estimatedMinutes,
-      quote.deliveryFeeNgn,
-      otp,
-      now,
-      now
-    );
+    const { deliveryId, trackingCode } = createBookingRows({
+      customerId: cust.id, pickupState, pickupAddress, pCoords, destinationState, destinationAddress, dCoords,
+      recipientName, recipientPhone, parcelCategory, parcelDescription, weightKg: parsedWeight,
+      paymentMethod: chosenMethod, quote, riderCommissionPercent: settings.riderCommissionPercent,
+    });
 
-    db.prepare(`
-      INSERT INTO parcels (id, delivery_id, category, description, weight_kg)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
-      `parc-${crypto.randomUUID().slice(0, 8)}`,
-      deliveryId,
-      parcelCategory || 'General Cargo',
-      String(parcelDescription).trim(),
-      parsedWeight
-    );
-
-    const riderPayout = calculateRiderPayoutNgn(
-      quote.deliveryFeeNgn,
-      settings.riderCommissionPercent
-    );
-    const platformFee = quote.deliveryFeeNgn - riderPayout;
-    db.prepare(`
-      INSERT INTO payments (id, delivery_id, amount_ngn, rider_payout_ngn, platform_fee_ngn, status, created_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', ?)
-    `).run(`pay-${crypto.randomUUID().slice(0, 8)}`, deliveryId, quote.deliveryFeeNgn, riderPayout, platformFee, now);
-
-    db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'pending_dispatch', ?, 'client', ?)
-    `).run(
-      `hist-${crypto.randomUUID().slice(0, 8)}`,
-      deliveryId,
-      `Parcel request created (${quote.serviceTier.replace('_', ' ')} · ${quote.distanceKm} km).`,
-      now
-    );
+    let paymentTransaction: any = null;
+    try {
+      if (chosenMethod === 'flutterwave') {
+        const origin = getRequestOrigin(req);
+        paymentTransaction = await initializeDeliveryFlutterwavePayment({
+          deliveryId,
+          userId: req.auth!.userId,
+          customerName: customerProfile.fullName,
+          customerEmail: customerProfile.email,
+          customerPhone: customerProfile.phone,
+          idempotencyKey: cleanIdempotencyKey,
+          redirectUrl: `${origin}/?flw_callback=1`,
+        });
+      } else {
+        const payRes = createDeliveryPaymentRecords({
+          deliveryId,
+          trackingCode,
+          customerProfileId: req.auth!.userId,
+          customerName: customerProfile.fullName,
+          customerEmail: customerProfile.email,
+          customerPhone: customerProfile.phone,
+          amountNgn: quote.deliveryFeeNgn,
+          paymentMethod: chosenMethod,
+          idempotencyKey: cleanIdempotencyKey,
+          transferReference: typeof transferReference === 'string' ? transferReference : null,
+          transferProofNote: typeof transferProofNote === 'string' ? transferProofNote : null,
+        });
+        paymentTransaction = payRes.paymentTransaction;
+        db.prepare('UPDATE delivery_requests SET payment_reference = ? WHERE id = ?').run(
+          payRes.paymentReference,
+          deliveryId
+        );
+      }
+    } catch (payErr) {
+      if (chosenMethod === 'flutterwave' && db.prepare('SELECT 1 FROM payment_transactions WHERE delivery_id = ?').get(deliveryId)) {
+        // Preserve the reference in case the provider accepted a request whose response was lost.
+        sendPaymentError(res, payErr);
+        return;
+      }
+      db.prepare('DELETE FROM delivery_status_history WHERE delivery_id = ?').run(deliveryId);
+      db.prepare('DELETE FROM payments WHERE delivery_id = ?').run(deliveryId);
+      db.prepare('DELETE FROM parcels WHERE delivery_id = ?').run(deliveryId);
+      db.prepare('DELETE FROM delivery_requests WHERE id = ?').run(deliveryId);
+      sendPaymentError(res, payErr);
+      return;
+    }
 
     const created = getDeliveryById(deliveryId)!;
     broadcastWsEvent('delivery:created', created);
 
     // Run Smart Rider Assignment Algorithm immediately
-    const dispatchResult = dispatchNextRiderForDelivery(deliveryId);
+    dispatchWaitingDeliveries();
+    const assigned = getDeliveryById(deliveryId);
+    const dispatchResult = assigned?.status === 'assigned'
+      ? { offered: true, riderId: assigned.assignedRiderId, riderName: assigned.assignedRiderName }
+      : { offered: false };
     const finalDelivery = getDeliveryById(deliveryId)!;
 
     res.status(201).json({
       delivery: finalDelivery,
       history: getDeliveryHistory(deliveryId),
       dispatchResult,
+      paymentTransaction,
+      checkoutUrl: paymentTransaction?.checkoutUrl || null,
     });
-  });
+  }));
 
   // Client or Admin: Retry smart dispatch
   app.post('/api/deliveries/:id/retry-dispatch', authenticate, requireRole('client', 'admin'), (req: AuthedRequest, res) => {
@@ -551,6 +847,10 @@ async function startServer() {
         return;
       }
     }
+    if (!['pending_dispatch', 'no_rider_available'].includes(delivery.status) || delivery.assignedRiderId) {
+      res.status(409).json({ error: 'Only waiting parcels can be retried.' });
+      return;
+    }
     db.prepare(
       `DELETE FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out')`
     ).run(delivery.id);
@@ -560,7 +860,7 @@ async function startServer() {
   });
 
   // Client or Admin: Cancel delivery
-  app.post('/api/deliveries/:id/cancel', authenticate, requireRole('client', 'admin'), (req: AuthedRequest, res) => {
+  app.post('/api/deliveries/:id/cancel', authenticate, requireRole('client', 'admin'), asyncRoute(async (req: AuthedRequest, res) => {
     const delivery = getDeliveryById(req.params.id);
     if (!delivery) {
       res.status(404).json({ error: 'Delivery not found.' });
@@ -593,7 +893,28 @@ async function startServer() {
       now,
       delivery.id
     );
-    db.prepare(`UPDATE payments SET status = 'refunded' WHERE delivery_id = ?`).run(delivery.id);
+
+    if (delivery.paymentMethod === 'wallet' && delivery.paymentStatus === 'paid') {
+      try {
+        await processAdminRefund({
+          deliveryId: delivery.id,
+          amountNgn: delivery.deliveryFeeNgn,
+          destination: 'wallet',
+          reason: `Automatic wallet refund on delivery cancellation (${delivery.trackingCode})`,
+          adminId: req.auth!.userId,
+        });
+      } catch {
+        // Non-fatal fallback: keep delivery cancelled if refund fails
+      }
+    } else if (delivery.paymentStatus !== 'paid' && delivery.paymentStatus !== 'collected_by_rider') {
+      cancelDeliveryPayments(delivery.id, {
+        reason:
+          req.auth!.role === 'admin'
+            ? `Delivery cancelled by operations (${delivery.trackingCode})`
+            : `Delivery cancelled by sender (${delivery.trackingCode})`,
+      });
+    }
+
     db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'cancelled', ?, ?, ?)
@@ -607,8 +928,166 @@ async function startServer() {
 
     const updated = getDeliveryById(delivery.id)!;
     broadcastWsEvent('delivery:updated', updated);
+    dispatchWaitingDeliveries();
     res.json({ delivery: updated });
+  }));
+
+  // Customer Wallet & Payment Endpoints
+  app.get('/api/wallet', authenticate, requireRole('client'), (req: AuthedRequest, res) => {
+    try {
+      res.json(getCustomerWalletSummary(req.auth!.userId));
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
   });
+
+  app.post('/api/wallet/fund/initialize', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
+    try {
+      const profile = getProfileById(req.auth!.userId);
+      if (!profile) {
+        res.status(401).json({ error: 'Account not found.' });
+        return;
+      }
+      const amountNgn = Number(req.body?.amountNgn);
+      const idempotencyKey =
+        typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey.trim() : null;
+      const origin = getRequestOrigin(req);
+      const tx = await initializeWalletFunding({
+        userId: profile.id,
+        customerName: profile.fullName,
+        customerEmail: profile.email,
+        customerPhone: profile.phone,
+        amountNgn,
+        idempotencyKey,
+        redirectUrl: `${origin}/?flw_callback=1`,
+      });
+      res.status(201).json({ paymentTransaction: tx, checkoutUrl: tx.checkoutUrl });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  }));
+
+  app.post('/api/wallet/verify', authenticate, asyncRoute(async (req: AuthedRequest, res) => {
+    try {
+      const { transactionId, txRef } = req.body || {};
+      if (!transactionId && !txRef) {
+        res.status(400).json({ error: 'transactionId or txRef is required.' });
+        return;
+      }
+
+      const cleanTxRef = txRef ? String(txRef).trim() : '';
+      const cleanTxId = transactionId ? String(transactionId).trim() : '';
+      const txRow = (cleanTxRef
+        ? db.prepare('SELECT user_id FROM payment_transactions WHERE reference = ?').get(cleanTxRef)
+        : db.prepare('SELECT user_id FROM payment_transactions WHERE provider_tx_id = ?').get(cleanTxId)) as
+        | { user_id: string }
+        | undefined;
+
+      if (txRow && req.auth!.role !== 'admin' && txRow.user_id !== req.auth!.userId) {
+        res.status(403).json({ error: 'You cannot verify another user transaction.' });
+        return;
+      }
+      if (!txRow && req.auth!.role !== 'admin' && !cleanTxRef) {
+        res.status(400).json({ error: 'Transaction reference (txRef) is required for verification.' });
+        return;
+      }
+
+      const result = await confirmFlutterwaveTransaction({
+        transactionId: cleanTxId || null,
+        txRef: cleanTxRef || null,
+        verifiedByUserId: req.auth!.userId,
+        source: 'callback',
+      });
+      res.json(result);
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  }));
+
+  app.post('/api/deliveries/:id/pay', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
+    try {
+      const { paymentMethod, idempotencyKey, transferReference, transferProofNote } = req.body || {};
+      const profile = getProfileById(req.auth!.userId);
+      if (!profile) {
+        res.status(401).json({ error: 'Account not found.' });
+        return;
+      }
+      if (!['wallet', 'flutterwave', 'bank_transfer'].includes(String(paymentMethod))) {
+        res.status(400).json({ error: 'Select wallet, flutterwave, or bank_transfer to complete payment.' });
+        return;
+      }
+      const methodRow = db
+        .prepare('SELECT is_enabled FROM payment_methods WHERE code = ?')
+        .get(String(paymentMethod)) as { is_enabled: number } | undefined;
+      if (methodRow && !methodRow.is_enabled) {
+        res.status(400).json({ error: `${String(paymentMethod).replace('_', ' ')} payment is currently disabled.` });
+        return;
+      }
+      if (paymentMethod === 'wallet') {
+        const result = payDeliveryWithWallet({
+          deliveryId: req.params.id,
+          userId: profile.id,
+          customerName: profile.fullName,
+          customerEmail: profile.email,
+          customerPhone: profile.phone,
+          idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : null,
+        });
+        res.json(result);
+        return;
+      }
+      if (paymentMethod === 'flutterwave') {
+        const origin = getRequestOrigin(req);
+        const tx = await initializeDeliveryFlutterwavePayment({
+          deliveryId: req.params.id,
+          userId: profile.id,
+          customerName: profile.fullName,
+          customerEmail: profile.email,
+          customerPhone: profile.phone,
+          idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : null,
+          redirectUrl: `${origin}/?flw_callback=1`,
+        });
+        res.json({ paymentTransaction: tx, checkoutUrl: tx.checkoutUrl });
+        return;
+      }
+      if (paymentMethod === 'bank_transfer') {
+        const updated = submitBankTransferProof({
+          deliveryId: req.params.id,
+          userId: profile.id,
+          transferReference: String(transferReference || ''),
+          transferProofNote: typeof transferProofNote === 'string' ? transferProofNote : undefined,
+        });
+        res.json({ delivery: updated });
+        return;
+      }
+      res.status(400).json({ error: 'Select wallet, flutterwave, or bank_transfer to complete payment.' });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  }));
+
+  // Flutterwave Server-Verified Webhook Endpoint
+  app.post('/api/webhooks/flutterwave', asyncRoute(async (req: any, res) => {
+    try {
+      const result = await processFlutterwaveWebhook({
+        headers: req.headers,
+        rawBody: req.rawBody || JSON.stringify(req.body || {}),
+        payload: req.body,
+      });
+      if (!result.accepted) {
+        res.status(401).json({ received: false, error: result.message || 'Invalid webhook signature.' });
+        return;
+      }
+      if (result.status === 'failed') {
+        void sendOpsAlert('payment_failure', { reason: 'flutterwave_webhook_processing' });
+        res.status(503).json({ received: true, status: 'retry' });
+        return;
+      }
+      res.status(200).json({ received: true, ...result });
+    } catch (err) {
+      void sendOpsAlert('payment_failure', { reason: 'flutterwave_webhook_exception' });
+      res.status(500).json({ received: false, error: err instanceof Error ? err.message : 'Webhook error' });
+    }
+  }));
 
   // Client: List submitted support tickets (suggestions & complaints)
   app.get('/api/client/tickets', authenticate, (req: AuthedRequest, res) => {
@@ -663,7 +1142,7 @@ async function startServer() {
     }
     const assignments = getAssignmentsForRider(rider.riderId);
     const deliveries = listDeliveries({ riderId: rider.riderId }).map((d) => ({
-      ...d,
+      ...riderDelivery(d),
       history: getDeliveryHistory(d.id),
     }));
     const settings = getPlatformSettings();
@@ -688,6 +1167,7 @@ async function startServer() {
     db.prepare('UPDATE riders SET is_online = ? WHERE id = ?').run(isOnline ? 1 : 0, rider.riderId);
     const updated = getRiderByProfileId(req.auth!.userId)!;
     broadcastWsEvent('rider:availability', updated);
+    if (isOnline) dispatchWaitingDeliveries();
     res.json({ rider: updated });
   });
 
@@ -700,8 +1180,8 @@ async function startServer() {
     }
     const lat = Number(req.body?.lat);
     const lng = Number(req.body?.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      res.status(400).json({ error: 'Valid lat/lng coordinates are required.' });
+    if (!isValidNigeriaCoordPair(lat, lng)) {
+      res.status(400).json({ error: 'Valid Nigerian GPS coordinates are required.' });
       return;
     }
     const now = new Date().toISOString();
@@ -719,6 +1199,7 @@ async function startServer() {
       lng: updated.currentLng,
       lastLocationAt: now,
     });
+    dispatchWaitingDeliveries();
     res.json({ rider: updated });
   });
 
@@ -742,14 +1223,23 @@ async function startServer() {
       return;
     }
 
-    clearOfferTimer(assignment.id);
-    const action = req.body?.action === 'accept' ? 'accept' : 'reject';
-    if (action === 'accept' && rider.verificationStatus !== 'verified') {
+    const delivery = getDeliveryById(assignment.delivery_id);
+    if (Date.parse(assignment.expires_at) <= Date.now() || delivery?.status !== 'assigned' || delivery.assignedRiderId !== rider.riderId) {
+      res.status(409).json({ error: 'This offer is no longer active.' });
+      return;
+    }
+    const action = req.body?.action;
+    if (action !== 'accept' && action !== 'reject') {
+      res.status(400).json({ error: 'Choose accept or reject.' });
+      return;
+    }
+    if (action === 'accept' && (!rider.isOnline || rider.verificationStatus !== 'verified')) {
       res.status(403).json({
         error: 'Your rider verification tick must be active to accept deliveries.',
       });
       return;
     }
+    clearOfferTimer(assignment.id);
     const now = new Date().toISOString();
 
     if (action === 'accept') {
@@ -785,7 +1275,7 @@ async function startServer() {
 
       broadcastWsEvent('assignment:updated', { id: assignment.id, status: 'accepted' });
       broadcastWsEvent('delivery:updated', updated);
-      res.json({ ok: true, delivery: updated });
+      res.json({ ok: true, delivery: riderDelivery(updated) });
       return;
     }
 
@@ -803,8 +1293,9 @@ async function startServer() {
       now
     );
     broadcastWsEvent('assignment:updated', { id: assignment.id, status: 'rejected' });
-    const nextResult = dispatchNextRiderForDelivery(assignment.delivery_id);
-    res.json({ ok: true, nextDispatch: nextResult });
+    releaseOffer(assignment.delivery_id, rider.riderId);
+    dispatchWaitingDeliveries();
+    res.json({ ok: true, nextDispatch: { offered: getDeliveryById(assignment.delivery_id)?.status === 'assigned' } });
   });
 
   // Rider: Advance delivery status
@@ -821,35 +1312,26 @@ async function startServer() {
       return;
     }
 
-    const allowedStatuses: DeliveryStatus[] = [
-      'accepted',
-      'heading_to_pickup',
-      'parcel_picked_up',
-      'in_transit',
-      'arrived_at_destination',
-      'delivered',
-    ];
+    const transitions: Partial<Record<DeliveryStatus, DeliveryStatus>> = {
+      accepted: 'heading_to_pickup',
+      heading_to_pickup: 'parcel_picked_up',
+      parcel_picked_up: 'in_transit',
+      in_transit: 'arrived_at_destination',
+      arrived_at_destination: 'delivered',
+    };
     const nextStatus = req.body?.status as DeliveryStatus;
-    if (!allowedStatuses.includes(nextStatus)) {
+    if (!nextStatus || transitions[delivery.status] !== nextStatus) {
       res.status(400).json({ error: 'Invalid delivery status transition.' });
       return;
     }
 
-    if (nextStatus === 'delivered') {
-      const providedOtp = String(req.body?.otp || '').trim();
-      if (!matchesDeliveryOtp(providedOtp, delivery.deliveryOtp)) {
-        res.status(400).json({
-          error: 'Invalid recipient OTP. Enter the 4-digit delivery code from the customer or recipient.',
-        });
-        return;
-      }
-    }
+    if (nextStatus === 'delivered' && !verifyHandoffOtp(res, delivery, req.body?.otp)) return;
 
     const now = new Date().toISOString();
     const note =
       req.body?.note ||
       (nextStatus === 'delivered'
-        ? `Parcel delivered and verified with 4-digit OTP (${delivery.deliveryOtp}).`
+        ? `Parcel delivered and verified with a verified recipient OTP.`
         : `Rider updated parcel status to ${nextStatus.replace(/_/g, ' ')}.`);
 
     if (nextStatus === 'delivered') {
@@ -867,37 +1349,6 @@ async function startServer() {
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, ?, ?, 'rider', ?)
     `).run(`hist-${crypto.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
-
-    // Move rider marker closer to destination as delivery progresses
-    if (nextStatus === 'heading_to_pickup') {
-      db.prepare('UPDATE riders SET current_lat = ?, current_lng = ?, last_location_at = ? WHERE id = ?').run(
-        Number(((rider.currentLat + delivery.pickupLat) / 2).toFixed(5)),
-        Number(((rider.currentLng + delivery.pickupLng) / 2).toFixed(5)),
-        now,
-        rider.riderId
-      );
-    } else if (nextStatus === 'parcel_picked_up') {
-      db.prepare('UPDATE riders SET current_lat = ?, current_lng = ?, last_location_at = ? WHERE id = ?').run(
-        delivery.pickupLat,
-        delivery.pickupLng,
-        now,
-        rider.riderId
-      );
-    } else if (nextStatus === 'in_transit') {
-      db.prepare('UPDATE riders SET current_lat = ?, current_lng = ?, last_location_at = ? WHERE id = ?').run(
-        Number(((delivery.pickupLat + delivery.destinationLat) / 2).toFixed(5)),
-        Number(((delivery.pickupLng + delivery.destinationLng) / 2).toFixed(5)),
-        now,
-        rider.riderId
-      );
-    } else if (nextStatus === 'arrived_at_destination' || nextStatus === 'delivered') {
-      db.prepare('UPDATE riders SET current_lat = ?, current_lng = ?, last_location_at = ? WHERE id = ?').run(
-        delivery.destinationLat,
-        delivery.destinationLng,
-        now,
-        rider.riderId
-      );
-    }
 
     if (nextStatus === 'delivered') {
       db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
@@ -935,7 +1386,29 @@ async function startServer() {
 
     const updated = getDeliveryById(delivery.id)!;
     broadcastWsEvent('delivery:updated', updated);
-    res.json({ delivery: updated, history: getDeliveryHistory(delivery.id) });
+    if (nextStatus === 'delivered') dispatchWaitingDeliveries();
+    res.json({ delivery: riderDelivery(updated), history: getDeliveryHistory(delivery.id) });
+  });
+
+  // Rider: Confirm Cash on Delivery collection
+  app.post('/api/rider/deliveries/:id/collect-cash', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
+    try {
+      const rider = getRiderByProfileId(req.auth!.userId);
+      if (!rider) {
+        res.status(404).json({ error: 'Rider profile not found.' });
+        return;
+      }
+      const updated = confirmRiderCashCollection({
+        deliveryId: req.params.id,
+        riderId: rider.riderId,
+        collectedAmountNgn:
+          req.body?.collectedAmountNgn !== undefined ? Number(req.body.collectedAmountNgn) : undefined,
+        notes: typeof req.body?.notes === 'string' ? req.body.notes : undefined,
+      });
+      res.json({ delivery: updated });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
   });
 
   // Admin: Full operational overview
@@ -978,6 +1451,15 @@ async function startServer() {
       return;
     }
 
+    if (!['pending_dispatch', 'no_rider_available', 'assigned'].includes(delivery.status) || !canDispatch(delivery)) {
+      res.status(409).json({ error: 'Only dispatchable parcels awaiting rider acceptance can be assigned.' });
+      return;
+    }
+    const alreadyReserved = delivery.assignedRiderId === rider.riderId ? 1 : 0;
+    if (rider.activeParcelsCount - alreadyReserved >= getPlatformSettings().maxActiveParcelsPerRider) {
+      res.status(409).json({ error: 'This rider has reached the active parcel limit.' });
+      return;
+    }
     const now = new Date().toISOString();
     db.prepare(
       `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
@@ -992,13 +1474,13 @@ async function startServer() {
 
     db.prepare(`
       UPDATE delivery_requests
-      SET assigned_rider_id = ?, status = CASE WHEN status IN ('pending_dispatch', 'no_rider_available') THEN 'assigned' ELSE status END, updated_at = ?
+      SET assigned_rider_id = ?, status = 'accepted', updated_at = ?
       WHERE id = ?
     `).run(rider.riderId, now, delivery.id);
 
     db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'assigned', ?, 'admin', ?)
+      VALUES (?, ?, 'accepted', ?, 'admin', ?)
     `).run(
       `hist-${crypto.randomUUID().slice(0, 8)}`,
       delivery.id,
@@ -1029,11 +1511,12 @@ async function startServer() {
 
     const updated = getDeliveryById(delivery.id)!;
     broadcastWsEvent('delivery:updated', updated);
+    dispatchWaitingDeliveries();
     res.json({ delivery: updated });
   });
 
   // Admin: Override or update delivery status for operational resolution
-  app.patch('/api/admin/deliveries/:id/status', authenticate, requireRole('admin'), (req, res) => {
+  app.patch('/api/admin/deliveries/:id/status', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     const delivery = getDeliveryById(req.params.id);
     if (!delivery) {
       res.status(404).json({ error: 'Delivery not found.' });
@@ -1056,6 +1539,15 @@ async function startServer() {
       res.status(400).json({ error: 'Invalid delivery status.' });
       return;
     }
+    if (['delivered', 'cancelled'].includes(delivery.status)) {
+      res.status(409).json({ error: 'A finalized parcel cannot be moved to another status.' });
+      return;
+    }
+    const requeue = nextStatus === 'pending_dispatch' || nextStatus === 'no_rider_available';
+    if (nextStatus === 'assigned' || (!requeue && nextStatus !== 'cancelled' && !delivery.assignedRiderId)) {
+      res.status(409).json({ error: 'Use rider assignment before advancing the parcel.' });
+      return;
+    }
 
     const now = new Date().toISOString();
     const note =
@@ -1064,11 +1556,22 @@ async function startServer() {
         : `SAQO Operations updated status to ${nextStatus.replace(/_/g, ' ')}.`;
 
     const wasDelivered = delivery.status === 'delivered';
-    db.prepare('UPDATE delivery_requests SET status = ?, updated_at = ? WHERE id = ?').run(
+    db.prepare(`UPDATE delivery_requests
+      SET status = ?, updated_at = ?, assigned_rider_id = CASE WHEN ? THEN NULL ELSE assigned_rider_id END
+      WHERE id = ?`).run(
       nextStatus,
       now,
+      requeue ? 1 : 0,
       delivery.id
     );
+    if (requeue || nextStatus !== 'cancelled') {
+      const replaced = db.prepare(`
+        UPDATE delivery_assignments SET status = ?, responded_at = ?
+        WHERE delivery_id = ? AND (status = 'offered' OR (? AND status = 'accepted'))
+        RETURNING id
+      `).all(requeue ? 'reassigned' : 'accepted', now, delivery.id, requeue ? 1 : 0) as Array<{ id: string }>;
+      for (const assignment of replaced) clearOfferTimer(assignment.id);
+    }
     db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, ?, ?, 'admin', ?)
@@ -1095,7 +1598,23 @@ async function startServer() {
       db.prepare(
         `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
       ).run(now, delivery.id);
-      db.prepare(`UPDATE payments SET status = 'refunded' WHERE delivery_id = ?`).run(delivery.id);
+      if (delivery.paymentMethod === 'wallet' && delivery.paymentStatus === 'paid') {
+        try {
+          await processAdminRefund({
+            deliveryId: delivery.id,
+            amountNgn: delivery.deliveryFeeNgn,
+            destination: 'wallet',
+            reason: `Automatic wallet refund on admin delivery cancellation (${delivery.trackingCode})`,
+            adminId: req.auth!.userId,
+          });
+        } catch {
+          // Non-fatal fallback
+        }
+      } else if (delivery.paymentStatus !== 'paid' && delivery.paymentStatus !== 'collected_by_rider') {
+        cancelDeliveryPayments(delivery.id, {
+          reason: `Delivery cancelled by operations (${delivery.trackingCode})`,
+        });
+      }
     }
 
     const custRow = db
@@ -1113,8 +1632,9 @@ async function startServer() {
 
     const updated = { ...getDeliveryById(delivery.id)!, history: getDeliveryHistory(delivery.id) };
     broadcastWsEvent('delivery:updated', updated);
+    if (requeue || nextStatus === 'delivered' || nextStatus === 'cancelled') dispatchWaitingDeliveries();
     res.json({ delivery: updated });
-  });
+  }));
 
   // Admin: Issue a new Rider account
   app.post('/api/admin/riders', authenticate, requireRole('admin'), (req, res) => {
@@ -1297,8 +1817,15 @@ async function startServer() {
   app.patch('/api/admin/settings', authenticate, requireRole('admin'), (req, res) => {
     const current = getPlatformSettings();
     const b = req.body || {};
+    const maxActiveParcelsPerRider = Number(b.maxActiveParcelsPerRider ?? current.maxActiveParcelsPerRider);
+    if (!Number.isSafeInteger(maxActiveParcelsPerRider) || maxActiveParcelsPerRider < 1) {
+      res.status(400).json({ error: 'The active parcel limit must be a positive whole number.' });
+      return;
+    }
     const next = {
-      maxActiveParcelsPerRider: Math.max(1, Number(b.maxActiveParcelsPerRider ?? current.maxActiveParcelsPerRider)),
+      maxActiveParcelsPerRider,
+      showDeliveryStateSelectors: typeof b.showDeliveryStateSelectors === 'boolean'
+        ? b.showDeliveryStateSelectors : current.showDeliveryStateSelectors,
       searchRadiusKm: Math.max(5, Number(b.searchRadiusKm ?? current.searchRadiusKm)),
       offerTimeoutSeconds: Math.max(10, Number(b.offerTimeoutSeconds ?? current.offerTimeoutSeconds)),
       baseLocalFeeNgn: Math.max(300, Number(b.baseLocalFeeNgn ?? current.baseLocalFeeNgn)),
@@ -1317,7 +1844,8 @@ async function startServer() {
         per_km_rate_ngn = ?,
         inter_state_surcharge_ngn = ?,
         rider_commission_percent = ?,
-        whatsapp_support_number = ?
+        whatsapp_support_number = ?,
+        show_delivery_state_selectors = ?
       WHERE id = 1
     `).run(
       next.maxActiveParcelsPerRider,
@@ -1327,11 +1855,179 @@ async function startServer() {
       next.perKmRateNgn,
       next.interStateSurchargeNgn,
       next.riderCommissionPercent,
-      next.whatsappSupportNumber
+      next.whatsappSupportNumber,
+      Number(next.showDeliveryStateSelectors)
     );
 
     broadcastWsEvent('settings:updated', next);
+    dispatchWaitingDeliveries();
     res.json({ settings: next });
+  });
+
+  // Admin: Payments & Wallet Management Overview (metrics + paginated transactions + wallets + cash collections + refunds + webhooks + audit logs)
+  app.get('/api/admin/payments/overview', authenticate, requireRole('admin'), (req, res) => {
+    const overview = getAdminPaymentsOverview({
+      search: typeof req.query.search === 'string' ? req.query.search : undefined,
+      method: typeof req.query.method === 'string' ? req.query.method : undefined,
+      status: typeof req.query.status === 'string' ? req.query.status : undefined,
+      purpose: typeof req.query.purpose === 'string' ? req.query.purpose : undefined,
+      dateFrom: typeof req.query.dateFrom === 'string' ? req.query.dateFrom : undefined,
+      dateTo: typeof req.query.dateTo === 'string' ? req.query.dateTo : undefined,
+      page: req.query.page ? Number(req.query.page) : 1,
+      pageSize: req.query.pageSize ? Number(req.query.pageSize) : 15,
+    });
+    res.json({ ...overview, auditLogs: getWalletAuditLogs(60) });
+  });
+
+  // Admin: Export filtered payment transactions as CSV
+  app.get('/api/admin/payments/export', authenticate, requireRole('admin'), (req, res) => {
+    const csv = exportPaymentsCsv({
+      search: typeof req.query.search === 'string' ? req.query.search : undefined,
+      method: typeof req.query.method === 'string' ? req.query.method : undefined,
+      status: typeof req.query.status === 'string' ? req.query.status : undefined,
+      purpose: typeof req.query.purpose === 'string' ? req.query.purpose : undefined,
+      dateFrom: typeof req.query.dateFrom === 'string' ? req.query.dateFrom : undefined,
+      dateTo: typeof req.query.dateTo === 'string' ? req.query.dateTo : undefined,
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="saqo-payments-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(csv);
+  });
+
+  // Admin: Inspect individual customer's wallet balance & ledger
+  app.get('/api/admin/customers/:profileId/wallet', authenticate, requireRole('admin'), (req, res) => {
+    try {
+      const profile = getProfileById(req.params.profileId);
+      if (!profile) {
+        res.status(404).json({ error: 'Customer profile not found.' });
+        return;
+      }
+      const summary = getCustomerWalletSummary(profile.id);
+      const auditLogs = getWalletAuditLogs(100).filter((l) => l.userId === profile.id);
+      res.json({ profile, ...summary, auditLogs });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  });
+
+  // Admin: Adjust wallet balance with mandatory reason & audit trail
+  app.post('/api/admin/wallets/:walletId/adjust', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+    try {
+      const { direction, amountNgn, reason, idempotencyKey } = req.body || {};
+      if (!['credit', 'debit'].includes(direction)) {
+        res.status(400).json({ error: 'Direction must be credit or debit.' });
+        return;
+      }
+      const actor = getProfileById(req.auth!.userId);
+      const result = adjustWalletAtomic({
+        walletId: req.params.walletId,
+        direction,
+        amountNgn: Number(amountNgn),
+        reason: String(reason || ''),
+        actorId: req.auth!.userId,
+        actorName: actor?.fullName || 'SAQO Admin',
+        idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : null,
+      });
+      res.json(result);
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  });
+
+  // Admin: Reconcile or dispute cash on delivery / bank transfer collection
+  app.post('/api/admin/cash-collections/:id/reconcile', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+    try {
+      const { action, collectedAmountNgn, notes } = req.body || {};
+      if (!['reconcile', 'dispute'].includes(action)) {
+        res.status(400).json({ error: 'Action must be reconcile or dispute.' });
+        return;
+      }
+      const updated = reconcileCashOrBankCollection({
+        collectionId: req.params.id,
+        action,
+        adminId: req.auth!.userId,
+        collectedAmountNgn: collectedAmountNgn !== undefined ? Number(collectedAmountNgn) : undefined,
+        notes: typeof notes === 'string' ? notes : undefined,
+      });
+      res.json({ cashCollection: updated });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  });
+
+  // Admin: Manually trigger server-side Flutterwave verification for a pending payment
+  app.post('/api/admin/payments/:id/verify', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
+    try {
+      const row = db
+        .prepare('SELECT id, reference, provider_tx_id FROM payment_transactions WHERE id = ? OR reference = ?')
+        .get(req.params.id, req.params.id) as { id: string; reference: string; provider_tx_id: string | null } | undefined;
+      if (!row) {
+        res.status(404).json({ error: 'Payment transaction not found.' });
+        return;
+      }
+      const result = await confirmFlutterwaveTransaction({
+        transactionId: row.provider_tx_id,
+        txRef: row.reference,
+        verifiedByUserId: req.auth!.userId,
+        source: 'admin_verify',
+      });
+      res.json(result);
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  }));
+
+  // Admin: Issue refund (to customer wallet, Flutterwave, or manual)
+  app.post('/api/admin/refunds', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
+    try {
+      const { paymentTransactionId, deliveryId, amountNgn, destination, reason } = req.body || {};
+      if (!['wallet', 'flutterwave', 'manual'].includes(destination)) {
+        res.status(400).json({ error: 'Refund destination must be wallet, flutterwave, or manual.' });
+        return;
+      }
+      const refund = await processAdminRefund({
+        paymentTransactionId: typeof paymentTransactionId === 'string' ? paymentTransactionId : undefined,
+        deliveryId: typeof deliveryId === 'string' ? deliveryId : undefined,
+        amountNgn: Number(amountNgn),
+        destination,
+        reason: String(reason || ''),
+        adminId: req.auth!.userId,
+      });
+      res.status(201).json({ refund });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  }));
+
+  app.post('/api/admin/refunds/:id/verify', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
+    try {
+      res.json({ status: await refreshFlutterwaveRefund(req.params.id) });
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
+  }));
+
+  // Admin: View Payment Gateway (Flutterwave & Bank Account) Settings (secrets strictly masked!)
+  app.get('/api/admin/gateway-settings', authenticate, requireRole('admin'), (req, res) => {
+    try {
+      res.set('Cache-Control', 'no-store').json(getGatewayAdminView(getRequestOrigin(req)));
+    } catch (error) {
+      sendPaymentError(res, error);
+    }
+  });
+
+  // Admin: Update Payment Gateway Settings (secrets encrypted at rest, never logged or returned)
+  app.patch('/api/admin/gateway-settings', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+    try {
+      const updated = updateGatewaySettings(
+        req.body || {},
+        req.auth!.userId,
+        getRequestOrigin(req)
+      );
+      res.json(updated);
+    } catch (err) {
+      sendPaymentError(res, err);
+    }
   });
 
   // Admin: Resolve / update complaint or suggestion ticket & notify reporter
@@ -1366,7 +2062,7 @@ async function startServer() {
 
   // Public: Admin online presence
   app.get('/api/support/presence', (_req, res) => {
-    res.json(getSupportPresence());
+    res.set('Cache-Control', 'no-store').json(getSupportPresence());
   });
 
   // Visitor / Client: List persistent conversations
@@ -1560,10 +2256,11 @@ async function startServer() {
 
   // Admin: List all support conversations + presence state
   app.get('/api/admin/support/conversations', authenticate, requireRole('admin'), (_req, res) => {
+    const accepting = isAdminChatAvailableFlag();
     res.json({
       conversations: getAllSupportConversations(),
       presence: getSupportPresence(),
-      adminAcceptingChats: isAdminChatAvailableFlag(),
+      adminAcceptingChats: accepting,
     });
   });
 
@@ -1590,7 +2287,7 @@ async function startServer() {
   });
 
   // Admin: Send reply message in a support conversation
-  app.post('/api/admin/support/conversations/:id/messages', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+  app.post('/api/admin/support/conversations/:id/messages', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     const adminProfile = getProfileById(req.auth!.userId);
     const conv = getSupportConversationById(req.params.id);
     if (!conv) {
@@ -1600,6 +2297,12 @@ async function startServer() {
     const cleanBody = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
     if (!cleanBody) {
       res.status(400).json({ error: 'Reply message cannot be empty.' });
+      return;
+    }
+    try {
+      await sendWhatsAppSupportReply(conv.id, cleanBody);
+    } catch (error) {
+      res.status(502).json({ error: error instanceof Error ? error.message : 'WhatsApp reply could not be sent.' });
       return;
     }
     const result = addSupportMessage({
@@ -1621,7 +2324,7 @@ async function startServer() {
     broadcastWsEvent('support:message', result.message);
     broadcastWsEvent('support:conversation', result.conversation);
     res.status(201).json(result);
-  });
+  }));
 
   // Admin: Update support conversation status (open | pending | resolved | closed)
   app.patch('/api/admin/support/conversations/:id', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
@@ -1645,8 +2348,21 @@ async function startServer() {
     res.json(result);
   });
 
+  app.use('/api', (_req, res) => { res.status(404).json({ error: 'API route not found.' }); });
+  app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) { next(error); return; }
+    const status = (error as { status?: number } | null)?.status;
+    if (status === 400 || status === 413) {
+      res.status(status).json({ error: status === 413 ? 'Request body is too large.' : 'Invalid request body.' });
+      return;
+    }
+    console.error('API request failed:', error);
+    res.status(500).json({ error: 'Unexpected server error.' });
+  });
+
   // Vite / Static Middleware
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1659,18 +2375,33 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
-      app.get('*', (_req, res) => {
-        res.sendFile(path.join(distPath, 'index.html'));
-      });
-    }
+    const indexPath = path.join(distPath, 'index.html');
+    if (!fs.existsSync(indexPath)) throw new Error('Production frontend is missing. Run npm run build first.');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => { res.sendFile(indexPath); });
   }
 
   const PORT = Number(process.env.PORT) || 3000;
+  let stopDispatch = () => {};
   server.listen(PORT, '0.0.0.0', () => {
+    stopDispatch = resumeDispatch();
     console.log(`SAQO Logistics server listening on http://localhost:${PORT}`);
   });
+  if (process.env.NODE_ENV === 'production') {
+    const shutdown = () => {
+      stopDispatch();
+      clearInterval(wsHeartbeat);
+      for (const socket of wss.clients) socket.terminate();
+      const timeout = setTimeout(() => process.exit(1), 20_000).unref();
+      server.close(() => {
+        clearTimeout(timeout);
+        db.close();
+        process.exit(0);
+      });
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
+  }
 }
 
 startServer().catch((err) => {

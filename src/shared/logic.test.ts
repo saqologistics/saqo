@@ -10,6 +10,7 @@ import {
   matchesDeliveryOtp,
 } from './pricing';
 import { rankEligibleRiders } from './dispatch';
+import { resolveAddressCoordinates, searchSmartAddresses } from './nigeria';
 import { formatDeliveryStatusLabel, getTrackingProgress } from './tracking';
 import type { DeliveryRequest, RiderProfile } from './types';
 
@@ -63,6 +64,9 @@ function makeDelivery(overrides: Partial<DeliveryRequest> = {}): DeliveryRequest
     distanceKm: 132,
     estimatedMinutes: 170,
     deliveryFeeNgn: 13900,
+    paymentMethod: 'cash',
+    paymentStatus: 'unpaid',
+    paymentReference: null,
     deliveryOtp: '4821',
     otpVerified: false,
     status: 'pending_dispatch',
@@ -270,5 +274,28 @@ test('pricing & handoff helpers: validates rider payout, Nigerian phones, and 4-
   assert.equal(matchesDeliveryOtp('9999', '4821'), false);
   assert.equal(matchesDeliveryOtp('482', '4821'), false);
   assert.equal(matchesDeliveryOtp('abcd', 'abcd'), false);
+});
+
+test('nigeria/katsina smart address search: resolves aliases, local landmarks, and distinct opposite exclusion', () => {
+  const umyuMatches = searchSmartAddresses('Katsina', 'umyu');
+  assert.ok(umyuMatches.length > 0);
+  assert.ok(umyuMatches[0].label.includes('UMYU'));
+
+  const kofarMatches = searchSmartAddresses('Katsina', 'kofar k');
+  assert.ok(kofarMatches.length > 0);
+  assert.equal(kofarMatches[0].label, 'Kofar Kaura, Katsina');
+
+  const excludedDefault = searchSmartAddresses('Katsina', '', 'Kofar Kaura, Katsina');
+  assert.ok(excludedDefault.every((s) => s.label !== 'Kofar Kaura, Katsina'));
+
+  const fmcCoords = resolveAddressCoordinates('Katsina', 'FMC');
+  assert.ok(fmcCoords);
+  assert.equal(fmcCoords.lat, 12.9612);
+  assert.equal(fmcCoords.lng, 7.6265);
+  assert.deepEqual(searchSmartAddresses('Katsina', 'nonexistent address in katsina'), []);
+  assert.equal(resolveAddressCoordinates('Katsina', 'unrecognized street near FMC'), null);
+  assert.equal(resolveAddressCoordinates('Katsina', 'kofar k'), null);
+  assert.ok(searchSmartAddresses('Katsina', 'kofar kaura', 'Kofar Kaura, Katsina')
+    .every((place) => place.label !== 'Kofar Kaura, Katsina'));
 });
 

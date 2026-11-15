@@ -45,6 +45,8 @@ import type {
   SupportMessage,
   SupportPresence,
 } from '../shared/types';
+import { AdminGatewaySettingsCard } from './AdminGatewaySettingsCard';
+import { AdminPaymentsSection } from './AdminPaymentsSection';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
 import { PWAInstallButton } from './PWAInstallButton';
 import { SaqoLogo } from './SaqoLogo';
@@ -153,15 +155,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [sendingChat, setSendingChat] = useState(false);
   const [adminAcceptingChats, setAdminAcceptingChats] = useState(true);
   const [chatPresence, setChatPresence] = useState<SupportPresence>({
-    adminOnline: true,
-    onlineAdminCount: 1,
+    adminOnline: false,
+    onlineAdminCount: 0,
   });
   const [visitorTypingConvId, setVisitorTypingConvId] = useState<string | null>(null);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
   const adminChatEndRef = React.useRef<HTMLDivElement | null>(null);
   const lastAdminTypingEmitRef = React.useRef<number>(0);
+  const presenceUpdateCount = React.useRef(0);
 
   const loadSupportChats = useCallback(async () => {
+    const presenceUpdate = presenceUpdateCount.current;
     try {
       const res = await apiRequest<{
         conversations: SupportConversation[];
@@ -169,7 +173,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         adminAcceptingChats: boolean;
       }>('/api/admin/support/conversations');
       setConversations(res.conversations);
-      if (res.presence) setChatPresence(res.presence);
+      if (res.presence && presenceUpdate === presenceUpdateCount.current) setChatPresence(res.presence);
       if (typeof res.adminAcceptingChats === 'boolean') {
         setAdminAcceptingChats(res.adminAcceptingChats);
       }
@@ -261,6 +265,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const { sendEvent } = useRealtime((evt) => {
     if (
+      evt.type === 'connected' ||
+      evt.type === 'settings:updated' ||
       evt.type === 'delivery:created' ||
       evt.type === 'delivery:updated' ||
       evt.type === 'rider:location' ||
@@ -269,6 +275,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     ) {
       loadOverview();
     } else if (evt.type === 'support:presence') {
+      presenceUpdateCount.current += 1;
       setChatPresence(evt.payload as SupportPresence);
     } else if (evt.type === 'support:conversation') {
       const conv = evt.payload as SupportConversation;
@@ -850,14 +857,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     },
     {
       id: 'settings',
-      label: 'Pricing & Dispatch',
-      mobileLabel: 'Rates',
+      label: 'Settings & Gateway',
+      mobileLabel: 'Settings',
       icon: <Settings className="w-4 h-4" />,
     },
     {
       id: 'finance',
-      label: 'Ledger & Tickets',
-      mobileLabel: 'Tickets',
+      label: 'Payments & Wallets',
+      mobileLabel: 'Payments',
       icon: <CreditCard className="w-4 h-4" />,
     },
   ];
@@ -933,7 +940,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 : section === 'chats'
                 ? 'Support Chats'
                 : section === 'finance'
-                ? 'Ledger & Tickets'
+                ? 'Payments, Wallets & Tickets'
                 : section}
             </h1>
           </div>
@@ -1799,6 +1806,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* SETTINGS: DISPATCH, PRICING & WHATSAPP */}
               {section === 'settings' && settingsDraft && (
+                <>
                 <form
                   onSubmit={handleSaveSettings}
                   className="bg-white border border-neutral-200 rounded-xl p-6 sm:p-8 max-w-3xl space-y-6"
@@ -1880,8 +1888,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <input
                         id="set-base-fee"
                         type="number"
-                        min={500}
-                        step={100}
+                        min={300}
+                        step="any"
                         value={settingsDraft.baseLocalFeeNgn}
                         onChange={(e) =>
                           setSettingsDraft({
@@ -1918,7 +1926,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         id="set-interstate"
                         type="number"
                         min={0}
-                        step={100}
+                        step="any"
                         value={settingsDraft.interStateSurchargeNgn}
                         onChange={(e) =>
                           setSettingsDraft({
@@ -1950,6 +1958,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </div>
                   </div>
 
+                    <label className="flex items-start gap-3 rounded-lg border border-neutral-200 p-3 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={settingsDraft.showDeliveryStateSelectors}
+                        onChange={(event) => setSettingsDraft({ ...settingsDraft, showDeliveryStateSelectors: event.target.checked })}
+                      />
+                      <span>
+                        <span className="block font-semibold">Show pickup and destination state selectors</span>
+                        <span className="block text-xs text-neutral-600">Leave off while service is limited to Katsina State.</span>
+                      </span>
+                    </label>
                   <div className="border-t border-neutral-200 pt-5">
                     <label htmlFor="set-whatsapp" className="block text-xs font-semibold mb-1.5">
                       Official WhatsApp Support Number (digits with country code)
@@ -1977,11 +1996,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     {savingSettings ? 'Saving...' : 'Save Platform Settings'}
                   </button>
                 </form>
+                <AdminGatewaySettingsCard onNotify={(msg) => setToast(msg)} />
+              </>
               )}
 
               {/* FINANCE, TICKETS & SUGGESTIONS */}
               {section === 'finance' && (
                 <div className="space-y-6">
+                  <AdminPaymentsSection onNotify={(msg) => setToast(msg)} />
                   {/* Financial Summary Breakdown */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div className="bg-white border border-neutral-200 rounded-xl p-5">
@@ -3603,7 +3625,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         >
           {(() => {
             const eligibleRiders = riders.filter(
-              (r) => r.verificationStatus === 'verified' && r.accountStatus === 'active'
+              (r) => r.verificationStatus === 'verified' && r.accountStatus === 'active' &&
+                r.activeParcelsCount - Number(r.riderId === assigningDelivery.assignedRiderId) <
+                  (settings?.maxActiveParcelsPerRider ?? 3)
             );
             return (
               <form
@@ -3622,10 +3646,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 {eligibleRiders.length === 0 ? (
                   <div className="border border-neutral-200 bg-neutral-50 rounded-xl p-4 space-y-3 text-xs">
                     <p className="font-semibold text-black">
-                      No verified active riders available yet.
+                      No verified riders have capacity for this parcel.
                     </p>
                     <p className="text-neutral-600 leading-relaxed">
-                      Issue a rider account with the verification tick enabled, or verify an existing pending rider in the Riders tab.
+                      This parcel can wait in the dispatch queue until capacity opens.
                     </p>
                     <div className="flex flex-wrap gap-2">
                       <button

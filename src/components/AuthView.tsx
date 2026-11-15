@@ -246,7 +246,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
               Onboarding & Verification Policy
             </h2>
             <p className="text-xs text-neutral-600 mt-1 leading-relaxed">
-              SAQO maintains verified courier dispatch across Katsina and all Nigerian states.
+              SAQO maintains verified courier dispatch across Katsina State — expanding one state at a time.
             </p>
           </div>
 
