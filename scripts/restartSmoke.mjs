@@ -107,9 +107,17 @@ try {
   assert.match(failed, /"type":"backup_failure"/);
   await stop();
 
+  // Make the queued parcel past the alert threshold even on fast CI runners.
+  const liveDb = new DatabaseSync(source);
+  liveDb.prepare('UPDATE delivery_requests SET created_at = ? WHERE id = ?')
+    .run(new Date(Date.now() - 2000).toISOString(), second.id);
+  liveDb.close();
   await start(source);
   await api('POST', '/api/auth/login', badLogin, undefined, 429);
   assert.equal((await api('GET', '/api/track/' + second.trackingCode)).delivery.status, 'no_rider_available');
+  for (let attempt = 0; attempt < 20 && !alerts.includes('"type":"dispatch_delay"'); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
   assert.match(alerts, /"type":"dispatch_delay"/);
   const offers = (await api('GET', '/api/rider/dashboard', null, rider.token)).assignments;
   assert.ok(offers.some((offer) => offer.id === originalOffer.id && offer.status === 'offered'));
