@@ -14,6 +14,8 @@ Caddy obtains the HTTPS certificate and forwards WebSocket upgrades. The applica
 
 Vercel Preview builds show a static, non-indexed preview. For a Production build, set `VITE_SAQO_API_ORIGIN` to the HTTPS origin of the SAQO API. Set `SAQO_FRONTEND_ORIGIN` if customers use a domain other than the project's default production URL. Enable Vercel system environment variables. Set `APP_URL` on the API to that same customer-facing origin. The build checks the API, cross-origin authorization headers, and WebSocket before enabling live features. Set `SAQO_API_ORIGIN` on the backend so the payment and WhatsApp webhooks point to the API host.
 
+The Supabase migrations create the private `saqo` operations schema alongside the existing `public` wallet tables. Browser roles cannot read the operations schema or call wallet mutation functions. The API and dispatch worker currently use SQLite, so the Supabase migration alone does not switch their storage. Connect the server to Postgres, migrate the existing accounts and deliveries, and verify the full queue and handoff flow before pointing the Vercel production build at the new API.
+
 ## Test the Twilio WhatsApp webhook before deployment
 
 1. Install `cloudflared` and set the trial account's `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_WHATSAPP_FROM` in the ignored local `.env`. The Auth Token must belong to the account that owns the Sandbox.
