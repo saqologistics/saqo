@@ -13,7 +13,6 @@ import {
   Phone,
   RefreshCw,
   Search,
-  ShieldCheck,
   Truck,
   X,
 } from 'lucide-react';
@@ -1143,7 +1142,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
       {/* Role Portals Banner */}
       <section className="py-16 bg-black text-white">
-        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="border border-white/15 rounded-xl p-6 flex flex-col justify-between">
             <div>
               <Package className="w-6 h-6 mb-4" />
@@ -1175,23 +1174,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               className="mt-6 w-full bg-white text-black py-2.5 rounded-lg text-sm font-semibold hover:bg-neutral-200 transition-colors cursor-pointer"
             >
               Rider Portal
-            </button>
-          </div>
-
-          <div className="border border-white/15 rounded-xl p-6 flex flex-col justify-between">
-            <div>
-              <ShieldCheck className="w-6 h-6 mb-4" />
-              <h3 className="font-display font-bold text-xl">SAQO Operations</h3>
-              <p className="text-sm text-neutral-400 mt-2 leading-relaxed">
-                Monitor live Nigerian fleet activity, manually reassign parcels, verify riders, and configure dispatch rules & pricing.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => onNavigateAuth('login', 'client')}
-              className="mt-6 w-full border border-white/30 text-white py-2.5 rounded-lg text-sm font-semibold hover:bg-white/10 transition-colors cursor-pointer"
-            >
-              Admin Console Sign In
             </button>
           </div>
         </div>
