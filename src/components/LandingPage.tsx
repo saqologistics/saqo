@@ -434,11 +434,26 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 </button>
               </div>
 
-              {heroTab === 'send' && whatsAppOrderNumber && (
-                <a href={buildWhatsAppUrl(whatsAppOrderNumber, 'ORDER')} target="_blank" rel="noreferrer"
-                  className="mb-3 inline-flex items-center gap-2 rounded-lg border border-neutral-300 px-3 py-2 text-xs font-semibold hover:bg-neutral-100">
-                  Order on WhatsApp
-                </a>
+              {whatsAppOrderNumber && (
+                <div className="mb-3 flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] font-semibold text-neutral-500 mr-1">WhatsApp:</span>
+                  {([
+                    ['Order', 'ORDER'],
+                    ['Status', 'STATUS'],
+                    ['Support', 'SUPPORT'],
+                    ['Menu', 'HI'],
+                  ] as const).map(([label, cmd]) => (
+                    <a
+                      key={cmd}
+                      href={buildWhatsAppUrl(whatsAppOrderNumber, cmd)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs font-semibold text-black hover:bg-neutral-100 transition-colors"
+                    >
+                      {label}
+                    </a>
+                  ))}
+                </div>
               )}
 
               {heroTab === 'send' ? (

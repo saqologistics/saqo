@@ -121,12 +121,23 @@ async function processMessage(input: {
   phone: string; profileName: string; body: string; appUrl: string; sid: string; session: Session;
 }): Promise<{ reply: string; deliveryId?: string; support?: Awaited<ReturnType<typeof createSupportConversation>> }> {
   const { phone, profileName, body, appUrl, session, sid } = input;
-  const command = body.toUpperCase();
+  const rawCommand = body.trim().toUpperCase();
   const appLink = `${appUrl}/?order=1`;
-  const menu = `Welcome to SAQO Logistics. Reply ORDER to book in Katsina, STATUS to recover your latest booking, SUPPORT to chat with an agent, or open the SAQO app: ${appLink}`;
+  const menu = [
+    'Welcome to SAQO Logistics.',
+    'Reply with a number or keyword:',
+    '1. ORDER - Book a parcel in Katsina',
+    '2. STATUS - Check your latest booking',
+    '3. SUPPORT - Chat with live support',
+    `4. APP - Open SAQO web app (${appLink})`,
+    '',
+    'Reply MENU or CANCEL anytime to return here.',
+  ].join('\n');
   const draft = session.draft && Date.now() - Date.parse(session.last_inbound_at) < dayMs
     ? typeof session.draft === 'string' ? JSON.parse(session.draft) as Draft : session.draft
     : null;
+  const menuShortcuts: Record<string, string> = { '1': 'ORDER', '2': 'STATUS', '3': 'SUPPORT', '4': 'APP', '0': 'MENU' };
+  const command = !draft && menuShortcuts[rawCommand] ? menuShortcuts[rawCommand] : rawCommand;
   const cashEnabled = async () => (await getPaymentMethods()).some((method) => method.code === 'cash' && method.isEnabled);
 
   if (command === 'APP' || command === 'OPEN APP') return { reply: `Open the SAQO booking app: ${appLink}` };
@@ -136,23 +147,23 @@ async function processMessage(input: {
       JOIN customers c ON c.id = d.customer_id WHERE c.profile_id = ?
       ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1
     `).get(session.profile_id) as { tracking_code: string; status: string; delivery_otp: string } | undefined;
-    if (!latest) return { reply: 'You do not have a WhatsApp booking yet. Reply ORDER to start.' };
+    if (!latest) return { reply: 'You do not have a WhatsApp booking yet.\n\nReply 1 or ORDER to start a booking, or MENU for options.' };
     const handoff = ['delivered', 'cancelled'].includes(latest.status)
       ? '' : `\nHandoff code: ${latest.delivery_otp}. Share it only with the recipient.`;
-    return { reply: `Latest booking • ${latest.tracking_code}\nTrack: ${appUrl}/?track=${latest.tracking_code}${handoff}` };
+    return { reply: `Latest booking • ${latest.tracking_code}\nStatus: ${latest.status.replace(/_/g, ' ')}\nTrack: ${appUrl}/?track=${latest.tracking_code}${handoff}` };
   }
   if (command === 'MENU' || command === 'CANCEL') {
     await saveDraft(phone, null);
-    return { reply: command === 'CANCEL' ? `Current conversation flow cleared. ${menu}` : menu };
+    return { reply: command === 'CANCEL' ? `Current conversation flow cleared.\n\n${menu}` : menu };
   }
   if (command === 'ORDER') {
     if (!await cashEnabled()) return { reply: `WhatsApp orders use cash on delivery. To choose another payment method, open the app: ${appLink}` };
     await saveDraft(phone, { step: 'pickup' });
-    return { reply: `Where should the rider collect your parcel? ${locationPrompt}` };
+    return { reply: `Where should the rider collect your parcel? ${locationPrompt}\n\n(Reply CANCEL anytime to return to the menu.)` };
   }
   if (command === 'SUPPORT') {
     await saveDraft(phone, { step: 'support' });
-    return { reply: 'Type your message for SAQO Support. You can return to booking any time by sending ORDER.' };
+    return { reply: 'Type your message for SAQO Support. You can return to booking any time by sending ORDER or MENU.' };
   }
   if (!draft) return { reply: menu };
   if (draft.step === 'support') {

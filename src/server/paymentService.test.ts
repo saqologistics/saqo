@@ -70,7 +70,14 @@ test('Twilio WhatsApp orders require a signed request and confirmation and persi
   assert.equal(whatsapp.getWhatsAppOrderNumber(), '2348000000000');
   assert.equal((await send('ORDER', undefined, false)).status, 403);
   assert.equal((await send('ORDER', undefined, true, config.APP_URL)).status, 403);
+  const greeting = (await send('Hi')).text;
+  assert.match(greeting, /1\. ORDER/);
+  assert.match(greeting, /2\. STATUS/);
+  assert.match(greeting, /3\. SUPPORT/);
+  assert.match((await send('4')).text, /https:\/\/saqo\.test\/\?order=1/);
   assert.match((await send('APP')).text, /https:\/\/saqo\.test\/\?order=1/);
+  assert.match((await send('1')).text, /collect your parcel/);
+  assert.match((await send('CANCEL')).text, /1\. ORDER/);
   assert.match((await send('ORDER')).text, /collect your parcel/);
   assert.match((await send('Kofar Kaura')).text, /1\. Kofar Kaura/);
   assert.match((await send('1')).text, /Pickup set to Kofar Kaura/);

@@ -5735,10 +5735,21 @@ async function getWhatsAppCustomer(phone, profileName, session) {
 }
 async function processMessage(input) {
   const { phone, profileName, body, appUrl, session, sid } = input;
-  const command = body.toUpperCase();
+  const rawCommand = body.trim().toUpperCase();
   const appLink = `${appUrl}/?order=1`;
-  const menu = `Welcome to SAQO Logistics. Reply ORDER to book in Katsina, STATUS to recover your latest booking, SUPPORT to chat with an agent, or open the SAQO app: ${appLink}`;
+  const menu = [
+    "Welcome to SAQO Logistics.",
+    "Reply with a number or keyword:",
+    "1. ORDER - Book a parcel in Katsina",
+    "2. STATUS - Check your latest booking",
+    "3. SUPPORT - Chat with live support",
+    `4. APP - Open SAQO web app (${appLink})`,
+    "",
+    "Reply MENU or CANCEL anytime to return here."
+  ].join("\n");
   const draft = session.draft && Date.now() - Date.parse(session.last_inbound_at) < dayMs ? typeof session.draft === "string" ? JSON.parse(session.draft) : session.draft : null;
+  const menuShortcuts = { "1": "ORDER", "2": "STATUS", "3": "SUPPORT", "4": "APP", "0": "MENU" };
+  const command = !draft && menuShortcuts[rawCommand] ? menuShortcuts[rawCommand] : rawCommand;
   const cashEnabled = async () => (await getPaymentMethods()).some((method) => method.code === "cash" && method.isEnabled);
   if (command === "APP" || command === "OPEN APP") return { reply: `Open the SAQO booking app: ${appLink}` };
   if (command === "STATUS") {
@@ -5747,24 +5758,29 @@ async function processMessage(input) {
       JOIN customers c ON c.id = d.customer_id WHERE c.profile_id = ?
       ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1
     `).get(session.profile_id);
-    if (!latest) return { reply: "You do not have a WhatsApp booking yet. Reply ORDER to start." };
+    if (!latest) return { reply: "You do not have a WhatsApp booking yet.\n\nReply 1 or ORDER to start a booking, or MENU for options." };
     const handoff = ["delivered", "cancelled"].includes(latest.status) ? "" : `
 Handoff code: ${latest.delivery_otp}. Share it only with the recipient.`;
     return { reply: `Latest booking \u2022 ${latest.tracking_code}
+Status: ${latest.status.replace(/_/g, " ")}
 Track: ${appUrl}/?track=${latest.tracking_code}${handoff}` };
   }
   if (command === "MENU" || command === "CANCEL") {
     await saveDraft(phone, null);
-    return { reply: command === "CANCEL" ? `Current conversation flow cleared. ${menu}` : menu };
+    return { reply: command === "CANCEL" ? `Current conversation flow cleared.
+
+${menu}` : menu };
   }
   if (command === "ORDER") {
     if (!await cashEnabled()) return { reply: `WhatsApp orders use cash on delivery. To choose another payment method, open the app: ${appLink}` };
     await saveDraft(phone, { step: "pickup" });
-    return { reply: `Where should the rider collect your parcel? ${locationPrompt}` };
+    return { reply: `Where should the rider collect your parcel? ${locationPrompt}
+
+(Reply CANCEL anytime to return to the menu.)` };
   }
   if (command === "SUPPORT") {
     await saveDraft(phone, { step: "support" });
-    return { reply: "Type your message for SAQO Support. You can return to booking any time by sending ORDER." };
+    return { reply: "Type your message for SAQO Support. You can return to booking any time by sending ORDER or MENU." };
   }
   if (!draft) return { reply: menu };
   if (draft.step === "support") {
