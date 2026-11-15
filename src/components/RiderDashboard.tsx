@@ -7,6 +7,7 @@ import {
   Clock,
   LogOut,
   MapPin,
+  Menu,
   Navigation,
   Phone,
   Power,
@@ -47,6 +48,7 @@ import type {
   RiderProfile,
 } from '../shared/types';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { MobileNavDrawer } from './MobileNavDrawer';
 import { OtpAlertModal } from './OtpAlertModal';
 import { PWAInstallButton } from './PWAInstallButton';
 import { SaqoLogo } from './SaqoLogo';
@@ -79,6 +81,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   const [liveToast, setLiveToast] = useState<NotificationItem | null>(null);
   const [settings, setSettings] = useState<PlatformSettings | null>(null);
   const [tab, setTab] = useState<'active' | 'history' | 'notifications' | 'profile'>('active');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -519,11 +522,28 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         </nav>
 
         <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => setTab('profile')}
+            className={`md:hidden inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap cursor-pointer ${
+              rider?.isOnline
+                ? 'bg-white text-black'
+                : 'border border-white/25 text-white'
+            }`}
+          >
+            <span
+              aria-hidden="true"
+              className={`w-2 h-2 rounded-full ${
+                rider?.isOnline ? 'bg-emerald-600' : 'bg-neutral-400'
+              }`}
+            />
+            <span>{rider?.isOnline ? 'Online' : 'Offline'}</span>
+          </button>
           {notifPerm === 'default' && (
             <button
               type="button"
               onClick={handleEnablePush}
-              className="hidden sm:inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-lg text-xs font-semibold hover:bg-white/10 transition-colors cursor-pointer"
+              className="hidden md:inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-lg text-xs font-semibold hover:bg-white/10 transition-colors cursor-pointer"
             >
               <Bell className="w-3.5 h-3.5" />
               <span>Enable Alerts</span>
@@ -534,17 +554,19 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             onClick={toggleMute}
             aria-label={muted ? 'Unmute alert sounds' : 'Mute alert sounds'}
             title={muted ? 'Sound Muted — Click to Unmute' : 'Alert Sound On'}
-            className="inline-flex items-center justify-center border border-white/25 text-white p-2 rounded-lg hover:bg-white/10 transition-colors cursor-pointer"
+            className="hidden md:inline-flex items-center justify-center border border-white/25 text-white p-2 rounded-lg hover:bg-white/10 transition-colors cursor-pointer"
           >
             {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
           </button>
-          <PWAInstallButton inverted compact />
+          <div className="hidden md:inline-flex">
+            <PWAInstallButton inverted compact />
+          </div>
           <button
             type="button"
             onClick={handleManualRefresh}
             disabled={refreshing}
             aria-label="Refresh rider dispatch"
-            className="inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-lg text-xs font-semibold hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
+            className="hidden md:inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-lg text-xs font-semibold hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">Refresh</span>
@@ -555,13 +577,119 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
           <button
             type="button"
             onClick={onLogout}
-            className="inline-flex items-center gap-1.5 bg-white text-black px-3 py-2 rounded-lg text-xs font-semibold hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="hidden md:inline-flex items-center gap-1.5 bg-white text-black px-3 py-2 rounded-lg text-xs font-semibold hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <LogOut className="w-3.5 h-3.5" />
             <span>Sign out</span>
           </button>
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen(true)}
+            aria-label="Open rider navigation menu"
+            aria-expanded={mobileMenuOpen}
+            className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 transition-colors cursor-pointer"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
         </div>
       </header>
+
+      <MobileNavDrawer
+        open={mobileMenuOpen}
+        onClose={() => setMobileMenuOpen(false)}
+        ariaLabel="Rider portal navigation"
+        headerAction={
+          <span
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap ${
+              rider?.isOnline ? 'bg-black text-white' : 'bg-neutral-200 text-neutral-700'
+            }`}
+          >
+            <span
+              aria-hidden="true"
+              className={`w-2 h-2 rounded-full ${
+                rider?.isOnline ? 'bg-emerald-400' : 'bg-neutral-500'
+              }`}
+            />
+            <span>{rider?.isOnline ? 'Online' : 'Offline'}</span>
+          </span>
+        }
+        items={[
+          {
+            id: 'active',
+            label: 'Active Dispatch',
+            active: tab === 'active',
+            badge: activeDeliveries.length > 0 ? activeDeliveries.length : undefined,
+            onSelect: () => setTab('active'),
+          },
+          {
+            id: 'history',
+            label: 'Earnings & History',
+            active: tab === 'history',
+            onSelect: () => setTab('history'),
+          },
+          {
+            id: 'notifications',
+            label: 'Alerts',
+            active: tab === 'notifications',
+            badge: unreadCount > 0 ? unreadCount : undefined,
+            onSelect: () => setTab('notifications'),
+          },
+          {
+            id: 'profile',
+            label: 'Account',
+            active: tab === 'profile',
+            subtitle: profile.fullName,
+            onSelect: () => setTab('profile'),
+          },
+        ]}
+        footerContent={
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={toggleMute}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
+              >
+                {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                <span>{muted ? 'Sound Muted' : 'Sound On'}</span>
+              </button>
+              {notifPerm === 'default' && (
+                <button
+                  type="button"
+                  onClick={handleEnablePush}
+                  className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
+                >
+                  <Bell className="w-3.5 h-3.5" />
+                  <span>Enable Push</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  handleManualRefresh();
+                  setMobileMenuOpen(false);
+                }}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                <span>Refresh</span>
+              </button>
+              <PWAInstallButton />
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMenuOpen(false);
+                onLogout();
+              }}
+              className="w-full inline-flex items-center justify-center gap-2 bg-black text-white py-3 rounded-xl text-sm font-bold cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Sign out</span>
+            </button>
+          </div>
+        }
+      />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 sm:pt-8 pb-24 md:pb-12 space-y-6">
         {liveToast && (
@@ -1468,8 +1596,8 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('active')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'active' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'active' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <Truck className="w-4 h-4" />
@@ -1478,8 +1606,8 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('history')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'history' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'history' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <Clock className="w-4 h-4" />
@@ -1488,8 +1616,8 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('notifications')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'notifications' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'notifications' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <Bell className="w-4 h-4" />
@@ -1498,8 +1626,8 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('profile')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'profile' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'profile' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <User className="w-4 h-4" />

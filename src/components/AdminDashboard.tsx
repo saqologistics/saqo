@@ -11,6 +11,7 @@ import {
   LogOut,
   Mail,
   MapPin,
+  Menu,
   MessageCircle,
   MoreHorizontal,
   Package,
@@ -48,6 +49,7 @@ import type {
 import { AdminGatewaySettingsCard } from './AdminGatewaySettingsCard';
 import { AdminPaymentsSection } from './AdminPaymentsSection';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { MobileNavDrawer } from './MobileNavDrawer';
 import { PWAInstallButton } from './PWAInstallButton';
 import { SaqoLogo } from './SaqoLogo';
 import { buildWhatsAppUrl } from './WhatsAppWidget';
@@ -934,7 +936,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <button type="button" onClick={onGoHome} className="lg:hidden cursor-pointer shrink-0">
               <SaqoLogo />
             </button>
-            <h1 className="font-display font-bold text-sm sm:text-lg capitalize truncate">
+            <h1 className="font-display font-extrabold text-base sm:text-lg capitalize truncate">
               <span className="hidden sm:inline">SAQO Operations / </span>
               {section === 'overview'
                 ? 'Live Fleet'
@@ -947,20 +949,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <PWAInstallButton compact />
+            <div className="hidden lg:inline-flex">
+              <PWAInstallButton compact />
+            </div>
             <button
               type="button"
               onClick={loadOverview}
-              className="border border-neutral-300 px-3 py-1.5 rounded-lg text-xs font-semibold hover:border-black cursor-pointer"
+              className="hidden sm:inline-flex border border-neutral-300 px-3 py-1.5 rounded-lg text-xs font-semibold hover:border-black cursor-pointer"
             >
               Refresh
             </button>
             <button
               type="button"
-              onClick={onLogout}
-              className="lg:hidden bg-black text-white px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer"
+              onClick={() => setMobileMoreOpen(true)}
+              aria-label="Open admin navigation menu"
+              aria-expanded={mobileMoreOpen}
+              className="lg:hidden p-2 rounded-lg text-black hover:bg-neutral-100 transition-colors cursor-pointer"
             >
-              Sign out
+              <Menu className="w-5 h-5" />
             </button>
           </div>
         </header>
@@ -2560,7 +2566,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </main>
       </div>
 
-      {/* Native Mobile Bottom Navigation (5 spacious slots + More sheet) */}
+      {/* Native Mobile Bottom Navigation (5 crisp quick slots + Full Bold Drawer) */}
       <nav
         aria-label="Admin mobile navigation"
         className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-5 pb-[env(safe-area-inset-bottom)]"
@@ -2576,8 +2582,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 setSection(navItem.id);
                 setMobileMoreOpen(false);
               }}
-              className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-[11px] font-semibold ${
-                section === navItem.id ? 'text-black' : 'text-neutral-600'
+              className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-xs font-bold border-t-2 transition-colors ${
+                section === navItem.id ? 'border-black text-black' : 'border-transparent text-neutral-500'
               }`}
             >
               {navItem.icon}
@@ -2594,14 +2600,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           type="button"
           onClick={() => setMobileMoreOpen((v) => !v)}
           aria-expanded={mobileMoreOpen}
-          className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-[11px] font-semibold ${
+          className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-xs font-bold border-t-2 transition-colors ${
             ['customers', 'settings', 'finance'].includes(section) || mobileMoreOpen
-              ? 'text-black'
-              : 'text-neutral-600'
+              ? 'border-black text-black'
+              : 'border-transparent text-neutral-500'
           }`}
         >
           <MoreHorizontal className="w-4 h-4" />
-          <span>More</span>
+          <span>Menu</span>
           {openTicketsCount > 0 && (
             <span className="absolute top-1 right-2 min-w-[15px] h-[15px] px-1 rounded-full bg-black text-white text-[9px] font-mono font-bold flex items-center justify-center tabular-nums">
               {openTicketsCount}
@@ -2610,66 +2616,59 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </button>
       </nav>
 
-      {/* Mobile More Sections Sheet */}
-      {mobileMoreOpen && (
-        <div
-          role="dialog"
-          aria-label="More admin sections"
-          className="lg:hidden fixed inset-0 z-50 bg-black/50 flex items-end justify-center"
-          onClick={() => setMobileMoreOpen(false)}
-        >
-          <div
-            className="bg-white border-t border-black rounded-t-2xl w-full p-5 pb-8 space-y-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-neutral-200 pb-3">
-              <p className="font-display font-bold text-base">Operations Menu</p>
+      {/* Bold Full-Screen Mobile Admin Navigation Drawer */}
+      <MobileNavDrawer
+        open={mobileMoreOpen}
+        onClose={() => setMobileMoreOpen(false)}
+        ariaLabel="Operations navigation"
+        breakpoint="lg"
+        headerAction={
+          <span className="px-3 py-1.5 rounded-full bg-black text-white text-xs font-bold whitespace-nowrap">
+            Admin
+          </span>
+        }
+        items={navItems.map((item) => ({
+          id: item.id,
+          label: item.label,
+          active: section === item.id,
+          badge:
+            item.badge !== undefined
+              ? item.badge
+              : item.id === 'finance' && openTicketsCount > 0
+              ? `${openTicketsCount} open`
+              : undefined,
+          onSelect: () => setSection(item.id),
+        }))}
+        footerContent={
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => setMobileMoreOpen(false)}
-                aria-label="Close operations menu"
-                className="w-8 h-8 rounded-full bg-neutral-100 flex items-center justify-center cursor-pointer"
+                onClick={() => {
+                  loadOverview();
+                  setMobileMoreOpen(false);
+                }}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
               >
-                <X className="w-4 h-4" />
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Refresh Data</span>
               </button>
+              <PWAInstallButton />
             </div>
-            <div className="grid grid-cols-1 gap-2">
-              {(['customers', 'settings', 'finance'] as AdminSection[]).map((id) => {
-                const item = navItems.find((n) => n.id === id)!;
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => {
-                      setSection(item.id);
-                      setMobileMoreOpen(false);
-                    }}
-                    className={`w-full flex items-center justify-between px-4 py-3 rounded-xl border text-sm font-semibold cursor-pointer ${
-                      section === item.id
-                        ? 'bg-black text-white border-black'
-                        : 'bg-white text-black border-neutral-200'
-                    }`}
-                  >
-                    <span className="inline-flex items-center gap-3">
-                      {item.icon}
-                      <span>{item.label}</span>
-                    </span>
-                    {item.id === 'finance' && openTicketsCount > 0 && (
-                      <span
-                        className={`text-xs font-mono font-bold px-2 py-0.5 rounded tabular-nums ${
-                          section === item.id ? 'bg-white text-black' : 'bg-black text-white'
-                        }`}
-                      >
-                        {openTicketsCount} open
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMoreOpen(false);
+                onLogout();
+              }}
+              className="w-full inline-flex items-center justify-center gap-2 bg-black text-white py-3 rounded-xl text-sm font-bold cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Sign out ({profile.fullName.split(' ')[0]})</span>
+            </button>
           </div>
-        </div>
-      )}
+        }
+      />
 
       {/* User Details Drawer / Modal */}
       {(inspectedCustomer || inspectedRider) && (

@@ -30,6 +30,7 @@ import type {
   Profile,
 } from '../shared/types';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { MobileNavDrawer } from './MobileNavDrawer';
 import { PWAInstallButton } from './PWAInstallButton';
 import { RouteLocationCard } from './RouteLocationCard';
 import { SaqoLogo } from './SaqoLogo';
@@ -287,12 +288,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </nav>
 
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            <PWAInstallButton inverted compact />
+            <div className="hidden md:inline-flex">
+              <PWAInstallButton inverted compact />
+            </div>
             {currentUser ? (
               <button
                 type="button"
                 onClick={() => onOpenDashboard()}
-                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold bg-white text-black rounded-lg hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-bold bg-white text-black rounded-full hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Open Dashboard
               </button>
@@ -300,7 +303,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               <button
                 type="button"
                 onClick={() => onNavigateAuth('login', 'client')}
-                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold bg-white text-black rounded-lg hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-bold bg-white text-black rounded-full hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Sign in
               </button>
@@ -310,80 +313,95 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               onClick={() => setMobileMenuOpen((v) => !v)}
               aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
               aria-expanded={mobileMenuOpen}
-              className="md:hidden p-2 rounded-lg border border-white/20 text-white hover:bg-white/10 cursor-pointer"
+              className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 transition-colors cursor-pointer"
             >
               {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
           </div>
         </div>
 
-        {mobileMenuOpen && (
-          <div className="md:hidden fixed inset-x-0 top-16 bottom-0 z-50 bg-white text-black px-6 py-8 flex flex-col justify-between overflow-y-auto">
-            <div className="space-y-6">
-              <a
-                href="#send-box"
-                onClick={() => {
-                  setHeroTab('send');
-                  setMobileMenuOpen(false);
-                }}
-                className="block font-display font-extrabold text-3xl tracking-tight text-black hover:text-neutral-600"
-              >
-                Send a Parcel
-              </a>
-              <a
-                href="#track-section"
-                onClick={() => {
-                  scrollToTrack();
-                  setMobileMenuOpen(false);
-                }}
-                className="block font-display font-extrabold text-3xl tracking-tight text-black hover:text-neutral-600"
-              >
-                Track
-              </a>
+        <MobileNavDrawer
+          open={mobileMenuOpen}
+          onClose={() => setMobileMenuOpen(false)}
+          ariaLabel="SAQO navigation"
+          headerAction={
+            currentUser ? (
               <button
                 type="button"
                 onClick={() => {
                   setMobileMenuOpen(false);
-                  onNavigateAuth('login', 'rider');
+                  onOpenDashboard();
                 }}
-                className="block w-full text-left font-display font-extrabold text-3xl tracking-tight text-black hover:text-neutral-600 cursor-pointer"
+                className="px-3.5 py-1.5 rounded-full bg-black text-white text-xs font-bold whitespace-nowrap cursor-pointer"
               >
-                Drive with SAQO
+                Dashboard
               </button>
-              <a
-                href="#how-it-works"
-                onClick={() => setMobileMenuOpen(false)}
-                className="block font-display font-extrabold text-3xl tracking-tight text-black hover:text-neutral-600"
-              >
-                How it works
-              </a>
+            ) : (
               <button
                 type="button"
                 onClick={() => {
                   setMobileMenuOpen(false);
-                  onOpenSupportChat?.();
+                  onNavigateAuth('login', 'client');
                 }}
-                className="block w-full text-left font-display font-extrabold text-3xl tracking-tight text-black hover:text-neutral-600 cursor-pointer"
+                className="px-3.5 py-1.5 rounded-full bg-black text-white text-xs font-bold whitespace-nowrap cursor-pointer"
               >
-                Help
+                Sign in
               </button>
-            </div>
-
-            {whatsAppOrderNumber && (
-              <div className="pt-6 border-t border-neutral-200 flex items-center justify-between text-xs text-neutral-600">
-                <span>Instant WhatsApp Bot</span>
-                <a
-                  href={buildWhatsAppUrl(whatsAppOrderNumber, 'HI')}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="font-bold text-black underline"
-                >
-                  Open Chat
-                </a>
+            )
+          }
+          items={[
+            {
+              id: 'send',
+              label: 'Send a Parcel',
+              onSelect: () => {
+                setHeroTab('send');
+                document.getElementById('send-box')?.scrollIntoView({ behavior: 'smooth' });
+              },
+            },
+            {
+              id: 'track',
+              label: 'Track',
+              onSelect: () => {
+                scrollToTrack();
+              },
+            },
+            {
+              id: 'drive',
+              label: 'Drive with SAQO',
+              onSelect: () => onNavigateAuth('login', 'rider'),
+            },
+            {
+              id: 'how-it-works',
+              label: 'How it works',
+              onSelect: () => {
+                document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' });
+              },
+            },
+            {
+              id: 'help',
+              label: 'Help',
+              onSelect: () => onOpenSupportChat?.(),
+            },
+          ]}
+          footerContent={
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <PWAInstallButton />
+                {whatsAppOrderNumber && (
+                  <a
+                    href={buildWhatsAppUrl(whatsAppOrderNumber, 'HI')}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs font-bold text-black underline"
+                  >
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    <span>WhatsApp Bot</span>
+                  </a>
+                )}
               </div>
-            )}
-          </div>
-        )}
+            </div>
+          }
+        />
       </header>
 
       {/* Hero Section: Uber-inspired High-Contrast Black Editorial Canvas */}

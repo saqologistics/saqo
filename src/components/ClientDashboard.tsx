@@ -16,6 +16,7 @@ import {
   LayoutGrid,
   LogOut,
   MapPin,
+  Menu,
   MessageCircle,
   MessageSquarePlus,
   Package,
@@ -67,6 +68,7 @@ import type {
 } from '../shared/types';
 import type { QuickDraft } from './LandingPage';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { MobileNavDrawer } from './MobileNavDrawer';
 import { OtpAlertModal } from './OtpAlertModal';
 import { PWAInstallButton } from './PWAInstallButton';
 import { ReceiptModal } from './ReceiptModal';
@@ -109,6 +111,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [tab, setTab] = useState<
     'active' | 'send' | 'wallet' | 'history' | 'notifications' | 'tickets' | 'profile' | 'more'
   >(initialDraft ? 'send' : 'active');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [deliveries, setDeliveries] = useState<DeliveryWithHistory[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [tickets, setTickets] = useState<ComplaintRecord[]>([]);
@@ -899,17 +902,19 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             onClick={toggleMute}
             aria-label={muted ? 'Unmute alert sounds' : 'Mute alert sounds'}
             title={muted ? 'Sound Muted' : 'Sound Alerts On'}
-            className="inline-flex items-center justify-center border border-white/25 text-white p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer"
+            className="hidden md:inline-flex items-center justify-center border border-white/25 text-white p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer"
           >
             {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
           </button>
-          <PWAInstallButton inverted compact />
+          <div className="hidden md:inline-flex">
+            <PWAInstallButton inverted compact />
+          </div>
           <button
             type="button"
             onClick={handleManualRefresh}
             disabled={refreshing}
             aria-label="Refresh deliveries"
-            className="inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-full text-xs font-semibold hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
+            className="hidden md:inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-full text-xs font-semibold hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
             <span className="hidden lg:inline">Refresh</span>
@@ -923,8 +928,131 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             <span>{profile.fullName.split(' ')[0]}</span>
             <ChevronDown className="w-3.5 h-3.5" />
           </button>
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen(true)}
+            aria-label="Open navigation menu"
+            aria-expanded={mobileMenuOpen}
+            className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 transition-colors cursor-pointer"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
         </div>
       </header>
+
+      <MobileNavDrawer
+        open={mobileMenuOpen}
+        onClose={() => setMobileMenuOpen(false)}
+        ariaLabel="Client portal navigation"
+        headerAction={
+          <button
+            type="button"
+            onClick={() => {
+              setMobileMenuOpen(false);
+              setTab('profile');
+            }}
+            className="inline-flex items-center gap-1.5 bg-black text-white px-3.5 py-1.5 rounded-full text-xs font-bold whitespace-nowrap cursor-pointer"
+          >
+            <span>{profile.fullName.split(' ')[0]}</span>
+            <ChevronDown className="w-3.5 h-3.5" />
+          </button>
+        }
+        items={[
+          {
+            id: 'active',
+            label: 'Track',
+            active: tab === 'active',
+            badge: activeDeliveries.length > 0 ? activeDeliveries.length : undefined,
+            onSelect: () => setTab('active'),
+          },
+          {
+            id: 'send',
+            label: 'Send a Parcel',
+            active: tab === 'send',
+            onSelect: () => setTab('send'),
+          },
+          {
+            id: 'wallet',
+            label: 'Wallet',
+            active: tab === 'wallet',
+            badge: formatNaira(wallet?.balanceNgn ?? 0),
+            onSelect: () => setTab('wallet'),
+          },
+          {
+            id: 'history',
+            label: 'History',
+            active: tab === 'history',
+            onSelect: () => setTab('history'),
+          },
+          {
+            id: 'notifications',
+            label: 'Notifications',
+            active: tab === 'notifications',
+            badge: unreadCount > 0 ? unreadCount : undefined,
+            onSelect: () => setTab('notifications'),
+          },
+          {
+            id: 'tickets',
+            label: 'Support & Tickets',
+            active: tab === 'tickets',
+            onSelect: () => setTab('tickets'),
+          },
+          {
+            id: 'profile',
+            label: 'Profile',
+            active: tab === 'profile',
+            onSelect: () => setTab('profile'),
+          },
+        ]}
+        footerContent={
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={toggleMute}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
+              >
+                {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                <span>{muted ? 'Sound Muted' : 'Sound On'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  handleManualRefresh();
+                  setMobileMenuOpen(false);
+                }}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                <span>Refresh</span>
+              </button>
+              <PWAInstallButton />
+              {whatsappNumber && (
+                <a
+                  href={buildWhatsAppUrl(whatsappNumber, `Hello SAQO, client inquiry from ${profile.fullName}`)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold"
+                >
+                  <MessageCircle className="w-3.5 h-3.5" />
+                  <span>WhatsApp</span>
+                </a>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMenuOpen(false);
+                onLogout();
+              }}
+              className="w-full inline-flex items-center justify-center gap-2 bg-black text-white py-3 rounded-xl text-sm font-bold cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Sign out</span>
+            </button>
+          </div>
+        }
+      />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 sm:pt-8 pb-28 md:pb-16">
         {liveToast && (
@@ -3357,8 +3485,8 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('active')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'active' ? 'text-black' : 'text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'active' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <MapPin className="w-4 h-4" />
@@ -3367,8 +3495,8 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('send')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'send' ? 'text-black' : 'text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'send' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <Plus className="w-4 h-4" />
@@ -3377,8 +3505,8 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('wallet')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
-            tab === 'wallet' ? 'text-black' : 'text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+            tab === 'wallet' ? 'border-black text-black' : 'border-transparent text-neutral-500'
           }`}
         >
           <Wallet className="w-4 h-4" />
@@ -3387,10 +3515,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('more')}
-          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
             ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab)
-              ? 'text-black'
-              : 'text-neutral-500'
+              ? 'border-black text-black'
+              : 'border-transparent text-neutral-500'
           }`}
         >
           <LayoutGrid className="w-4 h-4" />
