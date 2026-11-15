@@ -104,11 +104,12 @@ export const RouteLocationCard: React.FC<RouteLocationCardProps> = ({
       <div className="relative space-y-2.5">
         <span
           aria-hidden="true"
-          className="pointer-events-none absolute left-[20px] top-[34px] bottom-[34px] w-[1.5px] bg-black/25 z-0"
+          className="pointer-events-none absolute left-[20px] top-[44px] bottom-[25px] w-[1.5px] bg-black/25 z-0"
         />
         <AddressPickerField
           id={`${idPrefix}-pickup-addr`}
           label="Pickup location"
+          fieldTag="From"
           variant="pickup"
           stateName={pickupState}
           restrictToState={!showDeliveryStateSelectors}
@@ -129,6 +130,7 @@ export const RouteLocationCard: React.FC<RouteLocationCardProps> = ({
         <AddressPickerField
           id={`${idPrefix}-dest-addr`}
           label="Dropoff location"
+          fieldTag="To"
           variant="destination"
           stateName={destinationState}
           restrictToState={!showDeliveryStateSelectors}

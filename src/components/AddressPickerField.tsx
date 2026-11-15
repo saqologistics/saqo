@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  CheckCircle2,
   CornerDownLeft,
   Loader2,
   LocateFixed,
@@ -27,6 +26,7 @@ export interface ResolvedPlace {
 interface AddressPickerFieldProps {
   id: string;
   label: string;
+  fieldTag?: string;
   stateName: string;
   restrictToState?: boolean;
   value: string;
@@ -62,6 +62,7 @@ const normalizeLabel = (text: string) => text.trim().toLowerCase();
 export const AddressPickerField: React.FC<AddressPickerFieldProps> = ({
   id,
   label,
+  fieldTag,
   stateName,
   restrictToState = false,
   value,
@@ -303,6 +304,14 @@ export const AddressPickerField: React.FC<AddressPickerFieldProps> = ({
 
   return (
     <div ref={wrapperRef} className="relative">
+      {fieldTag && (
+        <label
+          htmlFor={id}
+          className="block text-[11px] font-bold uppercase tracking-wider text-neutral-500 mb-1 pl-0.5"
+        >
+          {fieldTag}
+        </label>
+      )}
       <div className="relative flex items-center">
         <span
           aria-hidden="true"
@@ -392,16 +401,9 @@ export const AddressPickerField: React.FC<AddressPickerFieldProps> = ({
       {locationError && !mobileSheetOpen && (
         <p role="status" className="mt-1 text-xs text-neutral-600">{locationError}</p>
       )}
-      {value.trim() && (
-        <p className="mt-1 flex items-center gap-1 text-[11px] text-neutral-600">
-          {selectedCoords ? (
-            <>
-              <CheckCircle2 className="w-3 h-3 shrink-0" />
-              <span>Pinned in {stateName}</span>
-            </>
-          ) : (
-            'Select a suggestion to pin this address.'
-          )}
+      {value.trim() && !selectedCoords && (
+        <p className="mt-1 text-[11px] text-neutral-600">
+          Select a suggestion to pin this address.
         </p>
       )}
 
