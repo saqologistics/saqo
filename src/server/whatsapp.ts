@@ -30,11 +30,14 @@ function getConfig() {
   const authToken = process.env.TWILIO_AUTH_TOKEN?.trim();
   const sender = process.env.TWILIO_WHATSAPP_FROM?.trim();
   const configuredUrl = process.env.APP_URL?.trim();
+  const configuredWebhookOrigin = process.env.TWILIO_WEBHOOK_ORIGIN?.trim();
   if (!accountSid || !/^AC[\da-f]{32}$/i.test(accountSid) || !authToken || !sender || !whatsappAddress.test(sender) || !configuredUrl) return null;
   try {
     const appUrl = new URL(configuredUrl);
-    if (appUrl.protocol !== 'https:') return null;
-    return { accountSid, authToken, sender, appUrl: appUrl.origin };
+    const webhook = new URL(configuredWebhookOrigin || appUrl.origin);
+    if (appUrl.protocol !== 'https:' || webhook.protocol !== 'https:' || webhook.username || webhook.password ||
+        webhook.pathname !== '/' || webhook.search || webhook.hash) return null;
+    return { accountSid, authToken, sender, appUrl: appUrl.origin, webhookOrigin: webhook.origin };
   } catch {
     return null;
   }
@@ -233,7 +236,7 @@ function processMessage(input: {
 export function handleTwilioWhatsApp(fields: TwilioFields, signature: string, requestPath: string) {
   const config = getConfig();
   if (!config) return { status: 503, text: 'WhatsApp ordering is unavailable.' };
-  if (!isValidSignature(config.appUrl + requestPath, fields, signature, config.authToken) ||
+  if (!isValidSignature(config.webhookOrigin + requestPath, fields, signature, config.authToken) ||
       fields.AccountSid !== config.accountSid || fields.To !== config.sender) {
     return { status: 403, text: 'Invalid Twilio request.' };
   }

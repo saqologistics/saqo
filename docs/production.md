@@ -20,7 +20,7 @@ Caddy obtains the HTTPS certificate and forwards WebSocket upgrades. The applica
 2. Run `npm run test:whatsapp:tunnel`. Wait for the HTTPS check and copy the printed URL. This run exposes only the webhook and uses a disposable database. It will read changes to `.env` on the next request. App, tracking, and live agent links are outside this test.
 3. In the Sandbox dedicated to SAQO, set **When a message comes in** to the printed URL with `POST`. Join the Sandbox from a test phone and send `MENU`, then `ORDER` using fictional details. Each new tunnel gets a different URL. Stop it with Ctrl+C when done.
 
-For a live deployment, set `APP_URL` to the public HTTPS origin and configure Twilio to `POST` to `/api/webhooks/twilio/whatsapp` on that origin. Use a registered production sender for customers. If deploying the frontend on Vercel, keep this version of the backend on a host that supports the Compose service and persistent SQLite volume, and route requests to that backend. Run Caddy there, if needed.
+For a live deployment, set `APP_URL` to the public HTTPS origin that customers open from WhatsApp. If Twilio calls a separate API host, set `TWILIO_WEBHOOK_ORIGIN` to its HTTPS origin. Configure the registered production sender to `POST` to `/api/webhooks/twilio/whatsapp` on the API host. The origin must match the URL in Twilio for signature verification. The current API and dispatch worker use SQLite for their primary reads and writes, even when Supabase Realtime and payment mirroring are enabled. Moving the live API to Supabase requires migrating those reads and writes and deploying the API and queue processing.
 
 ## Back up and restore
 

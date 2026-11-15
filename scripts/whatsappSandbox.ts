@@ -143,6 +143,7 @@ createInterface({ input: tunnel.stderr }).on('line', (line) => {
   }
   origin = match[1];
   process.env.APP_URL = origin;
+  process.env.TWILIO_WEBHOOK_ORIGIN = origin;
   const url = origin + TWILIO_WHATSAPP_PATH;
   console.log(`Twilio Sandbox webhook (POST): ${url}`);
   void verify(url).catch((error) => console.error('Sandbox check failed:', error.message));

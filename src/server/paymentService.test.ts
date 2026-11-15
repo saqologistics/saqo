@@ -46,6 +46,7 @@ test('operations alerts deliver structured JSON and coalesce a repeated event', 
 test('Twilio WhatsApp orders require a signed request and confirmation and persist only once', async (t) => {
   const config = {
     APP_URL: 'https://saqo.test',
+    TWILIO_WEBHOOK_ORIGIN: 'https://api.saqo.test',
     TWILIO_ACCOUNT_SID: 'AC' + '1'.repeat(32),
     TWILIO_AUTH_TOKEN: 'test-whatsapp-secret',
     TWILIO_WHATSAPP_FROM: 'whatsapp:+2348000000000',
@@ -56,18 +57,19 @@ test('Twilio WhatsApp orders require a signed request and confirmation and persi
     t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
   }
   const path = whatsapp.TWILIO_WHATSAPP_PATH;
-  const send = (body: string, sid = 'SM' + crypto.randomBytes(16).toString('hex'), signed = true) => {
+  const send = (body: string, sid = 'SM' + crypto.randomBytes(16).toString('hex'), signed = true, origin = config.TWILIO_WEBHOOK_ORIGIN) => {
     const fields = {
       AccountSid: config.TWILIO_ACCOUNT_SID, To: config.TWILIO_WHATSAPP_FROM,
       From: 'whatsapp:+2348111111111', ProfileName: 'WhatsApp Test', MessageSid: sid, Body: body,
     };
-    const input = config.APP_URL + path + Object.entries(fields).sort(([a], [b]) => a < b ? -1 : 1)
+    const input = origin + path + Object.entries(fields).sort(([a], [b]) => a < b ? -1 : 1)
       .map(([key, value]) => key + value).join('');
     const signature = signed ? crypto.createHmac('sha1', config.TWILIO_AUTH_TOKEN).update(input).digest('base64') : 'invalid';
     return whatsapp.handleTwilioWhatsApp(fields, signature, path);
   };
   assert.equal(whatsapp.getWhatsAppOrderNumber(), '2348000000000');
   assert.equal(send('ORDER', undefined, false).status, 403);
+  assert.equal(send('ORDER', undefined, true, config.APP_URL).status, 403);
   assert.match(send('APP').text, /https:\/\/saqo\.test\/\?order=1/);
   assert.match(send('ORDER').text, /collect your parcel/);
   assert.match(send('Kofar Kaura').text, /1\. Kofar Kaura/);
