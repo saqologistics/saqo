@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CloudOff, Wifi, WifiOff } from 'lucide-react';
+import { apiUrl } from '../lib/deployment';
 
 type ConnectionStatus = 'checking' | 'online' | 'offline' | 'unreachable';
 
@@ -28,7 +29,7 @@ export const OfflineIndicator: React.FC = () => {
       request = controller;
       const timeout = window.setTimeout(() => controller.abort(), 4500);
       try {
-        const response = await fetch('/api/health', { cache: 'no-store', signal: controller.signal });
+        const response = await fetch(apiUrl('/api/health'), { cache: 'no-store', signal: controller.signal });
         if (!response.ok || (await response.json()).service !== 'saqo-dispatch') {
           throw new Error('SAQO health check failed');
         }

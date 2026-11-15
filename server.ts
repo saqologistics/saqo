@@ -213,6 +213,31 @@ function getRequestOrigin(req: Request): string {
   return `${req.protocol}://${req.get('host') || `localhost:${process.env.PORT || 3000}`}`;
 }
 
+function isAllowedBrowserOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true;
+  try {
+    const site = new URL(origin);
+    if (site.origin !== origin || !['https:', 'http:'].includes(site.protocol)) return false;
+    return site.host === host || origin === new URL(process.env.APP_URL || '').origin;
+  } catch {
+    return false;
+  }
+}
+
+function getWebhookOrigin(req: Request): string {
+  const configured = process.env.SAQO_API_ORIGIN?.trim();
+  if (!configured) return getRequestOrigin(req);
+  try {
+    const url = new URL(configured);
+    if (url.protocol === 'https:' && (configured === url.origin || configured === `${url.origin}/`)) {
+      return url.origin;
+    }
+  } catch {
+    // Report the configuration error below.
+  }
+  throw new PaymentConfigError('Set SAQO_API_ORIGIN to the HTTPS origin that receives webhooks.');
+}
+
 function sendPaymentError(res: Response, err: unknown): void {
   if (err instanceof InsufficientWalletBalanceError) {
     res.status(400).json({
@@ -235,8 +260,23 @@ async function startServer() {
   const app = express();
   if (process.env.SAQO_TRUST_PROXY === '1') app.set('trust proxy', 1);
   app.disable('x-powered-by');
-  app.use('/api', (_req, res, next) => {
+  app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
+    res.vary('Origin');
+    const origin = req.get('Origin');
+    if (origin) {
+      if (!isAllowedBrowserOrigin(origin, req.get('host'))) {
+        res.status(403).json({ error: 'This origin cannot access the SAQO API.' });
+        return;
+      }
+      res.set('Access-Control-Allow-Origin', origin);
+      if (req.method === 'OPTIONS' && req.get('Access-Control-Request-Method')) {
+        res.set('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE');
+        res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+        res.sendStatus(204);
+        return;
+      }
+    }
     next();
   });
   app.use(
@@ -270,6 +310,10 @@ async function startServer() {
   server.on('upgrade', (req, socket, head) => {
     const pathname = new URL(req.url || '/', 'http://localhost').pathname;
     if (pathname === '/ws') {
+      if (!isAllowedBrowserOrigin(req.headers.origin, req.headers.host)) {
+        socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });
@@ -2010,7 +2054,7 @@ async function startServer() {
   // Admin: View Payment Gateway (Flutterwave & Bank Account) Settings (secrets strictly masked!)
   app.get('/api/admin/gateway-settings', authenticate, requireRole('admin'), (req, res) => {
     try {
-      res.set('Cache-Control', 'no-store').json(getGatewayAdminView(getRequestOrigin(req)));
+      res.set('Cache-Control', 'no-store').json(getGatewayAdminView(getWebhookOrigin(req)));
     } catch (error) {
       sendPaymentError(res, error);
     }
@@ -2022,7 +2066,7 @@ async function startServer() {
       const updated = updateGatewaySettings(
         req.body || {},
         req.auth!.userId,
-        getRequestOrigin(req)
+        getWebhookOrigin(req)
       );
       res.json(updated);
     } catch (err) {

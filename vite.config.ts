@@ -9,6 +9,12 @@ export default defineConfig(() => {
     plugins: [
       react(),
       tailwindcss(),
+      {
+        name: 'saqo-preview-robots',
+        transformIndexHtml: () => process.env.VITE_SAQO_STATIC_PREVIEW === '1'
+          ? [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex' } }]
+          : [],
+      },
       VitePWA({
         registerType: 'autoUpdate',
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],

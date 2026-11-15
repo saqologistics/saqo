@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiRequest, getStoredToken } from '../lib/api';
+import { apiUrl } from '../lib/deployment';
 import type { SaqoReceiptData } from '../lib/receipt';
 import { useRealtime } from '../hooks/useRealtime';
 import { formatNaira } from '../shared/pricing';
@@ -140,7 +141,7 @@ export const AdminPaymentsSection: React.FC<{
     try {
       const qs = buildQueryString(false);
       const token = getStoredToken();
-      const res = await fetch(`/api/admin/payments/export?${qs}`, {
+      const res = await fetch(apiUrl(`/api/admin/payments/export?${qs}`), {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!res.ok) throw new Error('Could not export CSV report.');

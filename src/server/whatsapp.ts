@@ -30,7 +30,7 @@ function getConfig() {
   const authToken = process.env.TWILIO_AUTH_TOKEN?.trim();
   const sender = process.env.TWILIO_WHATSAPP_FROM?.trim();
   const configuredUrl = process.env.APP_URL?.trim();
-  const configuredWebhookOrigin = process.env.TWILIO_WEBHOOK_ORIGIN?.trim();
+  const configuredWebhookOrigin = process.env.TWILIO_WEBHOOK_ORIGIN?.trim() || process.env.SAQO_API_ORIGIN?.trim();
   if (!accountSid || !/^AC[\da-f]{32}$/i.test(accountSid) || !authToken || !sender || !whatsappAddress.test(sender) || !configuredUrl) return null;
   try {
     const appUrl = new URL(configuredUrl);

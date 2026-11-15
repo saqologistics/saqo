@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getStoredToken } from '../lib/api';
-import { staticPreview } from '../lib/deployment';
+import { realtimeUrl, staticPreview } from '../lib/deployment';
 import { subscribeSupabaseNotifications } from '../lib/supabaseRealtime';
 import type { LiveWsEvent } from '../shared/types';
 
@@ -55,9 +55,7 @@ function ensureSharedConnection() {
     return;
   }
 
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/ws`;
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(realtimeUrl());
   sharedWs = ws;
 
   ws.onopen = () => {

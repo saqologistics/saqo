@@ -11,7 +11,8 @@ services:
         VITE_OSRM_URL: ${VITE_OSRM_URL:-}
     env_file: ${SAQO_ENV_FILE:-.env}
     environment:
-      APP_URL: https://${SAQO_DOMAIN:?Set SAQO_DOMAIN to a hostname}
+      APP_URL: ${APP_URL:-https://${SAQO_DOMAIN:?Set SAQO_DOMAIN to a hostname}}
+      SAQO_API_ORIGIN: https://${SAQO_DOMAIN:?Set SAQO_DOMAIN to a hostname}
       NODE_ENV: production
       SAQO_DB_PATH: /data/${SAQO_DB_FILE:-saqo.db}
       SAQO_TRUST_PROXY: "1"

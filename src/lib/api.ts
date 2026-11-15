@@ -1,4 +1,4 @@
-import { staticPreview } from './deployment';
+import { apiUrl, staticPreview } from './deployment';
 
 const TOKEN_KEY = 'saqo_auth_token';
 
@@ -46,7 +46,7 @@ export async function apiRequest<T = any>(
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(apiUrl(url), { ...options, headers });
   const text = await res.text();
   let data: any = {};
   try {
