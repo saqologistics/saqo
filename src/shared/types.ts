@@ -109,6 +109,10 @@ export interface DeliveryRequest {
   assignedRiderVerified?: boolean;
   assignedRiderLat: number | null;
   assignedRiderLng: number | null;
+  assignedRiderRating?: number | null;
+  riderRating?: number | null;
+  riderRatingComment?: string | null;
+  ratedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

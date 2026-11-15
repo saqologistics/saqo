@@ -306,12 +306,16 @@ export const AddressPickerField: React.FC<AddressPickerFieldProps> = ({
       <div className="relative flex items-center">
         <span
           aria-hidden="true"
-          className="absolute left-3 flex items-center justify-center pointer-events-none"
+          className="absolute left-3.5 flex items-center justify-center pointer-events-none z-10"
         >
           {isPickup ? (
-            <span className="w-2.5 h-2.5 rounded-full bg-black ring-2 ring-black/15" />
+            <span className="w-3.5 h-3.5 rounded-full bg-black flex items-center justify-center">
+              <span className="w-1.5 h-1.5 rounded-full bg-white" />
+            </span>
           ) : (
-            <span className="w-2.5 h-2.5 border-2 border-black bg-white" />
+            <span className="w-3.5 h-3.5 rounded-[3px] bg-black flex items-center justify-center">
+              <span className="w-1.5 h-1.5 bg-white" />
+            </span>
           )}
         </span>
         <input
@@ -335,9 +339,9 @@ export const AddressPickerField: React.FC<AddressPickerFieldProps> = ({
           aria-label={label}
           placeholder={placeholder}
           autoComplete="off"
-          className={`w-full rounded-lg pl-8 pr-16 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black ${surfaceClassName}`}
+          className={`w-full rounded-xl pl-10 pr-16 py-3.5 text-base sm:text-sm font-medium placeholder:text-neutral-500 transition-colors focus:outline-none focus:ring-2 focus:ring-black ${surfaceClassName}`}
         />
-        <div className="absolute right-2 flex items-center gap-0.5">
+        <div className="absolute right-2.5 flex items-center gap-0.5">
           {value && (
             <button
               type="button"
@@ -372,14 +376,14 @@ export const AddressPickerField: React.FC<AddressPickerFieldProps> = ({
             }}
             title={isPickup ? 'Detect GPS pickup location' : `Browse ${stateName} destinations`}
             aria-label={isPickup ? `Detect GPS for ${label}` : `Search ${label}`}
-            className="p-1 text-neutral-500 hover:text-black cursor-pointer"
+            className="p-1.5 text-black hover:text-neutral-700 cursor-pointer"
           >
             {locating ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : isPickup ? (
-              <LocateFixed className="w-4 h-4" />
+              <Navigation className="w-4 h-4 fill-black" />
             ) : (
-              <Search className="w-4 h-4" />
+              <Search className="w-4 h-4 text-neutral-500" />
             )}
           </button>
         </div>

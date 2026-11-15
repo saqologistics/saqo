@@ -176,6 +176,7 @@ export default function App() {
           initialDraft={quickDraft}
           onGoHome={() => setScreen('landing')}
           onLogout={handleLogout}
+          onProfileUpdated={(nextProfile) => setProfile(nextProfile)}
         />
       )}
 
@@ -184,6 +185,7 @@ export default function App() {
           profile={profile}
           onGoHome={() => setScreen('landing')}
           onLogout={handleLogout}
+          onProfileUpdated={(nextProfile) => setProfile(nextProfile)}
         />
       )}
 

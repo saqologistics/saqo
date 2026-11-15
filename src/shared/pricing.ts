@@ -125,3 +125,37 @@ export function matchesDeliveryOtp(enteredOtp: string, expectedOtp: string): boo
   return /^\d{4}$/.test(cleanEntered) && cleanEntered === cleanExpected;
 }
 
+export function formatPaymentMethodLabel(method?: string | null): string {
+  switch (method) {
+    case 'wallet':
+      return 'SAQO Wallet';
+    case 'flutterwave':
+      return 'Flutterwave';
+    case 'bank_transfer':
+      return 'Bank Transfer';
+    case 'cash':
+    default:
+      return 'Cash on Delivery';
+  }
+}
+
+export function formatPaymentStatusLabel(method?: string | null, status?: string | null): string {
+  const m = method || 'cash';
+  const s = status || 'pending';
+  if (s === 'paid' || s === 'settled') return 'Paid';
+  if (s === 'collected_by_rider') return m === 'cash' ? 'Cash Collected' : 'Collected by Rider';
+  if (s === 'reconciled') return 'Reconciled';
+  if (s === 'disputed') return 'Disputed';
+  if (s === 'pending_verification') return 'Awaiting Verification';
+  if (s === 'pending' || s === 'unpaid') {
+    if (m === 'cash') return 'Pay Cash to Rider';
+    if (m === 'bank_transfer') return 'Transfer Pending';
+    return 'Payment Pending';
+  }
+  if (s === 'refunded') return 'Refunded';
+  if (s === 'reversed') return 'Reversed';
+  if (s === 'failed') return 'Payment Failed';
+  return s.replace(/_/g, ' ');
+}
+
+

@@ -302,7 +302,7 @@ let lastSweepAt = 0;
 
 export async function expireTimedOutOffers(force = false): Promise<number> {
   const nowMs = Date.now();
-  if (!force && nowMs - lastSweepAt < 5000) return 0;
+  if (!force && nowMs - lastSweepAt < 1500) return 0;
   lastSweepAt = nowMs;
   const nowIso = new Date(nowMs).toISOString();
   const expired = await persistDispatchChange(async () => {

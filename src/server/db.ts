@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { db, sqlite, databaseTransaction } from './database';
+import { db, pool, sqlite, databaseTransaction } from './database';
 export { db, databaseTransaction as persistDispatchChange } from './database';
 import { DEFAULT_PLATFORM_SETTINGS } from '../shared/pricing';
 import type {
@@ -113,7 +113,7 @@ function initSqliteDatabase(): void {
       plate_number TEXT NOT NULL,
       home_state TEXT NOT NULL,
       verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending', 'verified', 'rejected')),
-      is_online INTEGER NOT NULL DEFAULT 0,
+      is_online INTEGER NOT NULL DEFAULT 1,
       current_lat REAL NOT NULL,
       current_lng REAL NOT NULL,
       last_location_at TEXT NOT NULL,
@@ -152,6 +152,9 @@ function initSqliteDatabase(): void {
       otp_verified INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL,
       assigned_rider_id TEXT REFERENCES riders(id),
+      rider_rating REAL,
+      rider_rating_comment TEXT,
+      rated_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -490,6 +493,15 @@ function initSqliteDatabase(): void {
   if (!colNames.has('payment_reference')) {
     db.exec('ALTER TABLE delivery_requests ADD COLUMN payment_reference TEXT');
   }
+  if (!colNames.has('rider_rating')) {
+    db.exec('ALTER TABLE delivery_requests ADD COLUMN rider_rating REAL');
+  }
+  if (!colNames.has('rider_rating_comment')) {
+    db.exec('ALTER TABLE delivery_requests ADD COLUMN rider_rating_comment TEXT');
+  }
+  if (!colNames.has('rated_at')) {
+    db.exec('ALTER TABLE delivery_requests ADD COLUMN rated_at TEXT');
+  }
 
   const nowIso = new Date().toISOString();
   const seedMethodStmt = db.prepare(`
@@ -564,8 +576,20 @@ function initSqliteDatabase(): void {
 
 }
 
+let schemaExtensionsEnsured = false;
+
+async function ensurePostgresSchemaExtensions(): Promise<void> {
+  if (!pool || schemaExtensionsEnsured) return;
+  await db.prepare('ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rider_rating REAL').run();
+  await db.prepare('ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rider_rating_comment TEXT').run();
+  await db.prepare('ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rated_at TEXT').run();
+  await db.prepare('ALTER TABLE riders ALTER COLUMN is_online SET DEFAULT 1').run();
+  schemaExtensionsEnsured = true;
+}
+
 export async function initDatabase() {
   if (sqlite) initSqliteDatabase();
+  if (pool) await ensurePostgresSchemaExtensions();
   await databaseTransaction(bootstrapAdminAccount);
 }
 
@@ -701,7 +725,7 @@ export async function getDeliveryById(deliveryId: string): Promise<DeliveryReque
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
-      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
+      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status, r.rating as rider_rating_avg,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
@@ -723,14 +747,14 @@ export function publicTrackingDelivery(delivery: DeliveryRequest) {
     destinationState, destinationAddress, destinationLat, destinationLng,
     parcelCategory, weightKg, serviceTier, distanceKm, estimatedMinutes, deliveryFeeNgn,
     status, otpVerified, assignedRiderId, assignedRiderName, assignedRiderVehicle,
-    assignedRiderVerified, assignedRiderLat, assignedRiderLng, updatedAt,
+    assignedRiderVerified, assignedRiderLat, assignedRiderLng, assignedRiderRating, riderRating, updatedAt,
   } = delivery;
   return {
     id, trackingCode, pickupState, pickupAddress, pickupLat, pickupLng,
     destinationState, destinationAddress, destinationLat, destinationLng,
     parcelCategory, weightKg, serviceTier, distanceKm, estimatedMinutes, deliveryFeeNgn,
     status, otpVerified, assignedRiderId, assignedRiderName, assignedRiderVehicle,
-    assignedRiderVerified, assignedRiderLat, assignedRiderLng, updatedAt,
+    assignedRiderVerified, assignedRiderLat, assignedRiderLng, assignedRiderRating, riderRating, updatedAt,
   };
 }
 
@@ -744,7 +768,7 @@ export async function getDeliveryByTrackingCode(trackingCode: string): Promise<D
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
-      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
+      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status, r.rating as rider_rating_avg,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
@@ -766,7 +790,7 @@ export async function listDeliveries(filter?: { customerId?: string; riderId?: s
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
-      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
+      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status, r.rating as rider_rating_avg,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
@@ -826,6 +850,10 @@ function mapDeliveryRow(row: any): DeliveryRequest {
     assignedRiderVerified: row.rider_verification_status === 'verified',
     assignedRiderLat: row.rider_lat ?? null,
     assignedRiderLng: row.rider_lng ?? null,
+    assignedRiderRating: row.rider_rating_avg ?? null,
+    riderRating: row.rider_rating ?? null,
+    riderRatingComment: row.rider_rating_comment || null,
+    ratedAt: row.rated_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

@@ -43,9 +43,14 @@ function ensureSharedConnection() {
   if (staticPreview || typeof window === 'undefined') return;
 
   if (!unsubscribeSupabase) {
-    unsubscribeSupabase = subscribeSupabaseNotifications((evt) => {
-      if (!sharedConnected) dispatchEvent(evt);
-    });
+    unsubscribeSupabase = subscribeSupabaseNotifications(
+      (evt) => {
+        if (!sharedConnected || isSupabaseEdgeApi) dispatchEvent(evt);
+      },
+      (sbConnected) => {
+        if (isSupabaseEdgeApi) notifyConnection(sbConnected);
+      }
+    );
   }
 
   if (isSupabaseEdgeApi) return;

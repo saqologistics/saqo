@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowDownLeft,
-  ArrowUpDown,
   ArrowUpRight,
   BadgeCheck,
   Banknote,
@@ -10,9 +9,11 @@ import {
   Building2,
   Check,
   CheckCircle2,
+  ChevronDown,
   Clock,
   Copy,
   CreditCard,
+  LayoutGrid,
   LogOut,
   MapPin,
   MessageCircle,
@@ -23,13 +24,31 @@ import {
   Receipt,
   RefreshCw,
   Search,
+  Star,
+  User,
+  Volume2,
+  VolumeX,
   Wallet,
 } from 'lucide-react';
 import { apiRequest } from '../lib/api';
+import {
+  getNotificationPermissionState,
+  isSoundMuted,
+  playNotificationSound,
+  requestPushNotificationPermission,
+  setSoundMuted,
+  showPushNotification,
+} from '../lib/alerts';
 import type { SaqoReceiptData } from '../lib/receipt';
 import { useRealtime } from '../hooks/useRealtime';
-import { NIGERIA_STATES, resolveAddressCoordinates } from '../shared/nigeria';
-import { formatEta, formatNaira, isValidNigerianPhone } from '../shared/pricing';
+import { resolveAddressCoordinates } from '../shared/nigeria';
+import {
+  formatEta,
+  formatNaira,
+  formatPaymentMethodLabel,
+  formatPaymentStatusLabel,
+  isValidNigerianPhone,
+} from '../shared/pricing';
 import { formatDeliveryStatusLabel, getTrackingProgress } from '../shared/tracking';
 import type {
   ComplaintRecord,
@@ -46,11 +65,12 @@ import type {
   WalletAccount,
   WalletTransaction,
 } from '../shared/types';
-import { AddressPickerField } from './AddressPickerField';
 import type { QuickDraft } from './LandingPage';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { OtpAlertModal } from './OtpAlertModal';
 import { PWAInstallButton } from './PWAInstallButton';
 import { ReceiptModal } from './ReceiptModal';
+import { RouteLocationCard } from './RouteLocationCard';
 import { SaqoLogo } from './SaqoLogo';
 import { buildWhatsAppUrl } from './WhatsAppWidget';
 
@@ -65,6 +85,7 @@ interface ClientDashboardProps {
   initialDraft?: QuickDraft | null;
   onGoHome: () => void;
   onLogout: () => void;
+  onProfileUpdated?: (profile: Profile) => void;
 }
 
 const PARCEL_CATEGORIES: ParcelCategory[] = [
@@ -83,9 +104,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   initialDraft,
   onGoHome,
   onLogout,
+  onProfileUpdated,
 }) => {
   const [tab, setTab] = useState<
-    'active' | 'send' | 'wallet' | 'history' | 'notifications' | 'tickets'
+    'active' | 'send' | 'wallet' | 'history' | 'notifications' | 'tickets' | 'profile' | 'more'
   >(initialDraft ? 'send' : 'active');
   const [deliveries, setDeliveries] = useState<DeliveryWithHistory[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -93,6 +115,24 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [selectedDeliveryId, setSelectedDeliveryId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [otpAlert, setOtpAlert] = useState<{ message: string; trackingCode?: string } | null>(null);
+  const [muted, setMuted] = useState<boolean>(() => isSoundMuted());
+  const [notifPerm, setNotifPerm] = useState<NotificationPermission | 'unsupported'>(() =>
+    getNotificationPermissionState()
+  );
+
+  // Post-delivery Rating state
+  const [ratingTargetDelivery, setRatingTargetDelivery] = useState<DeliveryWithHistory | null>(null);
+  const [ratingStars, setRatingStars] = useState(5);
+  const [ratingComment, setRatingComment] = useState('');
+  const [submittingRating, setSubmittingRating] = useState(false);
+
+  // Editable Profile state
+  const [editFullName, setEditFullName] = useState(profile.fullName);
+  const [editPhone, setEditPhone] = useState(profile.phone);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const seenStatusesRef = useRef<Map<string, string>>(new Map());
 
   // Wallet & Payment states
   const [wallet, setWallet] = useState<WalletAccount | null>(null);
@@ -175,10 +215,11 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [confirmingOtp, setConfirmingOtp] = useState(false);
   const [justConfirmedId, setJustConfirmedId] = useState<string | null>(null);
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (checkExpiry = false) => {
     try {
+      const delPath = checkExpiry ? '/api/client/deliveries?checkExpiry=1' : '/api/client/deliveries';
       const [delRes, notifRes, ticketsRes, walletRes, payCfgRes] = await Promise.all([
-        apiRequest<{ deliveries: DeliveryWithHistory[] }>('/api/client/deliveries'),
+        apiRequest<{ deliveries: DeliveryWithHistory[] }>(delPath),
         apiRequest<{ notifications: NotificationItem[] }>('/api/notifications'),
         apiRequest<{ tickets: ComplaintRecord[] }>('/api/client/tickets'),
         apiRequest<{
@@ -188,6 +229,20 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         }>('/api/wallet').catch(() => null),
         apiRequest<PaymentGatewayPublicConfig>('/api/payments/config').catch(() => null),
       ]);
+      if (seenStatusesRef.current.size > 0) {
+        for (const d of delRes.deliveries) {
+          const prev = seenStatusesRef.current.get(d.id);
+          if (prev && prev !== d.status) {
+            playNotificationSound('status');
+            showPushNotification(
+              `Parcel ${d.trackingCode}: ${formatDeliveryStatusLabel(d.status)}`,
+              `${d.pickupState} → ${d.destinationState}`,
+              `saqo-del-${d.id}`
+            );
+          }
+        }
+      }
+      seenStatusesRef.current = new Map(delRes.deliveries.map((d) => [d.id, d.status]));
       setDeliveries(delRes.deliveries);
       setNotifications(notifRes.notifications);
       setTickets(ticketsRes.tickets);
@@ -312,7 +367,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
   useRealtime((evt) => {
     if (evt.type === 'notifications:refresh' || evt.type === 'connected') {
-      loadData();
+      loadData(true);
       return;
     }
     if (evt.type === 'notification:created') {
@@ -322,6 +377,8 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           prev.some((n) => n.id === notif.id) ? prev : [notif, ...prev]
         );
         setLiveToast(notif);
+        playNotificationSound('status');
+        showPushNotification(notif.title, notif.message, `saqo-notif-${notif.id}`);
       }
     }
     if (
@@ -335,9 +392,28 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       evt.type === 'cash_collection:updated' ||
       evt.type === 'gateway:updated'
     ) {
-      loadData();
+      loadData(true);
     }
   });
+
+  // Sync profile edit form & keep active parcels synced automatically
+  useEffect(() => {
+    setEditFullName(profile.fullName);
+    setEditPhone(profile.phone);
+  }, [profile.fullName, profile.phone]);
+
+  useEffect(() => {
+    const hasActive = deliveries.some((d) => !['delivered', 'cancelled'].includes(d.status));
+    const onVis = () => {
+      if (document.visibilityState === 'visible') void loadData(true);
+    };
+    document.addEventListener('visibilitychange', onVis);
+    const interval = hasActive ? window.setInterval(() => void loadData(true), 8000) : null;
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      if (interval !== null) window.clearInterval(interval);
+    };
+  }, [deliveries, loadData]);
 
   // Live quote calculation
   useEffect(() => {
@@ -578,12 +654,74 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       setOtpInput('');
       setJustConfirmedId(delivery.id);
       setOtpFeedback('Parcel delivery confirmed via OTP.');
+      playNotificationSound('status');
       await loadData();
     } catch (err: any) {
-      setOtpFeedback(err.message || 'Invalid OTP.');
+      const msg = err.message || 'Invalid OTP.';
+      setOtpFeedback(msg);
+      setOtpAlert({ message: msg, trackingCode: delivery.trackingCode });
+      playNotificationSound('status');
     } finally {
       setConfirmingOtp(false);
     }
+  };
+
+  const handleSubmitRating = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!ratingTargetDelivery) return;
+    setSubmittingRating(true);
+    setError(null);
+    try {
+      await apiRequest(`/api/deliveries/${ratingTargetDelivery.id}/rate`, {
+        method: 'POST',
+        body: JSON.stringify({
+          rating: ratingStars,
+          comment: ratingComment.trim() || undefined,
+        }),
+      });
+      setRatingTargetDelivery(null);
+      setRatingStars(5);
+      setRatingComment('');
+      await loadData();
+    } catch (err: any) {
+      setError(err.message || 'Could not submit rider rating.');
+    } finally {
+      setSubmittingRating(false);
+    }
+  };
+
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingProfile(true);
+    setProfileNotice(null);
+    setError(null);
+    try {
+      const res = await apiRequest<{ profile: Profile }>('/api/auth/profile', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          fullName: editFullName.trim(),
+          phone: editPhone.trim(),
+        }),
+      });
+      onProfileUpdated?.(res.profile);
+      setProfileNotice('Profile saved successfully.');
+    } catch (err: any) {
+      setError(err.message || 'Could not update profile.');
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const toggleMute = () => {
+    const next = !muted;
+    setMuted(next);
+    setSoundMuted(next);
+  };
+
+  const handleEnablePush = async () => {
+    const perm = await requestPushNotificationPermission();
+    setNotifPerm(perm);
+    if (perm === 'granted') playNotificationSound('status');
   };
 
   const handleManualRefresh = async () => {
@@ -713,7 +851,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
               tab === 'active' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
             }`}
           >
-            Active Tracking
+            Track
           </button>
           <button
             type="button"
@@ -735,34 +873,14 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => setTab('history')}
+            onClick={() => setTab('more')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'history' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
-            }`}
-          >
-            History
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('notifications')}
-            className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'notifications'
+              ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab)
                 ? 'text-white underline underline-offset-8'
                 : 'text-neutral-400 hover:text-white'
             }`}
           >
-            Notifications{unreadCount > 0 ? ` (${unreadCount})` : ''}
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('tickets')}
-            className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'tickets'
-                ? 'text-white underline underline-offset-8'
-                : 'text-neutral-400 hover:text-white'
-            }`}
-          >
-            Tickets{tickets.length > 0 ? ` (${tickets.length})` : ''}
+            More{unreadCount > 0 ? ` (${unreadCount})` : ''}
           </button>
         </nav>
 
@@ -770,11 +888,20 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           <button
             type="button"
             onClick={() => setTab('wallet')}
-            className="inline-flex items-center gap-1.5 border border-white/25 bg-white/10 text-white px-3 py-1.5 rounded-lg text-xs font-mono font-bold tabular-nums hover:bg-white/20 transition-colors cursor-pointer"
+            className="hidden sm:inline-flex items-center gap-1.5 border border-white/25 bg-white/10 text-white px-3 py-1.5 rounded-full text-xs font-mono font-bold tabular-nums hover:bg-white/20 transition-colors cursor-pointer"
             title="Open SAQO Wallet"
           >
             <Wallet className="w-3.5 h-3.5" />
             <span>{formatNaira(wallet?.balanceNgn ?? 0)}</span>
+          </button>
+          <button
+            type="button"
+            onClick={toggleMute}
+            aria-label={muted ? 'Unmute alert sounds' : 'Mute alert sounds'}
+            title={muted ? 'Sound Muted' : 'Sound Alerts On'}
+            className="inline-flex items-center justify-center border border-white/25 text-white p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer"
+          >
+            {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
           </button>
           <PWAInstallButton inverted compact />
           <button
@@ -782,21 +909,19 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             onClick={handleManualRefresh}
             disabled={refreshing}
             aria-label="Refresh deliveries"
-            className="inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-lg text-xs font-semibold hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-1.5 border border-white/25 text-white px-2.5 py-2 rounded-full text-xs font-semibold hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-            <span className="hidden sm:inline">Refresh</span>
+            <span className="hidden lg:inline">Refresh</span>
           </button>
-          <span className="hidden md:inline text-xs text-neutral-300 whitespace-nowrap">
-            {profile.fullName}
-          </span>
           <button
             type="button"
-            onClick={onLogout}
-            className="inline-flex items-center gap-1.5 bg-white text-black px-3 py-2 rounded-lg text-xs font-semibold hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={() => setTab('profile')}
+            className="inline-flex items-center gap-1.5 bg-white text-black px-3.5 py-1.5 rounded-full text-xs font-bold hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            title="View & Edit Profile"
           >
-            <LogOut className="w-3.5 h-3.5" />
-            <span>Sign out</span>
+            <span>{profile.fullName.split(' ')[0]}</span>
+            <ChevronDown className="w-3.5 h-3.5" />
           </button>
         </div>
       </header>
@@ -903,161 +1028,36 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                   )}
                 </div>
 
-                {/* FROM — PICKUP LOCATION */}
-                <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-black">
-                      <span aria-hidden="true" className="w-2.5 h-2.5 rounded-full bg-black shrink-0" />
-                      <span>From · Pickup Location</span>
-                    </span>
-                    <span className="text-[11px] text-neutral-500">Where rider collects parcel</span>
-                  </div>
-                  <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-3 gap-3" : undefined}>
-                    {showDeliveryStateSelectors && (
-                      <div>
-                        <label htmlFor="send-pickup-state" className="block text-xs font-semibold mb-1">
-                          Pickup State
-                        </label>
-                        <select
-                          id="send-pickup-state"
-                          value={pickupState}
-                          onChange={(e) => {
-                            const nextState = e.target.value;
-                            setPickupState(nextState);
-                            setPickupAddress('');
-                            setPickupCoords(null);
-                          }}
-                          className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black"
-                        >
-                          <option value="Katsina">Katsina (Live Hub)</option>
-                          {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
-                            <option key={s.name} value={s.name}>
-                              {s.name}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-                    <div className={showDeliveryStateSelectors ? "sm:col-span-2" : undefined}>
-                      <label htmlFor="send-pickup-addr" className="block text-xs font-semibold mb-1">
-                        Pickup Street / Landmark
-                      </label>
-                      <AddressPickerField
-                        id="send-pickup-addr"
-                        label="Pickup Address"
-                        variant="pickup"
-                        stateName={pickupState}
-                        restrictToState={!showDeliveryStateSelectors}
-                        value={pickupAddress}
-                        oppositeAddress={destinationCoords ? destinationAddress : undefined}
-                        selectedCoords={pickupCoords}
-                        required
-                        surfaceClassName="bg-white border border-neutral-300"
-                        placeholder="Type Katsina street, gate, or LGA..."
-                        onChange={(val) => {
-                          setPickupAddress(val);
-                          setPickupCoords(null);
-                        }}
-                        onStateDetected={(st) => setPickupState(st)}
-                        onLocationResolved={(place) =>
-                          setPickupCoords({ lat: place.lat, lng: place.lng })
-                        }
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {/* Swap From & To (clean hairline divider, zero overlap) */}
-                <div className="flex items-center justify-center gap-3 py-2">
-                  <div className="h-px flex-1 bg-neutral-200" />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextPState = destinationState;
-                      const nextDState = pickupState;
-                      const nextPAddr = destinationAddress;
-                      const nextDAddr = pickupAddress;
-                      const nextPCoords = destinationCoords;
-                      const nextDCoords = pickupCoords;
-                      setPickupState(nextPState);
-                      setDestinationState(nextDState);
-                      setPickupAddress(nextPAddr);
-                      setDestinationAddress(nextDAddr);
-                      setPickupCoords(nextPCoords);
-                      setDestinationCoords(nextDCoords);
-                    }}
-                    aria-label="Swap From and To locations"
-                    className="inline-flex items-center gap-1.5 min-h-10 border border-neutral-300 bg-white hover:border-black px-3.5 py-1.5 rounded-full text-xs font-semibold text-neutral-700 hover:text-black shadow-xs cursor-pointer transition-colors shrink-0"
-                  >
-                    <ArrowUpDown className="w-3.5 h-3.5" />
-                    <span>Swap From &amp; To</span>
-                  </button>
-                  <div className="h-px flex-1 bg-neutral-200" />
-                </div>
-
-                {/* TO — DELIVERY DESTINATION */}
-                <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-black">
-                      <span aria-hidden="true" className="w-2.5 h-2.5 border-2 border-black bg-white shrink-0" />
-                      <span>To · Delivery Destination</span>
-                    </span>
-                    <span className="text-[11px] text-neutral-500">Where parcel will be delivered</span>
-                  </div>
-                  <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-3 gap-3" : undefined}>
-                    {showDeliveryStateSelectors && (
-                      <div>
-                        <label htmlFor="send-dest-state" className="block text-xs font-semibold mb-1">
-                          Destination State
-                        </label>
-                        <select
-                          id="send-dest-state"
-                          value={destinationState}
-                          onChange={(e) => {
-                            const nextState = e.target.value;
-                            setDestinationState(nextState);
-                            setDestinationAddress('');
-                            setDestinationCoords(null);
-                          }}
-                          className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-black"
-                        >
-                          <option value="Katsina">Katsina (Live Hub)</option>
-                          {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
-                            <option key={s.name} value={s.name}>
-                              {s.name}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-                    <div className={showDeliveryStateSelectors ? "sm:col-span-2" : undefined}>
-                      <label htmlFor="send-dest-addr" className="block text-xs font-semibold mb-1">
-                        Destination Street / Landmark
-                      </label>
-                      <AddressPickerField
-                        id="send-dest-addr"
-                        label="Destination Address"
-                        variant="destination"
-                        stateName={destinationState}
-                        restrictToState={!showDeliveryStateSelectors}
-                        value={destinationAddress}
-                        oppositeAddress={pickupCoords ? pickupAddress : undefined}
-                        selectedCoords={destinationCoords}
-                        required
-                        surfaceClassName="bg-white border border-neutral-300"
-                        placeholder="Type drop-off street, campus, or town..."
-                        onChange={(val) => {
-                          setDestinationAddress(val);
-                          setDestinationCoords(null);
-                        }}
-                        onStateDetected={(st) => setDestinationState(st)}
-                        onLocationResolved={(place) =>
-                          setDestinationCoords({ lat: place.lat, lng: place.lng })
-                        }
-                      />
-                    </div>
-                  </div>
-                </div>
+                <RouteLocationCard
+                  idPrefix="send"
+                  showDeliveryStateSelectors={showDeliveryStateSelectors}
+                  pickupState={pickupState}
+                  pickupAddress={pickupAddress}
+                  pickupCoords={pickupCoords}
+                  destinationState={destinationState}
+                  destinationAddress={destinationAddress}
+                  destinationCoords={destinationCoords}
+                  onPickupStateChange={setPickupState}
+                  onPickupAddressChange={setPickupAddress}
+                  onPickupCoordsChange={setPickupCoords}
+                  onDestinationStateChange={setDestinationState}
+                  onDestinationAddressChange={setDestinationAddress}
+                  onDestinationCoordsChange={setDestinationCoords}
+                  onSwap={() => {
+                    const nextPState = destinationState;
+                    const nextDState = pickupState;
+                    const nextPAddr = destinationAddress;
+                    const nextDAddr = pickupAddress;
+                    const nextPCoords = destinationCoords;
+                    const nextDCoords = pickupCoords;
+                    setPickupState(nextPState);
+                    setDestinationState(nextDState);
+                    setPickupAddress(nextPAddr);
+                    setDestinationAddress(nextDAddr);
+                    setPickupCoords(nextPCoords);
+                    setDestinationCoords(nextDCoords);
+                  }}
+                />
               </div>
 
               <div className="space-y-4 border-t border-neutral-200 pt-5">
@@ -1787,19 +1787,23 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                           <div className="border-t border-neutral-200 pt-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
                             <div>
                               <span className="text-neutral-500">Payment: </span>
-                              <span className="font-mono font-bold uppercase text-black">
-                                {(selectedDelivery.paymentMethod || 'cash').replace(/_/g, ' ')}
+                              <span className="font-semibold text-black">
+                                {formatPaymentMethodLabel(selectedDelivery.paymentMethod)}
                               </span>
                             </div>
                             <div className="flex items-center gap-1.5">
                               <span
-                                className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-bold uppercase ${
-                                  selectedDelivery.paymentStatus === 'paid'
+                                className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
+                                  selectedDelivery.paymentStatus === 'paid' ||
+                                  selectedDelivery.paymentStatus === 'collected_by_rider'
                                     ? 'bg-black text-white'
                                     : 'bg-neutral-200 text-neutral-800'
                                 }`}
                               >
-                                {(selectedDelivery.paymentStatus || 'pending').replace(/_/g, ' ')}
+                                {formatPaymentStatusLabel(
+                                  selectedDelivery.paymentMethod,
+                                  selectedDelivery.paymentStatus
+                                )}
                               </span>
                               {selectedDelivery.paymentReference && (
                                 <button
@@ -1988,6 +1992,50 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                         <p className="text-xs font-semibold text-black">{otpFeedback}</p>
                       )}
 
+                      {selectedDelivery.status === 'delivered' && selectedDelivery.assignedRiderId && (
+                        <div className="border-t border-neutral-200 pt-4">
+                          {selectedDelivery.riderRating ? (
+                            <div className="rounded-xl bg-neutral-100 border border-neutral-200 px-4 py-3 flex items-center justify-between gap-3">
+                              <div className="flex items-center gap-2 text-xs font-semibold text-black">
+                                <Star className="w-4 h-4 fill-black text-black" />
+                                <span>
+                                  You rated {selectedDelivery.assignedRiderName || 'your rider'}{' '}
+                                  {selectedDelivery.riderRating}/5
+                                </span>
+                              </div>
+                              {selectedDelivery.riderRatingComment && (
+                                <span className="text-xs text-neutral-600 truncate max-w-xs">
+                                  &ldquo;{selectedDelivery.riderRatingComment}&rdquo;
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="rounded-xl bg-black text-white px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                              <div>
+                                <p className="font-display font-bold text-sm">
+                                  How was your delivery with {selectedDelivery.assignedRiderName || 'your rider'}?
+                                </p>
+                                <p className="text-xs text-neutral-300 mt-0.5">
+                                  Rate this completed delivery to help keep SAQO dispatch top-rated.
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setRatingTargetDelivery(selectedDelivery);
+                                  setRatingStars(5);
+                                  setRatingComment('');
+                                }}
+                                className="inline-flex items-center gap-1.5 bg-white text-black px-4 py-2 rounded-xl text-xs font-bold hover:bg-neutral-200 cursor-pointer"
+                              >
+                                <Star className="w-3.5 h-3.5 fill-black" />
+                                <span>Rate Rider</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       {/* Status History + WhatsApp Link */}
                       <div className="border-t border-neutral-200 pt-4 flex flex-col md:flex-row md:items-end justify-between gap-4">
                         <div className="space-y-2 flex-1">
@@ -2115,12 +2163,12 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                             <p className="font-mono font-bold text-sm">{d.trackingCode}</p>
                             <p className="text-xs text-neutral-600 mt-0.5">
                               {d.pickupState} → {d.destinationState} ·{' '}
-                              <span className="uppercase font-mono">
-                                {(d.paymentMethod || 'cash').replace(/_/g, ' ')}
+                              <span className="font-medium">
+                                {formatPaymentMethodLabel(d.paymentMethod)}
                               </span>{' '}
                               ·{' '}
-                              <span className="uppercase font-semibold">
-                                {(d.paymentStatus || 'pending').replace(/_/g, ' ')}
+                              <span className="font-semibold text-black">
+                                {formatPaymentStatusLabel(d.paymentMethod, d.paymentStatus)}
                               </span>
                             </p>
                           </div>
@@ -2330,20 +2378,20 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                                   {pt.reference}
                                 </span>
                                 <span
-                                  className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-bold uppercase ${
-                                    pt.status === 'paid'
+                                  className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                                    pt.status === 'paid' || pt.status === 'collected_by_rider'
                                       ? 'bg-black text-white'
                                       : pt.status === 'failed' || pt.status === 'reversed'
                                         ? 'border border-black text-black'
                                         : 'bg-neutral-200 text-neutral-800'
                                   }`}
                                 >
-                                  {pt.status.replace(/_/g, ' ')}
+                                  {formatPaymentStatusLabel(pt.paymentMethod, pt.status)}
                                 </span>
                               </div>
                               <p className="text-xs text-neutral-600 mt-1">
                                 {pt.purpose === 'wallet_funding' ? 'Wallet Funding' : `Delivery ${pt.trackingCode || ''}`}{' '}
-                                · {pt.paymentMethod.replace(/_/g, ' ').toUpperCase()}
+                                · {formatPaymentMethodLabel(pt.paymentMethod)}
                               </p>
                               <p className="font-mono text-[10px] text-neutral-400">
                                 {new Date(pt.createdAt).toLocaleString()}
@@ -2462,16 +2510,37 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                       <div className="flex items-center justify-between text-xs text-neutral-600">
                         <span>
                           To {d.recipientName} ·{' '}
-                          <span className="font-mono uppercase text-black font-semibold">
-                            {(d.paymentMethod || 'cash').replace(/_/g, ' ')} ·{' '}
-                            {(d.paymentStatus || 'pending').replace(/_/g, ' ')}
+                          <span className="text-black font-semibold">
+                            {formatPaymentMethodLabel(d.paymentMethod)} ·{' '}
+                            {formatPaymentStatusLabel(d.paymentMethod, d.paymentStatus)}
                           </span>
                         </span>
                         <span className="font-mono font-bold text-black tabular-nums">
                           {formatNaira(d.deliveryFeeNgn)}
                         </span>
                       </div>
-                      <div className="pt-1 flex justify-end gap-2">
+                      <div className="pt-1 flex flex-wrap justify-end gap-2">
+                        {d.status === 'delivered' && d.assignedRiderId && (
+                          d.riderRating ? (
+                            <span className="inline-flex items-center gap-1 rounded-lg bg-neutral-100 border border-neutral-200 px-2.5 py-1.5 text-xs font-bold text-black">
+                              <Star className="w-3.5 h-3.5 fill-black" />
+                              <span>{d.riderRating}/5</span>
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRatingTargetDelivery(d);
+                                setRatingStars(5);
+                                setRatingComment('');
+                              }}
+                              className="inline-flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-neutral-800 cursor-pointer"
+                            >
+                              <Star className="w-3.5 h-3.5" />
+                              <span>Rate Rider</span>
+                            </button>
+                          )
+                        )}
                         {d.paymentStatus === 'paid' && (
                           <button
                             type="button"
@@ -2531,10 +2600,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                             {d.pickupState} → {d.destinationState}
                           </td>
                           <td className="py-3 px-4">{d.recipientName}</td>
-                          <td className="py-3 px-4 font-mono text-[11px] uppercase">
-                            {(d.paymentMethod || 'cash').replace(/_/g, ' ')} ·{' '}
-                            <span className="font-bold">
-                              {(d.paymentStatus || 'pending').replace(/_/g, ' ')}
+                          <td className="py-3 px-4 text-xs">
+                            {formatPaymentMethodLabel(d.paymentMethod)} ·{' '}
+                            <span className="font-bold text-black">
+                              {formatPaymentStatusLabel(d.paymentMethod, d.paymentStatus)}
                             </span>
                           </td>
                           <td className="py-3 px-4 capitalize">
@@ -2547,6 +2616,27 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                             {formatNaira(d.deliveryFeeNgn)}
                           </td>
                           <td className="py-3 px-4 text-right whitespace-nowrap space-x-1.5">
+                            {d.status === 'delivered' && d.assignedRiderId && (
+                              d.riderRating ? (
+                                <span className="inline-flex items-center gap-1 rounded bg-neutral-100 border border-neutral-200 px-2 py-1 text-xs font-bold text-black">
+                                  <Star className="w-3 h-3 fill-black" />
+                                  <span>{d.riderRating}/5</span>
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setRatingTargetDelivery(d);
+                                    setRatingStars(5);
+                                    setRatingComment('');
+                                  }}
+                                  className="inline-flex items-center gap-1 bg-black text-white px-2.5 py-1 rounded text-xs font-semibold hover:bg-neutral-800 cursor-pointer"
+                                >
+                                  <Star className="w-3 h-3" />
+                                  <span>Rate</span>
+                                </button>
+                              )
+                            )}
                             {d.paymentStatus === 'paid' && (
                               <button
                                 type="button"
@@ -2783,6 +2873,229 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           </div>
         )}
 
+        {/* MORE MENU VIEW (Simplified hub for secondary tools) */}
+        {tab === 'more' && (
+          <div className="max-w-2xl mx-auto space-y-6">
+            <div className="bg-black text-white rounded-2xl p-6 flex items-center justify-between gap-4">
+              <div>
+                <p className="font-mono text-[11px] uppercase tracking-widest text-neutral-400">
+                  Client Account
+                </p>
+                <h1 className="font-display font-extrabold text-2xl mt-1">{profile.fullName}</h1>
+                <p className="text-xs text-neutral-300 mt-0.5">{profile.email} · {profile.phone}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTab('profile')}
+                className="bg-white text-black px-4 py-2 rounded-xl text-xs font-bold hover:bg-neutral-200 cursor-pointer shrink-0"
+              >
+                Edit Profile
+              </button>
+            </div>
+
+            <div className="bg-white border border-neutral-200 rounded-2xl divide-y divide-neutral-200 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setTab('history')}
+                className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-3.5">
+                  <Clock className="w-5 h-5 text-black" />
+                  <div>
+                    <p className="font-display font-bold text-base">Delivery History</p>
+                    <p className="text-xs text-neutral-500">Past parcels, receipts &amp; rider ratings ({pastDeliveries.length})</p>
+                  </div>
+                </div>
+                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTab('notifications')}
+                className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-3.5">
+                  <Bell className="w-5 h-5 text-black" />
+                  <div>
+                    <p className="font-display font-bold text-base">
+                      Alerts &amp; Updates{unreadCount > 0 ? ` (${unreadCount})` : ''}
+                    </p>
+                    <p className="text-xs text-neutral-500">Real-time parcel &amp; rider dispatch alerts</p>
+                  </div>
+                </div>
+                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTab('tickets')}
+                className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-3.5">
+                  <MessageSquarePlus className="w-5 h-5 text-black" />
+                  <div>
+                    <p className="font-display font-bold text-base">
+                      Support &amp; Tickets{tickets.length > 0 ? ` (${tickets.length})` : ''}
+                    </p>
+                    <p className="text-xs text-neutral-500">Complaints, suggestions &amp; ops follow-up</p>
+                  </div>
+                </div>
+                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTab('profile')}
+                className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-3.5">
+                  <User className="w-5 h-5 text-black" />
+                  <div>
+                    <p className="font-display font-bold text-base">Profile &amp; Alert Settings</p>
+                    <p className="text-xs text-neutral-500">Update name, phone &amp; notification preferences</p>
+                  </div>
+                </div>
+                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+              </button>
+
+              <a
+                href={buildWhatsAppUrl(whatsappNumber, 'Hello SAQO Support, I need assistance.')}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors"
+              >
+                <div className="flex items-center gap-3.5">
+                  <MessageCircle className="w-5 h-5 text-black" />
+                  <div>
+                    <p className="font-display font-bold text-base">WhatsApp Support</p>
+                    <p className="text-xs text-neutral-500">Chat directly with SAQO Operations</p>
+                  </div>
+                </div>
+                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+              </a>
+            </div>
+
+            <button
+              type="button"
+              onClick={onLogout}
+              className="w-full flex items-center justify-center gap-2 border-2 border-black text-black py-3.5 rounded-2xl text-sm font-bold hover:bg-black hover:text-white transition-colors cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Sign Out</span>
+            </button>
+          </div>
+        )}
+
+        {/* PROFILE TAB */}
+        {tab === 'profile' && (
+          <form
+            onSubmit={handleSaveProfile}
+            className="bg-white border border-neutral-200 rounded-2xl p-6 sm:p-8 max-w-2xl mx-auto space-y-6"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-4 border-b border-neutral-200 pb-4">
+              <div>
+                <p className="font-mono text-xs uppercase tracking-wider text-neutral-500">
+                  Client Profile
+                </p>
+                <h1 className="font-display font-extrabold text-2xl mt-1">{profile.fullName}</h1>
+                <p className="text-xs text-neutral-500 mt-0.5">{profile.email}</p>
+              </div>
+              <button
+                type="button"
+                onClick={onLogout}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 hover:border-black px-3.5 py-2 rounded-xl text-xs font-bold cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Sign out</span>
+              </button>
+            </div>
+
+            {profileNotice && (
+              <div
+                role="status"
+                className="rounded-xl bg-neutral-100 border border-black px-4 py-3 text-xs font-semibold text-black"
+              >
+                {profileNotice}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="client-prof-name" className="block text-xs font-semibold text-neutral-600 mb-1">
+                  Full Name
+                </label>
+                <input
+                  id="client-prof-name"
+                  type="text"
+                  required
+                  value={editFullName}
+                  onChange={(e) => setEditFullName(e.target.value)}
+                  className="w-full rounded-xl bg-neutral-100 border border-transparent focus:bg-white focus:border-black px-3.5 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
+                />
+              </div>
+              <div>
+                <label htmlFor="client-prof-phone" className="block text-xs font-semibold text-neutral-600 mb-1">
+                  Phone Number
+                </label>
+                <input
+                  id="client-prof-phone"
+                  type="tel"
+                  required
+                  value={editPhone}
+                  onChange={(e) => setEditPhone(e.target.value)}
+                  className="w-full rounded-xl bg-neutral-100 border border-transparent focus:bg-white focus:border-black px-3.5 py-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-black"
+                />
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-neutral-50 border border-neutral-200 p-4 space-y-3">
+              <p className="font-display font-bold text-sm">Push &amp; Sound Alerts</p>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="text-xs text-neutral-600">
+                  Receive live sound chimes &amp; browser alerts when your rider moves or delivers.
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={toggleMute}
+                    className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:border-black cursor-pointer"
+                  >
+                    {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                    <span>{muted ? 'Unmute Sound' : 'Sound On'}</span>
+                  </button>
+                  {notifPerm === 'default' && (
+                    <button
+                      type="button"
+                      onClick={handleEnablePush}
+                      className="inline-flex items-center gap-1.5 bg-black text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-neutral-800 cursor-pointer"
+                    >
+                      <Bell className="w-3.5 h-3.5" />
+                      <span>Enable Push</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-neutral-200">
+              <button
+                type="button"
+                onClick={() => setTab('more')}
+                className="text-xs font-semibold text-neutral-600 hover:text-black underline cursor-pointer"
+              >
+                ← Back to More
+              </button>
+              <button
+                type="submit"
+                disabled={savingProfile}
+                className="bg-black text-white px-5 py-3 rounded-xl text-sm font-bold hover:bg-neutral-800 disabled:opacity-50 cursor-pointer"
+              >
+                {savingProfile ? 'Saving...' : 'Save Changes'}
+              </button>
+            </div>
+          </form>
+        )}
+
         {/* Issue Reporting Modal */}
         {issueDeliveryId && (
           <div
@@ -2950,28 +3263,112 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         )}
 
         <ReceiptModal receipt={activeReceipt} onClose={() => setActiveReceipt(null)} />
+
+        {/* Rate Rider Modal */}
+        {ratingTargetDelivery && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Rate delivery rider"
+            className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-0 sm:p-4 backdrop-blur-[2px]"
+          >
+            <form
+              onSubmit={handleSubmitRating}
+              className="bg-white border-2 border-black rounded-t-2xl sm:rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl"
+            >
+              <div>
+                <p className="font-mono text-[11px] uppercase tracking-wider text-neutral-500">
+                  {ratingTargetDelivery.trackingCode}
+                </p>
+                <h2 className="font-display font-extrabold text-xl mt-1">
+                  Rate {ratingTargetDelivery.assignedRiderName || 'your rider'}
+                </h2>
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  {ratingTargetDelivery.pickupState} → {ratingTargetDelivery.destinationState}
+                </p>
+              </div>
+
+              <div className="flex items-center justify-center gap-2 py-2">
+                {[1, 2, 3, 4, 5].map((star) => (
+                  <button
+                    key={star}
+                    type="button"
+                    onClick={() => setRatingStars(star)}
+                    aria-label={`Rate ${star} out of 5 stars`}
+                    className="p-2 rounded-xl hover:bg-neutral-100 transition-colors cursor-pointer"
+                  >
+                    <Star
+                      className={`w-8 h-8 ${
+                        star <= ratingStars ? 'fill-black text-black' : 'text-neutral-300'
+                      }`}
+                    />
+                  </button>
+                ))}
+              </div>
+
+              <div>
+                <label htmlFor="rating-comment" className="block text-xs font-semibold mb-1">
+                  Feedback (Optional)
+                </label>
+                <textarea
+                  id="rating-comment"
+                  rows={3}
+                  value={ratingComment}
+                  onChange={(e) => setRatingComment(e.target.value)}
+                  placeholder="Share how the pickup and delivery went..."
+                  className="w-full rounded-xl bg-neutral-100 border border-transparent focus:bg-white focus:border-black px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-black"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setRatingTargetDelivery(null)}
+                  className="border border-neutral-300 py-3 rounded-xl text-xs font-bold hover:border-black cursor-pointer"
+                >
+                  Later
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingRating}
+                  className="bg-black text-white py-3 rounded-xl text-xs font-bold hover:bg-neutral-800 disabled:opacity-50 cursor-pointer"
+                >
+                  {submittingRating ? 'Submitting...' : `Submit ${ratingStars}★ Rating`}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        <OtpAlertModal
+          open={Boolean(otpAlert)}
+          title="Delivery OTP Verification Failed"
+          message={otpAlert?.message || ''}
+          trackingCode={otpAlert?.trackingCode}
+          onClose={() => setOtpAlert(null)}
+        />
       </main>
 
-      {/* Native Mobile Bottom Navigation */}
+      {/* Native 4-Item Mobile Bottom Navigation */}
       <nav
         aria-label="Client mobile navigation"
-        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-6 pb-[env(safe-area-inset-bottom)]"
+        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-4 pb-[env(safe-area-inset-bottom)]"
       >
         <button
           type="button"
           onClick={() => setTab('active')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
-            tab === 'active' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+            tab === 'active' ? 'text-black' : 'text-neutral-500'
           }`}
         >
           <MapPin className="w-4 h-4" />
-          <span>Active</span>
+          <span>Track</span>
         </button>
         <button
           type="button"
           onClick={() => setTab('send')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
-            tab === 'send' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+            tab === 'send' ? 'text-black' : 'text-neutral-500'
           }`}
         >
           <Plus className="w-4 h-4" />
@@ -2980,8 +3377,8 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <button
           type="button"
           onClick={() => setTab('wallet')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
-            tab === 'wallet' ? 'text-black' : 'text-neutral-600'
+          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+            tab === 'wallet' ? 'text-black' : 'text-neutral-500'
           }`}
         >
           <Wallet className="w-4 h-4" />
@@ -2989,33 +3386,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         </button>
         <button
           type="button"
-          onClick={() => setTab('history')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
-            tab === 'history' ? 'text-black' : 'text-neutral-600'
+          onClick={() => setTab('more')}
+          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-[11px] font-semibold ${
+            ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab)
+              ? 'text-black'
+              : 'text-neutral-500'
           }`}
         >
-          <Clock className="w-4 h-4" />
-          <span>History</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab('notifications')}
-          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
-            tab === 'notifications' ? 'text-black' : 'text-neutral-600'
-          }`}
-        >
-          <Bell className="w-4 h-4" />
-          <span>Alerts{unreadCount > 0 ? ` (${unreadCount})` : ''}</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab('tickets')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-[10px] font-semibold ${
-            tab === 'tickets' ? 'text-black' : 'text-neutral-600'
-          }`}
-        >
-          <MessageSquarePlus className="w-4 h-4" />
-          <span>Tickets</span>
+          <LayoutGrid className="w-4 h-4" />
+          <span>More{unreadCount > 0 ? ` (${unreadCount})` : ''}</span>
         </button>
       </nav>
     </div>

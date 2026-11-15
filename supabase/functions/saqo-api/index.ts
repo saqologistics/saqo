@@ -721,7 +721,7 @@ function initSqliteDatabase() {
       plate_number TEXT NOT NULL,
       home_state TEXT NOT NULL,
       verification_status TEXT NOT NULL DEFAULT 'pending' CHECK(verification_status IN ('pending', 'verified', 'rejected')),
-      is_online INTEGER NOT NULL DEFAULT 0,
+      is_online INTEGER NOT NULL DEFAULT 1,
       current_lat REAL NOT NULL,
       current_lng REAL NOT NULL,
       last_location_at TEXT NOT NULL,
@@ -760,6 +760,9 @@ function initSqliteDatabase() {
       otp_verified INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL,
       assigned_rider_id TEXT REFERENCES riders(id),
+      rider_rating REAL,
+      rider_rating_comment TEXT,
+      rated_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -1096,6 +1099,15 @@ function initSqliteDatabase() {
   if (!colNames.has("payment_reference")) {
     db2.exec("ALTER TABLE delivery_requests ADD COLUMN payment_reference TEXT");
   }
+  if (!colNames.has("rider_rating")) {
+    db2.exec("ALTER TABLE delivery_requests ADD COLUMN rider_rating REAL");
+  }
+  if (!colNames.has("rider_rating_comment")) {
+    db2.exec("ALTER TABLE delivery_requests ADD COLUMN rider_rating_comment TEXT");
+  }
+  if (!colNames.has("rated_at")) {
+    db2.exec("ALTER TABLE delivery_requests ADD COLUMN rated_at TEXT");
+  }
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const seedMethodStmt = db2.prepare(`
     INSERT OR IGNORE INTO payment_methods (code, name, description, is_enabled, sort_order, config, updated_at)
@@ -1160,8 +1172,17 @@ function initSqliteDatabase() {
     `);
   }
 }
+async function ensurePostgresSchemaExtensions() {
+  if (!pool || schemaExtensionsEnsured) return;
+  await db.prepare("ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rider_rating REAL").run();
+  await db.prepare("ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rider_rating_comment TEXT").run();
+  await db.prepare("ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rated_at TEXT").run();
+  await db.prepare("ALTER TABLE riders ALTER COLUMN is_online SET DEFAULT 1").run();
+  schemaExtensionsEnsured = true;
+}
 async function initDatabase() {
   if (sqlite) initSqliteDatabase();
+  if (pool) await ensurePostgresSchemaExtensions();
   await databaseTransaction(bootstrapAdminAccount);
 }
 async function bootstrapAdminAccount() {
@@ -1281,7 +1302,7 @@ async function getDeliveryById(deliveryId) {
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
-      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
+      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status, r.rating as rider_rating_avg,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
@@ -1321,6 +1342,8 @@ function publicTrackingDelivery(delivery) {
     assignedRiderVerified,
     assignedRiderLat,
     assignedRiderLng,
+    assignedRiderRating,
+    riderRating,
     updatedAt
   } = delivery;
   return {
@@ -1348,6 +1371,8 @@ function publicTrackingDelivery(delivery) {
     assignedRiderVerified,
     assignedRiderLat,
     assignedRiderLng,
+    assignedRiderRating,
+    riderRating,
     updatedAt
   };
 }
@@ -1360,7 +1385,7 @@ async function getDeliveryByTrackingCode(trackingCode) {
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
-      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
+      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status, r.rating as rider_rating_avg,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
@@ -1380,7 +1405,7 @@ async function listDeliveries(filter) {
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
       rp.full_name as rider_name, rp.phone as rider_phone,
-      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status,
+      r.vehicle_type as rider_vehicle, r.verification_status as rider_verification_status, r.rating as rider_rating_avg,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lat END as rider_lat,
       CASE WHEN EXISTS (SELECT 1 FROM rider_locations loc WHERE loc.rider_id = r.id) THEN r.current_lng END as rider_lng
     FROM delivery_requests dr
@@ -1439,6 +1464,10 @@ function mapDeliveryRow(row) {
     assignedRiderVerified: row.rider_verification_status === "verified",
     assignedRiderLat: row.rider_lat ?? null,
     assignedRiderLng: row.rider_lng ?? null,
+    assignedRiderRating: row.rider_rating_avg ?? null,
+    riderRating: row.rider_rating ?? null,
+    riderRatingComment: row.rider_rating_comment || null,
+    ratedAt: row.rated_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -1743,7 +1772,7 @@ async function updateSupportConversationStatus(conversationId, status, actorName
   });
   return { conversation, systemMessage: message };
 }
-var configuredSecret, SESSION_SECRET, SESSION_LIFETIME_MS;
+var configuredSecret, SESSION_SECRET, SESSION_LIFETIME_MS, schemaExtensionsEnsured;
 var init_db = __esm({
   "src/server/db.ts"() {
     init_database();
@@ -1755,6 +1784,7 @@ var init_db = __esm({
     }
     SESSION_SECRET = configuredSecret || "saqo-dev-hmac-secret-2026";
     SESSION_LIFETIME_MS = 12 * 60 * 60 * 1e3;
+    schemaExtensionsEnsured = false;
   }
 });
 
@@ -2827,7 +2857,7 @@ function canDispatch(delivery) {
 }
 async function expireTimedOutOffers(force = false) {
   const nowMs = Date.now();
-  if (!force && nowMs - lastSweepAt < 5e3) return 0;
+  if (!force && nowMs - lastSweepAt < 1500) return 0;
   lastSweepAt = nowMs;
   const nowIso = new Date(nowMs).toISOString();
   const expired = await databaseTransaction(async () => {
@@ -6014,6 +6044,14 @@ function isValidNigeriaCoordPair(lat, lng) {
   return Number.isFinite(nLat) && Number.isFinite(nLng) && nLat >= 4 && nLat <= 14.5 && nLng >= 2 && nLng <= 15;
 }
 async function verifyHandoffOtp(res, delivery, otp) {
+  const cleanOtp = typeof otp === "string" ? otp.trim() : "";
+  if (!/^\d{4}$/.test(cleanOtp)) {
+    res.status(400).json({
+      error: "Enter the exact 4-digit delivery OTP from the recipient before completing delivery.",
+      code: "OTP_INVALID_FORMAT"
+    });
+    return false;
+  }
   const now = Date.now();
   const resetAt = now + 15 * 60 * 1e3;
   const attempt = await db.prepare(`
@@ -6024,11 +6062,20 @@ async function verifyHandoffOtp(res, delivery, otp) {
     RETURNING attempts, reset_at
   `).get(delivery.id, resetAt, now, now);
   if (attempt.attempts > 5) {
-    res.set("Retry-After", String(Math.ceil((attempt.reset_at - now) / 1e3))).status(429).json({ error: "Too many delivery code attempts. Please try again later." });
+    const waitMinutes = Math.max(1, Math.ceil((attempt.reset_at - now) / 6e4));
+    res.set("Retry-After", String(Math.ceil((attempt.reset_at - now) / 1e3))).status(429).json({
+      error: `Too many incorrect OTP attempts. For security, OTP confirmation is temporarily locked for ${waitMinutes} minute(s).`,
+      code: "OTP_LOCKED"
+    });
     return false;
   }
-  if (!matchesDeliveryOtp(typeof otp === "string" ? otp : "", delivery.deliveryOtp)) {
-    res.status(400).json({ error: "Invalid delivery OTP. Please check the 4-digit code." });
+  if (!matchesDeliveryOtp(cleanOtp, delivery.deliveryOtp)) {
+    const remaining = Math.max(0, 5 - attempt.attempts);
+    res.status(400).json({
+      error: remaining > 0 ? `Incorrect 4-digit delivery OTP. Ask the recipient or check your tracking card for the exact 4-digit code (${remaining} attempt${remaining === 1 ? "" : "s"} remaining).` : "Incorrect 4-digit delivery OTP. You have reached the maximum attempts and must wait before trying again.",
+      code: "OTP_MISMATCH",
+      remainingAttempts: remaining
+    });
     return false;
   }
   return true;
@@ -6272,6 +6319,55 @@ function registerSaqoRoutes(app, options) {
     const rider = profile.role === "rider" ? await getRiderByProfileId(profile.id) : null;
     res.json({ profile, rider });
   }));
+  app.patch("/api/auth/profile", authenticate, asyncRoute(async (req, res) => {
+    const profile = await getProfileById(req.auth.userId);
+    if (!profile) {
+      res.status(404).json({ error: "Account profile not found." });
+      return;
+    }
+    const { fullName, phone, homeState, vehicleType, plateNumber, defaultState } = req.body || {};
+    const nextName = typeof fullName === "string" && fullName.trim() ? fullName.trim() : profile.fullName;
+    if (nextName.length < 2 || nextName.length > 80) {
+      res.status(400).json({ error: "Full name must be between 2 and 80 characters." });
+      return;
+    }
+    const nextPhone = typeof phone === "string" && phone.trim() ? phone.trim() : profile.phone;
+    if (!isValidNigerianPhone(nextPhone)) {
+      res.status(400).json({ error: "Please enter a valid phone number (at least 10 digits)." });
+      return;
+    }
+    await db.prepare("UPDATE profiles SET full_name = ?, phone = ? WHERE id = ?").run(
+      nextName,
+      nextPhone,
+      profile.id
+    );
+    if (profile.role === "client" && typeof defaultState === "string" && defaultState.trim()) {
+      await db.prepare("UPDATE customers SET default_state = ? WHERE profile_id = ?").run(
+        defaultState.trim(),
+        profile.id
+      );
+    }
+    if (profile.role === "rider") {
+      const existingRider = await getRiderByProfileId(profile.id);
+      if (existingRider) {
+        const validVehicles = ["Motorcycle", "Van", "Inter-State Sprinter"];
+        const nextVehicle = validVehicles.includes(vehicleType) ? vehicleType : existingRider.vehicleType;
+        const nextState = typeof homeState === "string" && homeState.trim() ? homeState.trim() : existingRider.homeState;
+        const nextPlate = typeof plateNumber === "string" && plateNumber.trim() ? plateNumber.trim().toUpperCase() : existingRider.plateNumber;
+        await db.prepare("UPDATE riders SET vehicle_type = ?, plate_number = ?, home_state = ? WHERE id = ?").run(
+          nextVehicle,
+          nextPlate,
+          nextState,
+          existingRider.riderId
+        );
+        const updatedRider2 = await getRiderByProfileId(profile.id);
+        await broadcastWsEvent("rider:availability", updatedRider2);
+      }
+    }
+    const updatedProfile = await getProfileById(profile.id);
+    const updatedRider = updatedProfile.role === "rider" ? await getRiderByProfileId(profile.id) : null;
+    res.json({ profile: updatedProfile, rider: updatedRider });
+  }));
   app.get("/api/track/:trackingCode", asyncRoute(async (req, res) => {
     await expireTimedOutOffers().catch(() => {
     });
@@ -6340,7 +6436,7 @@ function registerSaqoRoutes(app, options) {
     res.json({ ok: true });
   }));
   app.get("/api/client/deliveries", authenticate, requireRole("client"), asyncRoute(async (req, res) => {
-    await expireTimedOutOffers().catch(() => {
+    await expireTimedOutOffers(req.query?.checkExpiry === "1").catch(() => {
     });
     const cust = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(req.auth.userId);
     if (!cust) {
@@ -6780,6 +6876,59 @@ function registerSaqoRoutes(app, options) {
       res.status(500).json({ received: false, error: err instanceof Error ? err.message : "Webhook error" });
     }
   }));
+  app.post("/api/deliveries/:id/rate", authenticate, requireRole("client"), asyncRoute(async (req, res) => {
+    const cust = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(req.auth.userId);
+    const delivery = await getDeliveryById(req.params.id);
+    if (!delivery || !cust || delivery.customerId !== cust.id) {
+      res.status(404).json({ error: "Delivery request not found." });
+      return;
+    }
+    if (delivery.status !== "delivered") {
+      res.status(400).json({ error: "You can rate your rider after the parcel has been delivered." });
+      return;
+    }
+    if (!delivery.assignedRiderId) {
+      res.status(400).json({ error: "No rider was assigned to this delivery." });
+      return;
+    }
+    const rawRating = Number(req.body?.rating);
+    if (!Number.isFinite(rawRating) || rawRating < 1 || rawRating > 5) {
+      res.status(400).json({ error: "Choose a star rating from 1 to 5." });
+      return;
+    }
+    const cleanRating = Math.round(rawRating);
+    const cleanComment = typeof req.body?.comment === "string" ? req.body.comment.trim().slice(0, 500) : "";
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    await db.prepare(`
+      UPDATE delivery_requests
+      SET rider_rating = ?, rider_rating_comment = ?, rated_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(cleanRating, cleanComment || null, now, now, delivery.id);
+    const avgRow = await db.prepare(`
+      SELECT AVG(rider_rating) as avg_rating, COUNT(rider_rating) as rating_count
+      FROM delivery_requests
+      WHERE assigned_rider_id = ? AND rider_rating IS NOT NULL
+    `).get(delivery.assignedRiderId);
+    if (avgRow && avgRow.avg_rating !== null) {
+      const nextRating = Number(Number(avgRow.avg_rating).toFixed(2));
+      await db.prepare("UPDATE riders SET rating = ? WHERE id = ?").run(nextRating, delivery.assignedRiderId);
+    }
+    const riderRow = await db.prepare("SELECT profile_id FROM riders WHERE id = ?").get(delivery.assignedRiderId);
+    if (riderRow) {
+      const notif = await createNotification(
+        riderRow.profile_id,
+        `New ${cleanRating}\u2605 Delivery Rating`,
+        cleanComment ? `${delivery.trackingCode}: Client rated ${cleanRating}/5 \u2014 "${cleanComment}"` : `${delivery.trackingCode}: Client rated your delivery ${cleanRating}/5 stars.`,
+        delivery.id
+      );
+      await broadcastWsEvent("notification:created", notif);
+    }
+    const updated = await getDeliveryById(delivery.id);
+    await broadcastWsEvent("delivery:updated", updated);
+    const riderProfile = riderRow ? await getRiderByProfileId(riderRow.profile_id) : null;
+    if (riderProfile) await broadcastWsEvent("rider:availability", riderProfile);
+    res.json({ delivery: updated, history: await getDeliveryHistory(delivery.id) });
+  }));
   app.get("/api/client/tickets", authenticate, asyncRoute(async (req, res) => {
     res.json({ tickets: await getTicketsForReporter(req.auth.userId) });
   }));
@@ -6820,7 +6969,7 @@ function registerSaqoRoutes(app, options) {
   app.post("/api/complaints", authenticate, handleCreateTicket);
   app.post("/api/tickets", authenticate, handleCreateTicket);
   app.get("/api/rider/dashboard", authenticate, requireRole("rider"), asyncRoute(async (req, res) => {
-    await expireTimedOutOffers().catch(() => {
+    await expireTimedOutOffers(req.query?.checkExpiry === "1").catch(() => {
     });
     const rider = await getRiderByProfileId(req.auth.userId);
     if (!rider) {
@@ -6901,7 +7050,9 @@ function registerSaqoRoutes(app, options) {
     }
     const delivery = await getDeliveryById(assignment.delivery_id);
     if (Date.parse(assignment.expires_at) <= Date.now() || delivery?.status !== "assigned" || delivery.assignedRiderId !== rider.riderId) {
-      res.status(409).json({ error: "This offer is no longer active." });
+      await expireTimedOutOffers(true).catch(() => {
+      });
+      res.status(409).json({ error: "This offer has expired and has been reassigned to the next available rider." });
       return;
     }
     const action = req.body?.action;
@@ -7299,11 +7450,12 @@ function registerSaqoRoutes(app, options) {
       INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
       VALUES (?, ?, ?, ?, ?, 'rider', 'active', ?)
     `).run(profileId, cleanEmail, passHash, String(fullName).trim(), String(phone).trim(), now);
+    const initialOnline = cleanVerify === "verified" ? 1 : 0;
     await db.prepare(`
       INSERT INTO riders (
         id, profile_id, vehicle_type, plate_number, home_state, verification_status,
         is_online, current_lat, current_lng, last_location_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       riderId,
       profileId,
@@ -7311,12 +7463,14 @@ function registerSaqoRoutes(app, options) {
       String(plateNumber).trim().toUpperCase(),
       cleanState,
       cleanVerify,
+      initialOnline,
       hub.lat,
       hub.lng,
       now
     );
     const created = await getRiderByProfileId(profileId);
     await broadcastWsEvent("rider:availability", created);
+    if (initialOnline === 1) await dispatchWaitingDeliveries();
     res.status(201).json({ rider: created, riders: await getAllRiders() });
   }));
   app.patch("/api/admin/riders/:id", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
@@ -7360,7 +7514,7 @@ function registerSaqoRoutes(app, options) {
       return;
     }
     if (status === "verified") {
-      await db.prepare("UPDATE riders SET verification_status = ? WHERE id = ?").run(status, req.params.id);
+      await db.prepare("UPDATE riders SET verification_status = ?, is_online = 1 WHERE id = ?").run(status, req.params.id);
     } else {
       await db.prepare("UPDATE riders SET verification_status = ?, is_online = 0 WHERE id = ?").run(
         status,
@@ -7371,11 +7525,12 @@ function registerSaqoRoutes(app, options) {
     const notif = await createNotification(
       rider.id,
       status === "verified" ? "Verification Tick Enabled" : "Verification Status Updated",
-      status === "verified" ? "Your SAQO rider verification tick is now active. You can go online and accept deliveries." : `Your rider verification status is now set to ${status}. Contact SAQO Operations for details.`,
+      status === "verified" ? "Your SAQO rider verification tick is now active and you are online to accept deliveries." : `Your rider verification status is now set to ${status}. Contact SAQO Operations for details.`,
       null
     );
     await broadcastWsEvent("notification:created", notif);
     await broadcastWsEvent("rider:availability", updatedRider);
+    if (status === "verified") await dispatchWaitingDeliveries();
     res.json({ rider: updatedRider, riders: await getAllRiders() });
   }));
   app.patch("/api/admin/profiles/:id/status", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {

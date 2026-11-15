@@ -154,6 +154,15 @@ async function verifyHandoffOtp(
   delivery: { id: string; deliveryOtp: string },
   otp: unknown
 ): Promise<boolean> {
+  const cleanOtp = typeof otp === 'string' ? otp.trim() : '';
+  if (!/^\d{4}$/.test(cleanOtp)) {
+    res.status(400).json({
+      error: 'Enter the exact 4-digit delivery OTP from the recipient before completing delivery.',
+      code: 'OTP_INVALID_FORMAT',
+    });
+    return false;
+  }
+
   const now = Date.now();
   const resetAt = now + 15 * 60 * 1000;
   const attempt = await db.prepare(`
@@ -165,12 +174,23 @@ async function verifyHandoffOtp(
   `).get(delivery.id, resetAt, now, now) as { attempts: number; reset_at: number };
 
   if (attempt.attempts > 5) {
+    const waitMinutes = Math.max(1, Math.ceil((attempt.reset_at - now) / 60000));
     res.set('Retry-After', String(Math.ceil((attempt.reset_at - now) / 1000)))
-      .status(429).json({ error: 'Too many delivery code attempts. Please try again later.' });
+      .status(429).json({
+        error: `Too many incorrect OTP attempts. For security, OTP confirmation is temporarily locked for ${waitMinutes} minute(s).`,
+        code: 'OTP_LOCKED',
+      });
     return false;
   }
-  if (!matchesDeliveryOtp(typeof otp === 'string' ? otp : '', delivery.deliveryOtp)) {
-    res.status(400).json({ error: 'Invalid delivery OTP. Please check the 4-digit code.' });
+  if (!matchesDeliveryOtp(cleanOtp, delivery.deliveryOtp)) {
+    const remaining = Math.max(0, 5 - attempt.attempts);
+    res.status(400).json({
+      error: remaining > 0
+        ? `Incorrect 4-digit delivery OTP. Ask the recipient or check your tracking card for the exact 4-digit code (${remaining} attempt${remaining === 1 ? '' : 's'} remaining).`
+        : 'Incorrect 4-digit delivery OTP. You have reached the maximum attempts and must wait before trying again.',
+      code: 'OTP_MISMATCH',
+      remainingAttempts: remaining,
+    });
     return false;
   }
   return true;
@@ -458,6 +478,63 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     res.json({ profile, rider });
   }));
 
+  // Auth: Update Own Profile (Client, Rider, Admin)
+  app.patch('/api/auth/profile', authenticate, asyncRoute(async (req: AuthedRequest, res: SaqoResponse) => {
+    const profile = await getProfileById(req.auth!.userId);
+    if (!profile) {
+      res.status(404).json({ error: 'Account profile not found.' });
+      return;
+    }
+    const { fullName, phone, homeState, vehicleType, plateNumber, defaultState } = req.body || {};
+    const nextName = typeof fullName === 'string' && fullName.trim() ? fullName.trim() : profile.fullName;
+    if (nextName.length < 2 || nextName.length > 80) {
+      res.status(400).json({ error: 'Full name must be between 2 and 80 characters.' });
+      return;
+    }
+    const nextPhone = typeof phone === 'string' && phone.trim() ? phone.trim() : profile.phone;
+    if (!isValidNigerianPhone(nextPhone)) {
+      res.status(400).json({ error: 'Please enter a valid phone number (at least 10 digits).' });
+      return;
+    }
+
+    await db.prepare('UPDATE profiles SET full_name = ?, phone = ? WHERE id = ?').run(
+      nextName,
+      nextPhone,
+      profile.id
+    );
+
+    if (profile.role === 'client' && typeof defaultState === 'string' && defaultState.trim()) {
+      await db.prepare('UPDATE customers SET default_state = ? WHERE profile_id = ?').run(
+        defaultState.trim(),
+        profile.id
+      );
+    }
+
+    if (profile.role === 'rider') {
+      const existingRider = await getRiderByProfileId(profile.id);
+      if (existingRider) {
+        const validVehicles = ['Motorcycle', 'Van', 'Inter-State Sprinter'];
+        const nextVehicle = validVehicles.includes(vehicleType) ? vehicleType : existingRider.vehicleType;
+        const nextState = typeof homeState === 'string' && homeState.trim() ? homeState.trim() : existingRider.homeState;
+        const nextPlate = typeof plateNumber === 'string' && plateNumber.trim()
+          ? plateNumber.trim().toUpperCase()
+          : existingRider.plateNumber;
+        await db.prepare('UPDATE riders SET vehicle_type = ?, plate_number = ?, home_state = ? WHERE id = ?').run(
+          nextVehicle,
+          nextPlate,
+          nextState,
+          existingRider.riderId
+        );
+        const updatedRider = (await getRiderByProfileId(profile.id))!;
+        await broadcastWsEvent('rider:availability', updatedRider);
+      }
+    }
+
+    const updatedProfile = (await getProfileById(profile.id))!;
+    const updatedRider = updatedProfile.role === 'rider' ? await getRiderByProfileId(profile.id) : null;
+    res.json({ profile: updatedProfile, rider: updatedRider });
+  }));
+
   // Public tracking lookup
   app.get('/api/track/:trackingCode', asyncRoute(async (req: SaqoRequest, res: SaqoResponse) => {
     await expireTimedOutOffers().catch(() => {});
@@ -540,7 +617,7 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
 
   // Client: List deliveries
   app.get('/api/client/deliveries', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res: SaqoResponse) => {
-    await expireTimedOutOffers().catch(() => {});
+    await expireTimedOutOffers(req.query?.checkExpiry === '1').catch(() => {});
     const cust = await db
       .prepare('SELECT id FROM customers WHERE profile_id = ?')
       .get(req.auth!.userId) as { id: string } | undefined;
@@ -1046,6 +1123,74 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     }
   }));
 
+  // Client: Rate rider after completed delivery
+  app.post('/api/deliveries/:id/rate', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res: SaqoResponse) => {
+    const cust = await db
+      .prepare('SELECT id FROM customers WHERE profile_id = ?')
+      .get(req.auth!.userId) as { id: string } | undefined;
+    const delivery = await getDeliveryById(req.params.id);
+    if (!delivery || !cust || delivery.customerId !== cust.id) {
+      res.status(404).json({ error: 'Delivery request not found.' });
+      return;
+    }
+    if (delivery.status !== 'delivered') {
+      res.status(400).json({ error: 'You can rate your rider after the parcel has been delivered.' });
+      return;
+    }
+    if (!delivery.assignedRiderId) {
+      res.status(400).json({ error: 'No rider was assigned to this delivery.' });
+      return;
+    }
+    const rawRating = Number(req.body?.rating);
+    if (!Number.isFinite(rawRating) || rawRating < 1 || rawRating > 5) {
+      res.status(400).json({ error: 'Choose a star rating from 1 to 5.' });
+      return;
+    }
+    const cleanRating = Math.round(rawRating);
+    const cleanComment = typeof req.body?.comment === 'string'
+      ? req.body.comment.trim().slice(0, 500)
+      : '';
+    const now = new Date().toISOString();
+
+    await db.prepare(`
+      UPDATE delivery_requests
+      SET rider_rating = ?, rider_rating_comment = ?, rated_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(cleanRating, cleanComment || null, now, now, delivery.id);
+
+    const avgRow = await db.prepare(`
+      SELECT AVG(rider_rating) as avg_rating, COUNT(rider_rating) as rating_count
+      FROM delivery_requests
+      WHERE assigned_rider_id = ? AND rider_rating IS NOT NULL
+    `).get(delivery.assignedRiderId) as { avg_rating: number | null; rating_count: number } | undefined;
+
+    if (avgRow && avgRow.avg_rating !== null) {
+      const nextRating = Number(Number(avgRow.avg_rating).toFixed(2));
+      await db.prepare('UPDATE riders SET rating = ? WHERE id = ?').run(nextRating, delivery.assignedRiderId);
+    }
+
+    const riderRow = await db
+      .prepare('SELECT profile_id FROM riders WHERE id = ?')
+      .get(delivery.assignedRiderId) as { profile_id: string } | undefined;
+    if (riderRow) {
+      const notif = await createNotification(
+        riderRow.profile_id,
+        `New ${cleanRating}★ Delivery Rating`,
+        cleanComment
+          ? `${delivery.trackingCode}: Client rated ${cleanRating}/5 — "${cleanComment}"`
+          : `${delivery.trackingCode}: Client rated your delivery ${cleanRating}/5 stars.`,
+        delivery.id
+      );
+      await broadcastWsEvent('notification:created', notif);
+    }
+
+    const updated = (await getDeliveryById(delivery.id))!;
+    await broadcastWsEvent('delivery:updated', updated);
+    const riderProfile = riderRow ? await getRiderByProfileId(riderRow.profile_id) : null;
+    if (riderProfile) await broadcastWsEvent('rider:availability', riderProfile);
+    res.json({ delivery: updated, history: await getDeliveryHistory(delivery.id) });
+  }));
+
   // Client: List submitted support tickets (suggestions & complaints)
   app.get('/api/client/tickets', authenticate, asyncRoute(async (req: AuthedRequest, res: SaqoResponse) => {
     res.json({ tickets: await getTicketsForReporter(req.auth!.userId) });
@@ -1092,7 +1237,7 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
 
   // Rider: Dashboard state
   app.get('/api/rider/dashboard', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res: SaqoResponse) => {
-    await expireTimedOutOffers().catch(() => {});
+    await expireTimedOutOffers(req.query?.checkExpiry === '1').catch(() => {});
     const rider = await getRiderByProfileId(req.auth!.userId);
     if (!rider) {
       res.status(404).json({ error: 'Rider profile not found.' });
@@ -1183,7 +1328,8 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
 
     const delivery = await getDeliveryById(assignment.delivery_id);
     if (Date.parse(assignment.expires_at) <= Date.now() || delivery?.status !== 'assigned' || delivery.assignedRiderId !== rider.riderId) {
-      res.status(409).json({ error: 'This offer is no longer active.' });
+      await expireTimedOutOffers(true).catch(() => {});
+      res.status(409).json({ error: 'This offer has expired and has been reassigned to the next available rider.' });
       return;
     }
     const action = req.body?.action;
@@ -1645,11 +1791,12 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       VALUES (?, ?, ?, ?, ?, 'rider', 'active', ?)
     `).run(profileId, cleanEmail, passHash, String(fullName).trim(), String(phone).trim(), now);
 
+    const initialOnline = cleanVerify === 'verified' ? 1 : 0;
     await db.prepare(`
       INSERT INTO riders (
         id, profile_id, vehicle_type, plate_number, home_state, verification_status,
         is_online, current_lat, current_lng, last_location_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       riderId,
       profileId,
@@ -1657,6 +1804,7 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       String(plateNumber).trim().toUpperCase(),
       cleanState,
       cleanVerify,
+      initialOnline,
       hub.lat,
       hub.lng,
       now
@@ -1664,6 +1812,7 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
 
     const created = (await getRiderByProfileId(profileId))!;
     await broadcastWsEvent('rider:availability', created);
+    if (initialOnline === 1) await dispatchWaitingDeliveries();
     res.status(201).json({ rider: created, riders: await getAllRiders() });
   }));
 
@@ -1713,7 +1862,7 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       return;
     }
     if (status === 'verified') {
-      await db.prepare('UPDATE riders SET verification_status = ? WHERE id = ?').run(status, req.params.id);
+      await db.prepare('UPDATE riders SET verification_status = ?, is_online = 1 WHERE id = ?').run(status, req.params.id);
     } else {
       await db.prepare('UPDATE riders SET verification_status = ?, is_online = 0 WHERE id = ?').run(
         status,
@@ -1726,12 +1875,13 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       rider.id,
       status === 'verified' ? 'Verification Tick Enabled' : 'Verification Status Updated',
       status === 'verified'
-        ? 'Your SAQO rider verification tick is now active. You can go online and accept deliveries.'
+        ? 'Your SAQO rider verification tick is now active and you are online to accept deliveries.'
         : `Your rider verification status is now set to ${status}. Contact SAQO Operations for details.`,
       null
     );
     await broadcastWsEvent('notification:created', notif);
     await broadcastWsEvent('rider:availability', updatedRider);
+    if (status === 'verified') await dispatchWaitingDeliveries();
     res.json({ rider: updatedRider, riders: await getAllRiders() });
   }));
 
