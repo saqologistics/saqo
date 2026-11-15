@@ -1,6 +1,6 @@
-import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
-import path from 'node:path';
+import { db, sqlite, databaseTransaction } from './database';
+export { db, databaseTransaction as persistDispatchChange } from './database';
 import { DEFAULT_PLATFORM_SETTINGS } from '../shared/pricing';
 import type {
   AccountStatus,
@@ -26,7 +26,6 @@ import type {
   VerificationStatus,
 } from '../shared/types';
 
-const DB_PATH = process.env.SAQO_DB_PATH || path.resolve(process.cwd(), 'saqo.db');
 const configuredSecret = process.env.SAQO_SESSION_SECRET?.trim();
 if (process.env.NODE_ENV === 'production' &&
     (!configuredSecret || configuredSecret.length < 32 || configuredSecret === 'saqo-dev-hmac-secret-2026')) {
@@ -34,23 +33,6 @@ if (process.env.NODE_ENV === 'production' &&
 }
 const SESSION_SECRET = configuredSecret || 'saqo-dev-hmac-secret-2026';
 const SESSION_LIFETIME_MS = 12 * 60 * 60 * 1000;
-
-export const db = new DatabaseSync(DB_PATH);
-db.exec('PRAGMA foreign_keys = ON;');
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA busy_timeout = 5000;');
-
-export function persistDispatchChange<T>(change: () => T): T {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const result = change();
-    db.exec('COMMIT');
-    return result;
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
-}
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -104,7 +86,8 @@ export function verifySessionToken(token: string): { userId: string; role: UserR
   }
 }
 
-export function initDatabase(): void {
+function initSqliteDatabase(): void {
+  const db = sqlite!;
   db.exec(`
     CREATE TABLE IF NOT EXISTS profiles (
       id TEXT PRIMARY KEY,
@@ -579,16 +562,20 @@ export function initDatabase(): void {
     `);
   }
 
-  bootstrapAdminAccount();
 }
 
-function bootstrapAdminAccount(): void {
-  const adminCount = db
+export async function initDatabase() {
+  if (sqlite) initSqliteDatabase();
+  await databaseTransaction(bootstrapAdminAccount);
+}
+
+async function bootstrapAdminAccount(): Promise<void> {
+  const adminCount = await db
     .prepare("SELECT COUNT(*) as c FROM profiles WHERE role = 'admin'")
     .get() as { c: number };
   if (adminCount.c > 0) {
     if (process.env.NODE_ENV === 'production') {
-      const admins = db.prepare("SELECT password_hash FROM profiles WHERE role = 'admin' AND account_status = 'active'")
+      const admins = await db.prepare("SELECT password_hash FROM profiles WHERE role = 'admin' AND account_status = 'active'")
         .all() as Array<{ password_hash: string }>;
       if (admins.some((admin) => verifyPassword('saqo1234', admin.password_hash))) {
         throw new Error('Change the default admin password before starting in production.');
@@ -608,15 +595,15 @@ function bootstrapAdminAccount(): void {
   const adminName = process.env.SAQO_ADMIN_NAME || 'SAQO Operations Admin';
   const adminPhone = process.env.SAQO_ADMIN_PHONE || '+2348007276000';
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
     VALUES (?, ?, ?, ?, ?, 'admin', 'active', ?)
   `).run(`prof-admin-${crypto.randomUUID().slice(0, 8)}`, adminEmail, adminPass, adminName, adminPhone, now);
 }
 
 // Query helpers
-export function getPlatformSettings(): PlatformSettings {
-  const row = db.prepare('SELECT * FROM platform_settings WHERE id = 1').get() as any;
+export async function getPlatformSettings(): Promise<PlatformSettings> {
+  const row = await db.prepare('SELECT * FROM platform_settings WHERE id = 1').get() as any;
   return {
     maxActiveParcelsPerRider: row.max_active_parcels_per_rider,
     showDeliveryStateSelectors: Boolean(row.show_delivery_state_selectors),
@@ -630,8 +617,8 @@ export function getPlatformSettings(): PlatformSettings {
   };
 }
 
-export function getProfileById(id: string): Profile | null {
-  const row = db.prepare('SELECT * FROM profiles WHERE id = ?').get(id) as any;
+export async function getProfileById(id: string): Promise<Profile | null> {
+  const row = await db.prepare('SELECT * FROM profiles WHERE id = ?').get(id) as any;
   if (!row) return null;
   return {
     id: row.id,
@@ -644,8 +631,8 @@ export function getProfileById(id: string): Profile | null {
   };
 }
 
-export function getAllRiders(): RiderProfile[] {
-  const rows = db.prepare(`
+export async function getAllRiders(): Promise<RiderProfile[]> {
+  const rows = await db.prepare(`
     SELECT p.*, r.id as rider_id, r.vehicle_type, r.plate_number, r.home_state,
       r.verification_status, r.is_online, r.current_lat, r.current_lng, r.last_location_at,
       r.completed_deliveries_count, r.total_earnings_ngn, r.rating,
@@ -679,12 +666,12 @@ export function getAllRiders(): RiderProfile[] {
   }));
 }
 
-export function getRiderByProfileId(profileId: string): RiderProfile | null {
-  return getAllRiders().find((r) => r.id === profileId) || null;
+export async function getRiderByProfileId(profileId: string): Promise<RiderProfile | null> {
+  return (await getAllRiders()).find((r) => r.id === profileId) || null;
 }
 
-export function getAllCustomers(): CustomerSummary[] {
-  const rows = db.prepare(`
+export async function getAllCustomers(): Promise<CustomerSummary[]> {
+  const rows = await db.prepare(`
     SELECT p.*, c.id as customer_id, c.default_state,
       (SELECT COUNT(*) FROM delivery_requests dr WHERE dr.customer_id = c.id) as total_requests,
       (SELECT COUNT(*) FROM delivery_requests dr WHERE dr.customer_id = c.id AND dr.status = 'delivered') as completed_requests
@@ -708,8 +695,8 @@ export function getAllCustomers(): CustomerSummary[] {
   }));
 }
 
-export function getDeliveryById(deliveryId: string): DeliveryRequest | null {
-  const row = db.prepare(`
+export async function getDeliveryById(deliveryId: string): Promise<DeliveryRequest | null> {
+  const row = await db.prepare(`
     SELECT dr.*,
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
@@ -747,12 +734,12 @@ export function publicTrackingDelivery(delivery: DeliveryRequest) {
   };
 }
 
-export function publicTrackingHistory(deliveryId: string) {
-  return getDeliveryHistory(deliveryId).map(({ id, status, createdAt }) => ({ id, status, createdAt }));
+export async function publicTrackingHistory(deliveryId: string) {
+  return (await getDeliveryHistory(deliveryId)).map(({ id, status, createdAt }) => ({ id, status, createdAt }));
 }
 
-export function getDeliveryByTrackingCode(trackingCode: string): DeliveryRequest | null {
-  const row = db.prepare(`
+export async function getDeliveryByTrackingCode(trackingCode: string): Promise<DeliveryRequest | null> {
+  const row = await db.prepare(`
     SELECT dr.*,
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
       cp.full_name as customer_name, cp.phone as customer_phone,
@@ -773,7 +760,7 @@ export function getDeliveryByTrackingCode(trackingCode: string): DeliveryRequest
   return mapDeliveryRow(row);
 }
 
-export function listDeliveries(filter?: { customerId?: string; riderId?: string }): DeliveryRequest[] {
+export async function listDeliveries(filter?: { customerId?: string; riderId?: string }): Promise<DeliveryRequest[]> {
   let sql = `
     SELECT dr.*,
       pa.category as parcel_category, pa.description as parcel_description, pa.weight_kg,
@@ -798,7 +785,7 @@ export function listDeliveries(filter?: { customerId?: string; riderId?: string 
     params.push(filter.riderId);
   }
   sql += ' ORDER BY dr.created_at DESC';
-  const rows = db.prepare(sql).all(...params) as any[];
+  const rows = await db.prepare(sql).all(...params) as any[];
   return rows.map(mapDeliveryRow);
 }
 
@@ -844,8 +831,8 @@ function mapDeliveryRow(row: any): DeliveryRequest {
   };
 }
 
-export function getDeliveryHistory(deliveryId: string): DeliveryStatusHistoryItem[] {
-  const rows = db
+export async function getDeliveryHistory(deliveryId: string): Promise<DeliveryStatusHistoryItem[]> {
+  const rows = await db
     .prepare('SELECT * FROM delivery_status_history WHERE delivery_id = ? ORDER BY created_at ASC')
     .all(deliveryId) as any[];
   return rows.map((r) => ({
@@ -863,8 +850,8 @@ export function riderDelivery(delivery: DeliveryRequest | null): DeliveryRequest
   return { ...delivery, deliveryOtp: '' };
 }
 
-export function getAssignmentsForRider(riderId: string): DeliveryAssignment[] {
-  const rows = db.prepare(`
+export async function getAssignmentsForRider(riderId: string): Promise<DeliveryAssignment[]> {
+  const rows = await db.prepare(`
     SELECT da.*, dr.tracking_code, rp.full_name as rider_name
     FROM delivery_assignments da
     JOIN delivery_requests dr ON dr.id = da.delivery_id
@@ -874,7 +861,7 @@ export function getAssignmentsForRider(riderId: string): DeliveryAssignment[] {
     ORDER BY da.offered_at DESC
   `).all(riderId) as any[];
 
-  return rows.map((row) => ({
+  return Promise.all(rows.map(async (row) => ({
     id: row.id,
     deliveryId: row.delivery_id,
     trackingCode: row.tracking_code,
@@ -887,12 +874,12 @@ export function getAssignmentsForRider(riderId: string): DeliveryAssignment[] {
     offeredAt: row.offered_at,
     expiresAt: row.expires_at,
     respondedAt: row.responded_at,
-    delivery: riderDelivery(getDeliveryById(row.delivery_id)),
-  }));
+    delivery: riderDelivery(await getDeliveryById(row.delivery_id)),
+  })));
 }
 
-export function getAllPayments(): PaymentRecord[] {
-  const rows = db.prepare(`
+export async function getAllPayments(): Promise<PaymentRecord[]> {
+  const rows = await db.prepare(`
     SELECT py.*, dr.tracking_code, dr.payment_method, cp.full_name as customer_name
     FROM payments py
     JOIN delivery_requests dr ON dr.id = py.delivery_id
@@ -915,8 +902,8 @@ export function getAllPayments(): PaymentRecord[] {
   }));
 }
 
-export function getAllComplaints(): ComplaintRecord[] {
-  const rows = db.prepare(`
+export async function getAllComplaints(): Promise<ComplaintRecord[]> {
+  const rows = await db.prepare(`
     SELECT co.*, dr.tracking_code, p.full_name as reporter_name, p.email as reporter_email, p.phone as reporter_phone
     FROM complaints co
     LEFT JOIN delivery_requests dr ON dr.id = co.delivery_id
@@ -941,12 +928,12 @@ export function getAllComplaints(): ComplaintRecord[] {
   }));
 }
 
-export function getTicketsForReporter(reporterId: string): ComplaintRecord[] {
-  return getAllComplaints().filter((c) => c.reporterId === reporterId);
+export async function getTicketsForReporter(reporterId: string): Promise<ComplaintRecord[]> {
+  return (await getAllComplaints()).filter((c) => c.reporterId === reporterId);
 }
 
-export function getNotificationsForUser(userId: string): NotificationItem[] {
-  const rows = db
+export async function getNotificationsForUser(userId: string): Promise<NotificationItem[]> {
+  const rows = await db
     .prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 30')
     .all(userId) as any[];
   return rows.map((r) => ({
@@ -960,15 +947,15 @@ export function getNotificationsForUser(userId: string): NotificationItem[] {
   }));
 }
 
-export function createNotification(
+export async function createNotification(
   userId: string,
   title: string,
   message: string,
   deliveryId: string | null = null
-): NotificationItem {
+): Promise<NotificationItem> {
   const id = `notif-${crypto.randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO notifications (id, user_id, title, message, delivery_id, is_read, created_at)
     VALUES (?, ?, ?, ?, ?, 0, ?)
   `).run(id, userId, title, message, deliveryId, now);
@@ -1002,29 +989,29 @@ function mapSupportConversationRow(r: any): SupportConversation {
   };
 }
 
-export function getSupportConversationById(id: string): SupportConversation | null {
-  const row = db.prepare('SELECT * FROM support_conversations WHERE id = ?').get(id) as any;
+export async function getSupportConversationById(id: string): Promise<SupportConversation | null> {
+  const row = await db.prepare('SELECT * FROM support_conversations WHERE id = ?').get(id) as any;
   return row ? mapSupportConversationRow(row) : null;
 }
 
-export function getAllSupportConversations(): SupportConversation[] {
-  const rows = db
+export async function getAllSupportConversations(): Promise<SupportConversation[]> {
+  const rows = await db
     .prepare('SELECT * FROM support_conversations ORDER BY last_message_at DESC')
     .all() as any[];
   return rows.map(mapSupportConversationRow);
 }
 
-export function getSupportConversationsForVisitor(params: {
+export async function getSupportConversationsForVisitor(params: {
   visitorToken?: string | null;
   userId?: string | null;
-}): SupportConversation[] {
+}): Promise<SupportConversation[]> {
   const { visitorToken, userId } = params;
   if (userId && visitorToken) {
     // Associate any anonymous conversations started in the same browser with this signed-in user
-    db.prepare(
+    await db.prepare(
       `UPDATE support_conversations SET user_id = ? WHERE visitor_token = ? AND user_id IS NULL`
     ).run(userId, visitorToken);
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT * FROM support_conversations WHERE user_id = ? OR visitor_token = ? ORDER BY last_message_at DESC`
       )
@@ -1032,13 +1019,13 @@ export function getSupportConversationsForVisitor(params: {
     return rows.map(mapSupportConversationRow);
   }
   if (userId) {
-    const rows = db
+    const rows = await db
       .prepare(`SELECT * FROM support_conversations WHERE user_id = ? ORDER BY last_message_at DESC`)
       .all(userId) as any[];
     return rows.map(mapSupportConversationRow);
   }
   if (visitorToken) {
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT * FROM support_conversations WHERE visitor_token = ? ORDER BY last_message_at DESC`
       )
@@ -1048,8 +1035,8 @@ export function getSupportConversationsForVisitor(params: {
   return [];
 }
 
-export function getSupportMessages(conversationId: string): SupportMessage[] {
-  const rows = db
+export async function getSupportMessages(conversationId: string): Promise<SupportMessage[]> {
+  const rows = await db
     .prepare('SELECT * FROM support_messages WHERE conversation_id = ? ORDER BY created_at ASC')
     .all(conversationId) as any[];
   return rows.map((r) => ({
@@ -1062,7 +1049,7 @@ export function getSupportMessages(conversationId: string): SupportMessage[] {
   }));
 }
 
-export function createSupportConversation(input: {
+export async function createSupportConversation(input: {
   visitorToken: string;
   userId: string | null;
   visitorName: string;
@@ -1071,13 +1058,13 @@ export function createSupportConversation(input: {
   trackingCode: string | null;
   initialMessage: string;
   senderRole: SupportSenderRole;
-}): { conversation: SupportConversation; message: SupportMessage } {
+}): Promise<{ conversation: SupportConversation; message: SupportMessage }> {
   const convId = `chat-${crypto.randomUUID().slice(0, 8)}`;
   const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
   const cleanPreview = input.initialMessage.trim().slice(0, 140);
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO support_conversations (
       id, visitor_token, user_id, visitor_name, visitor_email, visitor_phone,
       tracking_code, status, assigned_admin_id, unread_by_admin, unread_by_visitor,
@@ -1096,13 +1083,13 @@ export function createSupportConversation(input: {
     now
   );
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(msgId, convId, input.senderRole, input.visitorName.trim(), input.initialMessage.trim(), now);
 
   return {
-    conversation: getSupportConversationById(convId)!,
+    conversation: (await getSupportConversationById(convId))!,
     message: {
       id: msgId,
       conversationId: convId,
@@ -1114,25 +1101,25 @@ export function createSupportConversation(input: {
   };
 }
 
-export function addSupportMessage(input: {
+export async function addSupportMessage(input: {
   conversationId: string;
   senderRole: SupportSenderRole;
   senderName: string;
   body: string;
   assignedAdminId?: string | null;
-}): { conversation: SupportConversation; message: SupportMessage } {
+}): Promise<{ conversation: SupportConversation; message: SupportMessage }> {
   const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
   const cleanBody = input.body.trim();
   const preview = cleanBody.slice(0, 140);
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(msgId, input.conversationId, input.senderRole, input.senderName, cleanBody, now);
 
   if (input.senderRole === 'admin') {
-    db.prepare(`
+    await db.prepare(`
       UPDATE support_conversations
       SET unread_by_visitor = unread_by_visitor + 1,
           unread_by_admin = 0,
@@ -1143,13 +1130,13 @@ export function addSupportMessage(input: {
       WHERE id = ?
     `).run(input.assignedAdminId || null, preview, now, input.conversationId);
   } else if (input.senderRole === 'system') {
-    db.prepare(`
+    await db.prepare(`
       UPDATE support_conversations
       SET last_message_preview = ?, last_message_at = ?
       WHERE id = ?
     `).run(preview, now, input.conversationId);
   } else {
-    db.prepare(`
+    await db.prepare(`
       UPDATE support_conversations
       SET unread_by_admin = unread_by_admin + 1,
           unread_by_visitor = 0,
@@ -1161,7 +1148,7 @@ export function addSupportMessage(input: {
   }
 
   return {
-    conversation: getSupportConversationById(input.conversationId)!,
+    conversation: (await getSupportConversationById(input.conversationId))!,
     message: {
       id: msgId,
       conversationId: input.conversationId,
@@ -1173,30 +1160,30 @@ export function addSupportMessage(input: {
   };
 }
 
-export function markSupportConversationRead(
+export async function markSupportConversationRead(
   conversationId: string,
   reader: 'admin' | 'visitor'
-): SupportConversation | null {
+): Promise<SupportConversation | null> {
   if (reader === 'admin') {
-    db.prepare('UPDATE support_conversations SET unread_by_admin = 0 WHERE id = ?').run(
+    await db.prepare('UPDATE support_conversations SET unread_by_admin = 0 WHERE id = ?').run(
       conversationId
     );
   } else {
-    db.prepare('UPDATE support_conversations SET unread_by_visitor = 0 WHERE id = ?').run(
+    await db.prepare('UPDATE support_conversations SET unread_by_visitor = 0 WHERE id = ?').run(
       conversationId
     );
   }
-  return getSupportConversationById(conversationId);
+  return await getSupportConversationById(conversationId);
 }
 
-export function updateSupportConversationStatus(
+export async function updateSupportConversationStatus(
   conversationId: string,
   status: SupportConversationStatus,
   actorName: string
-): { conversation: SupportConversation; systemMessage: SupportMessage } | null {
-  const existing = getSupportConversationById(conversationId);
+): Promise<{ conversation: SupportConversation; systemMessage: SupportMessage } | null> {
+  const existing = await getSupportConversationById(conversationId);
   if (!existing) return null;
-  db.prepare('UPDATE support_conversations SET status = ? WHERE id = ?').run(
+  await db.prepare('UPDATE support_conversations SET status = ? WHERE id = ?').run(
     status,
     conversationId
   );
@@ -1206,7 +1193,7 @@ export function updateSupportConversationStatus(
     resolved: 'marked as resolved',
     closed: 'closed',
   };
-  const { conversation, message } = addSupportMessage({
+  const { conversation, message } = await addSupportMessage({
     conversationId,
     senderRole: 'system',
     senderName: 'SAQO Support',

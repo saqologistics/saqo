@@ -17,7 +17,7 @@ for (const key of Object.keys(process.env)) {
 
 const { db, initDatabase } = await import('../src/server/db');
 const { registerTwilioWhatsAppWebhook, TWILIO_WHATSAPP_PATH } = await import('../src/server/whatsapp');
-initDatabase();
+await initDatabase();
 const credentialKeys = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_WHATSAPP_FROM'] as const;
 const envCredentials = Object.fromEntries(credentialKeys.map((key) => [key, process.env[key]]));
 let smokeTest = true;
@@ -129,8 +129,8 @@ async function verify(url: string) {
   } finally {
     smokeTest = false;
     for (const key of credentialKeys) delete process.env[key];
-    db.prepare('DELETE FROM whatsapp_sessions WHERE phone = ?').run('+2348111111111');
-    db.prepare('DELETE FROM whatsapp_inbound_messages WHERE message_sid = ?').run(fields.get('MessageSid'));
+    await db.prepare('DELETE FROM whatsapp_sessions WHERE phone = ?').run('+2348111111111');
+    await db.prepare('DELETE FROM whatsapp_inbound_messages WHERE message_sid = ?').run(fields.get('MessageSid'));
     console.log('Sandbox now reads Twilio credentials from the shell or git-ignored .env. Stop with Ctrl+C.');
   }
 }

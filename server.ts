@@ -97,13 +97,13 @@ import {
   updateGatewaySettings,
 } from './src/server/paymentService';
 
-initDatabase();
+await initDatabase();
 
 interface AuthedRequest extends Request {
   auth?: { userId: string; role: UserRole };
 }
 
-function authenticate(req: AuthedRequest, res: Response, next: NextFunction): void {
+const authenticate = asyncRoute(async (req: AuthedRequest, res: Response, next: NextFunction): Promise<void> => {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Authentication required.' });
@@ -115,7 +115,7 @@ function authenticate(req: AuthedRequest, res: Response, next: NextFunction): vo
     res.status(401).json({ error: 'Invalid or expired session token.' });
     return;
   }
-  const profile = getProfileById(payload.userId);
+  const profile = await getProfileById(payload.userId);
   if (!profile) {
     res.status(401).json({ error: 'Account not found.' });
     return;
@@ -126,7 +126,7 @@ function authenticate(req: AuthedRequest, res: Response, next: NextFunction): vo
   }
   req.auth = { userId: profile.id, role: profile.role };
   next();
-}
+});
 
 function requireRole(...roles: UserRole[]) {
   return (req: AuthedRequest, res: Response, next: NextFunction): void => {
@@ -138,13 +138,13 @@ function requireRole(...roles: UserRole[]) {
   };
 }
 
-function tryAuthenticate(req: Request): { userId: string; role: UserRole } | null {
+async function tryAuthenticate(req: Request): Promise<{ userId: string; role: UserRole } | null> {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return null;
   const token = header.slice('Bearer '.length).trim();
   const payload = verifySessionToken(token);
   if (!payload) return null;
-  const profile = getProfileById(payload.userId);
+  const profile = await getProfileById(payload.userId);
   if (!profile || profile.accountStatus === 'suspended') return null;
   return { userId: profile.id, role: profile.role };
 }
@@ -162,18 +162,18 @@ function isValidNigeriaCoordPair(lat: unknown, lng: unknown): boolean {
   );
 }
 
-function verifyHandoffOtp(
+async function verifyHandoffOtp(
   res: Response,
   delivery: { id: string; deliveryOtp: string },
   otp: unknown
-): boolean {
+): Promise<boolean> {
   const now = Date.now();
   const resetAt = now + 15 * 60 * 1000;
-  const attempt = db.prepare(`
+  const attempt = await db.prepare(`
     INSERT INTO delivery_otp_attempts (delivery_id, attempts, reset_at) VALUES (?, 1, ?)
     ON CONFLICT(delivery_id) DO UPDATE SET
-      attempts = CASE WHEN reset_at <= ? THEN 1 ELSE attempts + 1 END,
-      reset_at = CASE WHEN reset_at <= ? THEN excluded.reset_at ELSE reset_at END
+      attempts = CASE WHEN delivery_otp_attempts.reset_at <= ? THEN 1 ELSE delivery_otp_attempts.attempts + 1 END,
+      reset_at = CASE WHEN delivery_otp_attempts.reset_at <= ? THEN excluded.reset_at ELSE delivery_otp_attempts.reset_at END
     RETURNING attempts, reset_at
   `).get(delivery.id, resetAt, now, now) as { attempts: number; reset_at: number };
 
@@ -189,9 +189,9 @@ function verifyHandoffOtp(
   return true;
 }
 
-function asyncRoute(handler: (req: AuthedRequest, res: Response) => Promise<unknown>) {
+function asyncRoute(handler: (req: AuthedRequest, res: Response, next: NextFunction) => Promise<unknown>) {
   return (req: AuthedRequest, res: Response, next: NextFunction) => {
-    void handler(req, res).catch(next);
+    void handler(req, res, next).catch(next);
   };
 }
 
@@ -340,27 +340,27 @@ async function startServer() {
       })
     );
 
-    ws.on('message', (raw) => {
+    ws.on('message', async (raw) => {
       try {
         const msg = JSON.parse(String(raw));
         if (msg?.type === 'auth' && typeof msg.token === 'string') {
           const payload = verifySessionToken(msg.token);
           if (payload) {
-            const prof = getProfileById(payload.userId);
+            const prof = await getProfileById(payload.userId);
             if (prof && prof.accountStatus === 'active') {
-              setWsClientAuth(ws, prof.id, prof.role, payload.expiresAt);
+              await setWsClientAuth(ws, prof.id, prof.role, payload.expiresAt);
               return;
             }
           }
-          clearWsClientAuth(ws);
+          await clearWsClientAuth(ws);
         } else if (msg?.type === 'track' && typeof msg.trackingCode === 'string') {
           setWsTracking(ws, msg.trackingCode.trim().toUpperCase().slice(0, 32));
         } else if (msg?.type === 'logout') {
-          clearWsClientAuth(ws);
+          await clearWsClientAuth(ws);
         } else if (msg?.type === 'support:subscribe' && typeof msg.visitorToken === 'string') {
           setWsSupportVisitor(ws, msg.visitorToken);
         } else if (msg?.type === 'support:typing' && typeof msg.conversationId === 'string') {
-          sendSupportTyping(ws, msg.conversationId, Boolean(msg.isTyping));
+          await sendSupportTyping(ws, msg.conversationId, Boolean(msg.isTyping));
         }
       } catch {
         // ignore malformed frames
@@ -374,27 +374,27 @@ async function startServer() {
   });
 
   // Public settings
-  app.get('/api/settings/public', (_req, res) => {
-    const s = getPlatformSettings();
+  app.get('/api/settings/public', asyncRoute(async (_req, res) => {
+    const s = await getPlatformSettings();
     res.json({
       whatsappSupportNumber: s.whatsappSupportNumber,
       showDeliveryStateSelectors: s.showDeliveryStateSelectors,
       whatsAppOrderNumber: getWhatsAppOrderNumber(),
       maxActiveParcelsPerRider: s.maxActiveParcelsPerRider,
       offerTimeoutSeconds: s.offerTimeoutSeconds,
-      payments: getGatewayPublicConfig(),
+      payments: await getGatewayPublicConfig(),
     });
-  });
+  }));
 
-  app.get('/api/payments/config', (_req, res) => {
-    res.set('Cache-Control', 'no-store').json(getGatewayPublicConfig());
-  });
+  app.get('/api/payments/config', asyncRoute(async (_req, res) => {
+    res.set('Cache-Control', 'no-store').json(await getGatewayPublicConfig());
+  }));
 
   registerTwilioWhatsAppWebhook(app);
 
   // Quote endpoint
-  app.post('/api/quote', (req, res) => {
-    const settings = getPlatformSettings();
+  app.post('/api/quote', asyncRoute(async (req, res) => {
+    const settings = await getPlatformSettings();
     const {
       pickupState = 'Katsina',
       pickupAddress,
@@ -447,23 +447,23 @@ async function startServer() {
       pickupCoords: pCoords,
       destinationCoords: dCoords,
     });
-  });
+  }));
 
   // Auth: Login
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', asyncRoute(async (req, res) => {
     const { email, password } = req.body || {};
     if (typeof email !== 'string' || !email.trim() || email.length > 254 ||
         typeof password !== 'string' || !password || password.length > 1024) {
       res.status(400).json({ error: 'Email and password are required.' });
       return;
     }
-    const throttle = checkLoginThrottle(req.ip || req.socket.remoteAddress || 'unknown', email);
+    const throttle = await checkLoginThrottle(req.ip || req.socket.remoteAddress || 'unknown', email);
     if (throttle.retryAfter) {
       res.set('Retry-After', String(throttle.retryAfter)).status(429)
         .json({ error: 'Too many sign-in attempts. Please try again later.' });
       return;
     }
-    const row = db
+    const row = await db
       .prepare('SELECT * FROM profiles WHERE LOWER(email) = LOWER(?)')
       .get(String(email).trim()) as any;
     if (!row || !verifyPassword(String(password), row.password_hash)) {
@@ -474,15 +474,15 @@ async function startServer() {
       res.status(403).json({ error: 'Account is suspended. Please contact SAQO support.' });
       return;
     }
-    throttle.clearAccount();
+    await throttle.clearAccount();
     const token = signSessionToken({ userId: row.id, role: row.role });
-    const profile = getProfileById(row.id)!;
-    const rider = profile.role === 'rider' ? getRiderByProfileId(profile.id) : null;
+    const profile = (await getProfileById(row.id))!;
+    const rider = profile.role === 'rider' ? await getRiderByProfileId(profile.id) : null;
     res.json({ token, profile, rider });
-  });
+  }));
 
   // Auth: Register (Public registration is strictly for Customers; riders are issued by Admin)
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', asyncRoute(async (req, res) => {
     const {
       email,
       password,
@@ -511,7 +511,7 @@ async function startServer() {
       return;
     }
     const targetRole: UserRole = 'client';
-    const existing = db
+    const existing = await db
       .prepare('SELECT id FROM profiles WHERE LOWER(email) = LOWER(?)')
       .get(String(email).trim());
     if (existing) {
@@ -524,43 +524,43 @@ async function startServer() {
     const passHash = hashPassword(String(password));
     const state = homeState || 'Katsina';
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
     `).run(profileId, String(email).trim().toLowerCase(), passHash, String(fullName).trim(), String(phone).trim(), targetRole, now);
 
-    db.prepare(`INSERT INTO customers (id, profile_id, default_state) VALUES (?, ?, ?)`).run(
+    await db.prepare(`INSERT INTO customers (id, profile_id, default_state) VALUES (?, ?, ?)`).run(
       `cust-${crypto.randomUUID().slice(0, 8)}`,
       profileId,
       state
     );
 
     const token = signSessionToken({ userId: profileId, role: targetRole });
-    const profile = getProfileById(profileId)!;
+    const profile = (await getProfileById(profileId))!;
     res.status(201).json({ token, profile, rider: null });
-  });
+  }));
 
   // Auth: Me
-  app.get('/api/auth/me', authenticate, (req: AuthedRequest, res) => {
-    const profile = getProfileById(req.auth!.userId)!;
-    const rider = profile.role === 'rider' ? getRiderByProfileId(profile.id) : null;
+  app.get('/api/auth/me', authenticate, asyncRoute(async (req: AuthedRequest, res) => {
+    const profile = (await getProfileById(req.auth!.userId))!;
+    const rider = profile.role === 'rider' ? await getRiderByProfileId(profile.id) : null;
     res.json({ profile, rider });
-  });
+  }));
 
   // Public tracking lookup
-  app.get('/api/track/:trackingCode', (req, res) => {
-    const delivery = getDeliveryByTrackingCode(req.params.trackingCode);
+  app.get('/api/track/:trackingCode', asyncRoute(async (req, res) => {
+    const delivery = await getDeliveryByTrackingCode(req.params.trackingCode);
     if (!delivery) {
       res.status(404).json({ error: 'Tracking code not found.' });
       return;
     }
-    res.json({ delivery: publicTrackingDelivery(delivery), history: publicTrackingHistory(delivery.id) });
-  });
+    res.json({ delivery: publicTrackingDelivery(delivery), history: await publicTrackingHistory(delivery.id) });
+  }));
 
   // Confirm OTP (public recipient or client)
-  app.post('/api/track/:trackingCode/confirm-otp', (req, res) => {
+  app.post('/api/track/:trackingCode/confirm-otp', asyncRoute(async (req, res) => {
     const { otp } = req.body || {};
-    const delivery = getDeliveryByTrackingCode(req.params.trackingCode);
+    const delivery = await getDeliveryByTrackingCode(req.params.trackingCode);
     if (!delivery) {
       res.status(404).json({ error: 'Parcel not found.' });
       return;
@@ -577,16 +577,16 @@ async function startServer() {
       res.status(409).json({ error: 'The rider must arrive at the destination before handoff.' });
       return;
     }
-    if (!verifyHandoffOtp(res, delivery, otp)) return;
+    if (!await verifyHandoffOtp(res, delivery, otp)) return;
 
     const now = new Date().toISOString();
-    db.prepare(`
+    await db.prepare(`
       UPDATE delivery_requests
       SET otp_verified = 1, status = 'delivered', updated_at = ?
       WHERE id = ?
     `).run(now, delivery.id);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'delivered', ?, 'client', ?)
     `).run(
@@ -597,12 +597,12 @@ async function startServer() {
     );
 
     // Settle payment & credit rider
-    db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
+    await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
     if (delivery.assignedRiderId) {
-      const payment = db
+      const payment = await db
         .prepare('SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?')
         .get(delivery.id) as { rider_payout_ngn: number } | undefined;
-      db.prepare(`
+      await db.prepare(`
         UPDATE riders
         SET completed_deliveries_count = completed_deliveries_count + 1,
             total_earnings_ngn = total_earnings_ngn + ?
@@ -610,42 +610,42 @@ async function startServer() {
       `).run(payment?.rider_payout_ngn || 0, delivery.assignedRiderId);
     }
 
-    const updated = getDeliveryById(delivery.id)!;
-    broadcastWsEvent('delivery:updated', updated);
-    dispatchWaitingDeliveries();
-    res.json({ delivery: publicTrackingDelivery(updated), history: publicTrackingHistory(delivery.id) });
-  });
+    const updated = (await getDeliveryById(delivery.id))!;
+    await broadcastWsEvent('delivery:updated', updated);
+    await dispatchWaitingDeliveries();
+    res.json({ delivery: publicTrackingDelivery(updated), history: await publicTrackingHistory(delivery.id) });
+  }));
 
   // Notifications
-  app.get('/api/notifications', authenticate, (req: AuthedRequest, res) => {
-    res.json({ notifications: getNotificationsForUser(req.auth!.userId) });
-  });
+  app.get('/api/notifications', authenticate, asyncRoute(async (req: AuthedRequest, res) => {
+    res.json({ notifications: await getNotificationsForUser(req.auth!.userId) });
+  }));
 
-  app.post('/api/notifications/read', authenticate, (req: AuthedRequest, res) => {
-    db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(req.auth!.userId);
+  app.post('/api/notifications/read', authenticate, asyncRoute(async (req: AuthedRequest, res) => {
+    await db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(req.auth!.userId);
     res.json({ ok: true });
-  });
+  }));
 
   // Client: List deliveries
-  app.get('/api/client/deliveries', authenticate, requireRole('client'), (req: AuthedRequest, res) => {
-    const cust = db
+  app.get('/api/client/deliveries', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
+    const cust = await db
       .prepare('SELECT id FROM customers WHERE profile_id = ?')
       .get(req.auth!.userId) as { id: string } | undefined;
     if (!cust) {
       res.json({ deliveries: [] });
       return;
     }
-    const deliveries = listDeliveries({ customerId: cust.id });
-    const withHistory = deliveries.map((d) => ({
+    const deliveries = await listDeliveries({ customerId: cust.id });
+    const withHistory = await Promise.all(deliveries.map(async (d) => ({
       ...d,
-      history: getDeliveryHistory(d.id),
-    }));
+      history: await getDeliveryHistory(d.id),
+    })));
     res.json({ deliveries: withHistory });
-  });
+  }));
 
   // Client: Create delivery request + process payment method + trigger Smart Dispatch
   app.post('/api/deliveries', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
-    const settings = getPlatformSettings();
+    const settings = await getPlatformSettings();
     const {
       pickupState = 'Katsina',
       pickupAddress,
@@ -697,7 +697,7 @@ async function startServer() {
     const cleanIdempotencyKey =
       typeof idempotencyKey === 'string' && idempotencyKey.trim() ? idempotencyKey.trim() : null;
     if (cleanIdempotencyKey) {
-      const existingPayment = db
+      const existingPayment = await db
         .prepare('SELECT delivery_id, user_id FROM payment_transactions WHERE idempotency_key = ? AND delivery_id IS NOT NULL')
         .get(cleanIdempotencyKey) as { delivery_id: string; user_id: string } | undefined;
       if (existingPayment?.delivery_id) {
@@ -705,9 +705,9 @@ async function startServer() {
           res.status(409).json({ error: 'This request key is already in use.' });
           return;
         }
-        const existingDelivery = getDeliveryById(existingPayment.delivery_id);
+        const existingDelivery = await getDeliveryById(existingPayment.delivery_id);
         if (existingDelivery) {
-          let replayPaymentTx = getPaymentTransactionByKey(cleanIdempotencyKey);
+          let replayPaymentTx = await getPaymentTransactionByKey(cleanIdempotencyKey);
           if (replayPaymentTx?.provider === 'flutterwave') {
             try {
               replayPaymentTx = await reuseFlutterwaveCheckout(replayPaymentTx);
@@ -717,8 +717,8 @@ async function startServer() {
             }
           }
           res.status(200).json({
-            delivery: getDeliveryById(existingDelivery.id) ?? existingDelivery,
-            history: getDeliveryHistory(existingDelivery.id),
+            delivery: await getDeliveryById(existingDelivery.id) ?? existingDelivery,
+            history: await getDeliveryHistory(existingDelivery.id),
             paymentTransaction: replayPaymentTx,
             checkoutUrl: replayPaymentTx?.checkoutUrl || null,
             idempotentReplay: true,
@@ -728,7 +728,7 @@ async function startServer() {
       }
     }
 
-    const methodRow = db
+    const methodRow = await db
       .prepare('SELECT is_enabled FROM payment_methods WHERE code = ?')
       .get(chosenMethod) as { is_enabled: number } | undefined;
     if (methodRow && !methodRow.is_enabled) {
@@ -736,16 +736,16 @@ async function startServer() {
       return;
     }
 
-    const cust = db
+    const cust = await db
       .prepare('SELECT id FROM customers WHERE profile_id = ?')
       .get(req.auth!.userId) as { id: string } | undefined;
-    const customerProfile = getProfileById(req.auth!.userId);
+    const customerProfile = await getProfileById(req.auth!.userId);
     if (!cust || !customerProfile) {
       res.status(400).json({ error: 'Customer profile not initialized.' });
       return;
     }
 
-    const publicPayConfig = getGatewayPublicConfig();
+    const publicPayConfig = await getGatewayPublicConfig();
     const methodConfig = publicPayConfig.methods.find((m) => m.code === chosenMethod);
     if (methodConfig && !methodConfig.isEnabled) {
       res.status(400).json({ error: `${methodConfig.name} is currently disabled.` });
@@ -790,7 +790,7 @@ async function startServer() {
     });
 
     if (chosenMethod === 'wallet') {
-      const wallet = ensureWallet(req.auth!.userId);
+      const wallet = await ensureWallet(req.auth!.userId);
       if (wallet.balanceNgn < quote.deliveryFeeNgn) {
         res.status(400).json({
           error: `Insufficient wallet balance. Delivery fee is ₦${quote.deliveryFeeNgn.toLocaleString()}, available balance is ₦${wallet.balanceNgn.toLocaleString()}. Fund your wallet to proceed.`,
@@ -802,7 +802,7 @@ async function startServer() {
       }
     }
 
-    const { deliveryId, trackingCode } = createBookingRows({
+    const { deliveryId, trackingCode } = await createBookingRows({
       customerId: cust.id, pickupState, pickupAddress, pCoords, destinationState, destinationAddress, dCoords,
       recipientName, recipientPhone, parcelCategory, parcelDescription, weightKg: parsedWeight,
       paymentMethod: chosenMethod, quote, riderCommissionPercent: settings.riderCommissionPercent,
@@ -822,7 +822,7 @@ async function startServer() {
           redirectUrl: `${origin}/?flw_callback=1`,
         });
       } else {
-        const payRes = createDeliveryPaymentRecords({
+        const payRes = await createDeliveryPaymentRecords({
           deliveryId,
           trackingCode,
           customerProfileId: req.auth!.userId,
@@ -836,39 +836,39 @@ async function startServer() {
           transferProofNote: typeof transferProofNote === 'string' ? transferProofNote : null,
         });
         paymentTransaction = payRes.paymentTransaction;
-        db.prepare('UPDATE delivery_requests SET payment_reference = ? WHERE id = ?').run(
+        await db.prepare('UPDATE delivery_requests SET payment_reference = ? WHERE id = ?').run(
           payRes.paymentReference,
           deliveryId
         );
       }
     } catch (payErr) {
-      if (chosenMethod === 'flutterwave' && db.prepare('SELECT 1 FROM payment_transactions WHERE delivery_id = ?').get(deliveryId)) {
+      if (chosenMethod === 'flutterwave' && await db.prepare('SELECT 1 FROM payment_transactions WHERE delivery_id = ?').get(deliveryId)) {
         // Preserve the reference in case the provider accepted a request whose response was lost.
         sendPaymentError(res, payErr);
         return;
       }
-      db.prepare('DELETE FROM delivery_status_history WHERE delivery_id = ?').run(deliveryId);
-      db.prepare('DELETE FROM payments WHERE delivery_id = ?').run(deliveryId);
-      db.prepare('DELETE FROM parcels WHERE delivery_id = ?').run(deliveryId);
-      db.prepare('DELETE FROM delivery_requests WHERE id = ?').run(deliveryId);
+      await db.prepare('DELETE FROM delivery_status_history WHERE delivery_id = ?').run(deliveryId);
+      await db.prepare('DELETE FROM payments WHERE delivery_id = ?').run(deliveryId);
+      await db.prepare('DELETE FROM parcels WHERE delivery_id = ?').run(deliveryId);
+      await db.prepare('DELETE FROM delivery_requests WHERE id = ?').run(deliveryId);
       sendPaymentError(res, payErr);
       return;
     }
 
-    const created = getDeliveryById(deliveryId)!;
-    broadcastWsEvent('delivery:created', created);
+    const created = (await getDeliveryById(deliveryId))!;
+    await broadcastWsEvent('delivery:created', created);
 
     // Run Smart Rider Assignment Algorithm immediately
-    dispatchWaitingDeliveries();
-    const assigned = getDeliveryById(deliveryId);
+    await dispatchWaitingDeliveries();
+    const assigned = await getDeliveryById(deliveryId);
     const dispatchResult = assigned?.status === 'assigned'
       ? { offered: true, riderId: assigned.assignedRiderId, riderName: assigned.assignedRiderName }
       : { offered: false };
-    const finalDelivery = getDeliveryById(deliveryId)!;
+    const finalDelivery = (await getDeliveryById(deliveryId))!;
 
     res.status(201).json({
       delivery: finalDelivery,
-      history: getDeliveryHistory(deliveryId),
+      history: await getDeliveryHistory(deliveryId),
       dispatchResult,
       paymentTransaction,
       checkoutUrl: paymentTransaction?.checkoutUrl || null,
@@ -876,14 +876,14 @@ async function startServer() {
   }));
 
   // Client or Admin: Retry smart dispatch
-  app.post('/api/deliveries/:id/retry-dispatch', authenticate, requireRole('client', 'admin'), (req: AuthedRequest, res) => {
-    const delivery = getDeliveryById(req.params.id);
+  app.post('/api/deliveries/:id/retry-dispatch', authenticate, requireRole('client', 'admin'), asyncRoute(async (req: AuthedRequest, res) => {
+    const delivery = await getDeliveryById(req.params.id);
     if (!delivery) {
       res.status(404).json({ error: 'Delivery not found.' });
       return;
     }
     if (req.auth!.role === 'client') {
-      const cust = db
+      const cust = await db
         .prepare('SELECT id FROM customers WHERE profile_id = ?')
         .get(req.auth!.userId) as { id: string } | undefined;
       if (!cust || delivery.customerId !== cust.id) {
@@ -895,23 +895,23 @@ async function startServer() {
       res.status(409).json({ error: 'Only waiting parcels can be retried.' });
       return;
     }
-    db.prepare(
+    await db.prepare(
       `DELETE FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out')`
     ).run(delivery.id);
-    const dispatchResult = dispatchNextRiderForDelivery(delivery.id);
-    const updated = getDeliveryById(delivery.id)!;
+    const dispatchResult = await dispatchNextRiderForDelivery(delivery.id);
+    const updated = (await getDeliveryById(delivery.id))!;
     res.json({ delivery: updated, dispatchResult });
-  });
+  }));
 
   // Client or Admin: Cancel delivery
   app.post('/api/deliveries/:id/cancel', authenticate, requireRole('client', 'admin'), asyncRoute(async (req: AuthedRequest, res) => {
-    const delivery = getDeliveryById(req.params.id);
+    const delivery = await getDeliveryById(req.params.id);
     if (!delivery) {
       res.status(404).json({ error: 'Delivery not found.' });
       return;
     }
     if (req.auth!.role === 'client') {
-      const cust = db
+      const cust = await db
         .prepare('SELECT id FROM customers WHERE profile_id = ?')
         .get(req.auth!.userId) as { id: string } | undefined;
       if (!cust || delivery.customerId !== cust.id) {
@@ -924,16 +924,16 @@ async function startServer() {
       return;
     }
     const now = new Date().toISOString();
-    const offeredAssignments = db
+    const offeredAssignments = await db
       .prepare(`SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'`)
       .all(delivery.id) as Array<{ id: string }>;
     for (const asg of offeredAssignments) {
       clearOfferTimer(asg.id);
     }
-    db.prepare(
+    await db.prepare(
       `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
     ).run(now, delivery.id);
-    db.prepare(`UPDATE delivery_requests SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE delivery_requests SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(
       now,
       delivery.id
     );
@@ -951,7 +951,7 @@ async function startServer() {
         // Non-fatal fallback: keep delivery cancelled if refund fails
       }
     } else if (delivery.paymentStatus !== 'paid' && delivery.paymentStatus !== 'collected_by_rider') {
-      cancelDeliveryPayments(delivery.id, {
+      await cancelDeliveryPayments(delivery.id, {
         reason:
           req.auth!.role === 'admin'
             ? `Delivery cancelled by operations (${delivery.trackingCode})`
@@ -959,7 +959,7 @@ async function startServer() {
       });
     }
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'cancelled', ?, ?, ?)
     `).run(
@@ -970,24 +970,24 @@ async function startServer() {
       now
     );
 
-    const updated = getDeliveryById(delivery.id)!;
-    broadcastWsEvent('delivery:updated', updated);
-    dispatchWaitingDeliveries();
+    const updated = (await getDeliveryById(delivery.id))!;
+    await broadcastWsEvent('delivery:updated', updated);
+    await dispatchWaitingDeliveries();
     res.json({ delivery: updated });
   }));
 
   // Customer Wallet & Payment Endpoints
-  app.get('/api/wallet', authenticate, requireRole('client'), (req: AuthedRequest, res) => {
+  app.get('/api/wallet', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
-      res.json(getCustomerWalletSummary(req.auth!.userId));
+      res.json(await getCustomerWalletSummary(req.auth!.userId));
     } catch (err) {
       sendPaymentError(res, err);
     }
-  });
+  }));
 
   app.post('/api/wallet/fund/initialize', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
-      const profile = getProfileById(req.auth!.userId);
+      const profile = await getProfileById(req.auth!.userId);
       if (!profile) {
         res.status(401).json({ error: 'Account not found.' });
         return;
@@ -1022,8 +1022,8 @@ async function startServer() {
       const cleanTxRef = txRef ? String(txRef).trim() : '';
       const cleanTxId = transactionId ? String(transactionId).trim() : '';
       const txRow = (cleanTxRef
-        ? db.prepare('SELECT user_id FROM payment_transactions WHERE reference = ?').get(cleanTxRef)
-        : db.prepare('SELECT user_id FROM payment_transactions WHERE provider_tx_id = ?').get(cleanTxId)) as
+        ? await db.prepare('SELECT user_id FROM payment_transactions WHERE reference = ?').get(cleanTxRef)
+        : await db.prepare('SELECT user_id FROM payment_transactions WHERE provider_tx_id = ?').get(cleanTxId)) as
         | { user_id: string }
         | undefined;
 
@@ -1051,7 +1051,7 @@ async function startServer() {
   app.post('/api/deliveries/:id/pay', authenticate, requireRole('client'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
       const { paymentMethod, idempotencyKey, transferReference, transferProofNote } = req.body || {};
-      const profile = getProfileById(req.auth!.userId);
+      const profile = await getProfileById(req.auth!.userId);
       if (!profile) {
         res.status(401).json({ error: 'Account not found.' });
         return;
@@ -1060,7 +1060,7 @@ async function startServer() {
         res.status(400).json({ error: 'Select wallet, flutterwave, or bank_transfer to complete payment.' });
         return;
       }
-      const methodRow = db
+      const methodRow = await db
         .prepare('SELECT is_enabled FROM payment_methods WHERE code = ?')
         .get(String(paymentMethod)) as { is_enabled: number } | undefined;
       if (methodRow && !methodRow.is_enabled) {
@@ -1068,7 +1068,7 @@ async function startServer() {
         return;
       }
       if (paymentMethod === 'wallet') {
-        const result = payDeliveryWithWallet({
+        const result = await payDeliveryWithWallet({
           deliveryId: req.params.id,
           userId: profile.id,
           customerName: profile.fullName,
@@ -1094,7 +1094,7 @@ async function startServer() {
         return;
       }
       if (paymentMethod === 'bank_transfer') {
-        const updated = submitBankTransferProof({
+        const updated = await submitBankTransferProof({
           deliveryId: req.params.id,
           userId: profile.id,
           transferReference: String(transferReference || ''),
@@ -1134,12 +1134,12 @@ async function startServer() {
   }));
 
   // Client: List submitted support tickets (suggestions & complaints)
-  app.get('/api/client/tickets', authenticate, (req: AuthedRequest, res) => {
-    res.json({ tickets: getTicketsForReporter(req.auth!.userId) });
-  });
+  app.get('/api/client/tickets', authenticate, asyncRoute(async (req: AuthedRequest, res) => {
+    res.json({ tickets: await getTicketsForReporter(req.auth!.userId) });
+  }));
 
   // Client: File complaint or suggestion ticket (deliveryId optional)
-  const handleCreateTicket = (req: AuthedRequest, res: Response) => {
+  const handleCreateTicket = async (req: AuthedRequest, res: Response) => {
     const { ticketType, deliveryId, subject, details } = req.body || {};
     if (!subject || !details) {
       res.status(400).json({ error: 'Subject and details are required.' });
@@ -1148,13 +1148,13 @@ async function startServer() {
     const normalizedType = ticketType === 'suggestion' ? 'suggestion' : 'complaint';
     const cleanDeliveryId =
       typeof deliveryId === 'string' && deliveryId.trim() ? deliveryId.trim() : null;
-    if (cleanDeliveryId && !getDeliveryById(cleanDeliveryId)) {
+    if (cleanDeliveryId && !await getDeliveryById(cleanDeliveryId)) {
       res.status(404).json({ error: 'Referenced delivery was not found.' });
       return;
     }
     const id = `comp-${crypto.randomUUID().slice(0, 8)}`;
     const now = new Date().toISOString();
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO complaints (id, ticket_type, delivery_id, reporter_id, subject, details, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
     `).run(
@@ -1166,37 +1166,37 @@ async function startServer() {
       String(details).trim(),
       now
     );
-    broadcastWsEvent('complaint:updated', {
+    await broadcastWsEvent('complaint:updated', {
       id,
       ticketType: normalizedType,
       deliveryId: cleanDeliveryId,
       status: 'open',
     });
-    res.status(201).json({ ok: true, id, tickets: getTicketsForReporter(req.auth!.userId) });
+    res.status(201).json({ ok: true, id, tickets: await getTicketsForReporter(req.auth!.userId) });
   };
   app.post('/api/complaints', authenticate, handleCreateTicket);
   app.post('/api/tickets', authenticate, handleCreateTicket);
 
   // Rider: Dashboard state
-  app.get('/api/rider/dashboard', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
-    const rider = getRiderByProfileId(req.auth!.userId);
+  app.get('/api/rider/dashboard', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res) => {
+    const rider = await getRiderByProfileId(req.auth!.userId);
     if (!rider) {
       res.status(404).json({ error: 'Rider profile not found.' });
       return;
     }
-    const assignments = getAssignmentsForRider(rider.riderId);
-    const deliveries = listDeliveries({ riderId: rider.riderId }).map((d) => ({
+    const assignments = await getAssignmentsForRider(rider.riderId);
+    const deliveries = await Promise.all((await listDeliveries({ riderId: rider.riderId })).map(async (d) => ({
       ...riderDelivery(d),
-      history: getDeliveryHistory(d.id),
-    }));
-    const settings = getPlatformSettings();
-    const notifications = getNotificationsForUser(req.auth!.userId);
+      history: await getDeliveryHistory(d.id),
+    })));
+    const settings = await getPlatformSettings();
+    const notifications = await getNotificationsForUser(req.auth!.userId);
     res.json({ rider, assignments, deliveries, settings, notifications });
-  });
+  }));
 
   // Rider: Toggle Online/Offline (must have verification tick enabled by Admin to go online)
-  app.patch('/api/rider/availability', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
-    const rider = getRiderByProfileId(req.auth!.userId);
+  app.patch('/api/rider/availability', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res) => {
+    const rider = await getRiderByProfileId(req.auth!.userId);
     if (!rider) {
       res.status(404).json({ error: 'Rider not found.' });
       return;
@@ -1208,16 +1208,16 @@ async function startServer() {
       });
       return;
     }
-    db.prepare('UPDATE riders SET is_online = ? WHERE id = ?').run(isOnline ? 1 : 0, rider.riderId);
-    const updated = getRiderByProfileId(req.auth!.userId)!;
-    broadcastWsEvent('rider:availability', updated);
-    if (isOnline) dispatchWaitingDeliveries();
+    await db.prepare('UPDATE riders SET is_online = ? WHERE id = ?').run(isOnline ? 1 : 0, rider.riderId);
+    const updated = (await getRiderByProfileId(req.auth!.userId))!;
+    await broadcastWsEvent('rider:availability', updated);
+    if (isOnline) await dispatchWaitingDeliveries();
     res.json({ rider: updated });
-  });
+  }));
 
   // Rider: Update live GPS location
-  app.post('/api/rider/location', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
-    const rider = getRiderByProfileId(req.auth!.userId);
+  app.post('/api/rider/location', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res) => {
+    const rider = await getRiderByProfileId(req.auth!.userId);
     if (!rider) {
       res.status(404).json({ error: 'Rider not found.' });
       return;
@@ -1229,32 +1229,32 @@ async function startServer() {
       return;
     }
     const now = new Date().toISOString();
-    db.prepare(
+    await db.prepare(
       'UPDATE riders SET current_lat = ?, current_lng = ?, last_location_at = ? WHERE id = ?'
     ).run(lat, lng, now, rider.riderId);
-    db.prepare(
+    await db.prepare(
       'INSERT INTO rider_locations (id, rider_id, lat, lng, recorded_at) VALUES (?, ?, ?, ?, ?)'
     ).run(`loc-${crypto.randomUUID().slice(0, 8)}`, rider.riderId, lat, lng, now);
 
-    const updated = getRiderByProfileId(req.auth!.userId)!;
-    broadcastWsEvent('rider:location', {
+    const updated = (await getRiderByProfileId(req.auth!.userId))!;
+    await broadcastWsEvent('rider:location', {
       riderId: updated.riderId,
       lat: updated.currentLat,
       lng: updated.currentLng,
       lastLocationAt: now,
     });
-    dispatchWaitingDeliveries();
+    await dispatchWaitingDeliveries();
     res.json({ rider: updated });
-  });
+  }));
 
   // Rider: Accept or Reject an assignment offer
-  app.post('/api/rider/assignments/:id/respond', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
-    const rider = getRiderByProfileId(req.auth!.userId);
+  app.post('/api/rider/assignments/:id/respond', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res) => {
+    const rider = await getRiderByProfileId(req.auth!.userId);
     if (!rider) {
       res.status(404).json({ error: 'Rider not found.' });
       return;
     }
-    const assignment = db
+    const assignment = await db
       .prepare('SELECT * FROM delivery_assignments WHERE id = ? AND rider_id = ?')
       .get(req.params.id, rider.riderId) as any;
 
@@ -1267,7 +1267,7 @@ async function startServer() {
       return;
     }
 
-    const delivery = getDeliveryById(assignment.delivery_id);
+    const delivery = await getDeliveryById(assignment.delivery_id);
     if (Date.parse(assignment.expires_at) <= Date.now() || delivery?.status !== 'assigned' || delivery.assignedRiderId !== rider.riderId) {
       res.status(409).json({ error: 'This offer is no longer active.' });
       return;
@@ -1287,13 +1287,13 @@ async function startServer() {
     const now = new Date().toISOString();
 
     if (action === 'accept') {
-      db.prepare(
+      await db.prepare(
         `UPDATE delivery_assignments SET status = 'accepted', responded_at = ? WHERE id = ?`
       ).run(now, assignment.id);
-      db.prepare(
+      await db.prepare(
         `UPDATE delivery_requests SET status = 'accepted', assigned_rider_id = ?, updated_at = ? WHERE id = ?`
       ).run(rider.riderId, now, assignment.delivery_id);
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
         VALUES (?, ?, 'accepted', ?, 'rider', ?)
       `).run(
@@ -1303,31 +1303,31 @@ async function startServer() {
         now
       );
 
-      const updated = getDeliveryById(assignment.delivery_id)!;
-      const custRow = db
+      const updated = (await getDeliveryById(assignment.delivery_id))!;
+      const custRow = await db
         .prepare('SELECT profile_id FROM customers WHERE id = ?')
         .get(updated.customerId) as { profile_id: string } | undefined;
       if (custRow) {
-        const notif = createNotification(
+        const notif = await createNotification(
           custRow.profile_id,
           'Rider Assigned',
           `${rider.fullName} (${rider.vehicleType}) accepted parcel ${updated.trackingCode} and is heading for pickup.`,
           updated.id
         );
-        broadcastWsEvent('notification:created', notif);
+        await broadcastWsEvent('notification:created', notif);
       }
 
-      broadcastWsEvent('assignment:updated', { id: assignment.id, status: 'accepted' });
-      broadcastWsEvent('delivery:updated', updated);
+      await broadcastWsEvent('assignment:updated', { id: assignment.id, status: 'accepted' });
+      await broadcastWsEvent('delivery:updated', updated);
       res.json({ ok: true, delivery: riderDelivery(updated) });
       return;
     }
 
     // Rejected -> automatically cascade to next eligible rider!
-    db.prepare(
+    await db.prepare(
       `UPDATE delivery_assignments SET status = 'rejected', responded_at = ? WHERE id = ?`
     ).run(now, assignment.id);
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'pending_dispatch', ?, 'rider', ?)
     `).run(
@@ -1336,16 +1336,16 @@ async function startServer() {
       `${rider.fullName} declined the offer. Re-running smart dispatch for next rider.`,
       now
     );
-    broadcastWsEvent('assignment:updated', { id: assignment.id, status: 'rejected' });
-    releaseOffer(assignment.delivery_id, rider.riderId);
-    dispatchWaitingDeliveries();
-    res.json({ ok: true, nextDispatch: { offered: getDeliveryById(assignment.delivery_id)?.status === 'assigned' } });
-  });
+    await broadcastWsEvent('assignment:updated', { id: assignment.id, status: 'rejected' });
+    await releaseOffer(assignment.delivery_id, rider.riderId);
+    await dispatchWaitingDeliveries();
+    res.json({ ok: true, nextDispatch: { offered: (await getDeliveryById(assignment.delivery_id))?.status === 'assigned' } });
+  }));
 
   // Rider: Advance delivery status
-  app.patch('/api/rider/deliveries/:id/status', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
-    const rider = getRiderByProfileId(req.auth!.userId);
-    const delivery = getDeliveryById(req.params.id);
+  app.patch('/api/rider/deliveries/:id/status', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res) => {
+    const rider = await getRiderByProfileId(req.auth!.userId);
+    const delivery = await getDeliveryById(req.params.id);
     if (!rider || !delivery || delivery.assignedRiderId !== rider.riderId) {
       res.status(404).json({ error: 'Assigned delivery not found.' });
       return;
@@ -1369,7 +1369,7 @@ async function startServer() {
       return;
     }
 
-    if (nextStatus === 'delivered' && !verifyHandoffOtp(res, delivery, req.body?.otp)) return;
+    if (nextStatus === 'delivered' && !await verifyHandoffOtp(res, delivery, req.body?.otp)) return;
 
     const now = new Date().toISOString();
     const note =
@@ -1379,27 +1379,27 @@ async function startServer() {
         : `Rider updated parcel status to ${nextStatus.replace(/_/g, ' ')}.`);
 
     if (nextStatus === 'delivered') {
-      db.prepare(
+      await db.prepare(
         'UPDATE delivery_requests SET status = ?, otp_verified = 1, updated_at = ? WHERE id = ?'
       ).run(nextStatus, now, delivery.id);
     } else {
-      db.prepare('UPDATE delivery_requests SET status = ?, updated_at = ? WHERE id = ?').run(
+      await db.prepare('UPDATE delivery_requests SET status = ?, updated_at = ? WHERE id = ?').run(
         nextStatus,
         now,
         delivery.id
       );
     }
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, ?, ?, 'rider', ?)
     `).run(`hist-${crypto.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
 
     if (nextStatus === 'delivered') {
-      db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
-      const payment = db
+      await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
+      const payment = await db
         .prepare('SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?')
         .get(delivery.id) as { rider_payout_ngn: number } | undefined;
-      db.prepare(`
+      await db.prepare(`
         UPDATE riders
         SET completed_deliveries_count = completed_deliveries_count + 1,
             total_earnings_ngn = total_earnings_ngn + ?
@@ -1407,7 +1407,7 @@ async function startServer() {
       `).run(payment?.rider_payout_ngn || 0, rider.riderId);
     }
 
-    const custRow = db
+    const custRow = await db
       .prepare('SELECT profile_id FROM customers WHERE id = ?')
       .get(delivery.customerId) as { profile_id: string } | undefined;
     if (custRow) {
@@ -1419,30 +1419,30 @@ async function startServer() {
       } else if (nextStatus === 'delivered') {
         notifTitle = 'Parcel Delivered';
       }
-      const notif = createNotification(
+      const notif = await createNotification(
         custRow.profile_id,
         notifTitle,
         `${delivery.trackingCode}: ${note}`,
         delivery.id
       );
-      broadcastWsEvent('notification:created', notif);
+      await broadcastWsEvent('notification:created', notif);
     }
 
-    const updated = getDeliveryById(delivery.id)!;
-    broadcastWsEvent('delivery:updated', updated);
-    if (nextStatus === 'delivered') dispatchWaitingDeliveries();
-    res.json({ delivery: riderDelivery(updated), history: getDeliveryHistory(delivery.id) });
-  });
+    const updated = (await getDeliveryById(delivery.id))!;
+    await broadcastWsEvent('delivery:updated', updated);
+    if (nextStatus === 'delivered') await dispatchWaitingDeliveries();
+    res.json({ delivery: riderDelivery(updated), history: await getDeliveryHistory(delivery.id) });
+  }));
 
   // Rider: Confirm Cash on Delivery collection
-  app.post('/api/rider/deliveries/:id/collect-cash', authenticate, requireRole('rider'), (req: AuthedRequest, res) => {
+  app.post('/api/rider/deliveries/:id/collect-cash', authenticate, requireRole('rider'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
-      const rider = getRiderByProfileId(req.auth!.userId);
+      const rider = await getRiderByProfileId(req.auth!.userId);
       if (!rider) {
         res.status(404).json({ error: 'Rider profile not found.' });
         return;
       }
-      const updated = confirmRiderCashCollection({
+      const updated = await confirmRiderCashCollection({
         deliveryId: req.params.id,
         riderId: rider.riderId,
         collectedAmountNgn:
@@ -1453,19 +1453,19 @@ async function startServer() {
     } catch (err) {
       sendPaymentError(res, err);
     }
-  });
+  }));
 
   // Admin: Full operational overview
-  app.get('/api/admin/overview', authenticate, requireRole('admin'), (_req, res) => {
-    const deliveries = listDeliveries().map((d) => ({
+  app.get('/api/admin/overview', authenticate, requireRole('admin'), asyncRoute(async (_req, res) => {
+    const deliveries = await Promise.all((await listDeliveries()).map(async (d) => ({
       ...d,
-      history: getDeliveryHistory(d.id),
-    }));
-    const riders = getAllRiders();
-    const customers = getAllCustomers();
-    const payments = getAllPayments();
-    const complaints = getAllComplaints();
-    const settings = getPlatformSettings();
+      history: await getDeliveryHistory(d.id),
+    })));
+    const riders = await getAllRiders();
+    const customers = await getAllCustomers();
+    const payments = await getAllPayments();
+    const complaints = await getAllComplaints();
+    const settings = await getPlatformSettings();
 
     res.json({
       deliveries,
@@ -1475,17 +1475,17 @@ async function startServer() {
       complaints,
       settings,
     });
-  });
+  }));
 
   // Admin: Manually assign or reassign rider
-  app.post('/api/admin/deliveries/:id/assign', authenticate, requireRole('admin'), (req, res) => {
+  app.post('/api/admin/deliveries/:id/assign', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const { riderId } = req.body || {};
-    const delivery = getDeliveryById(req.params.id);
+    const delivery = await getDeliveryById(req.params.id);
     if (!delivery) {
       res.status(404).json({ error: 'Delivery not found.' });
       return;
     }
-    const rider = getAllRiders().find((r) => r.riderId === riderId);
+    const rider = (await getAllRiders()).find((r) => r.riderId === riderId);
     if (!rider) {
       res.status(404).json({ error: 'Rider not found.' });
       return;
@@ -1500,29 +1500,29 @@ async function startServer() {
       return;
     }
     const alreadyReserved = delivery.assignedRiderId === rider.riderId ? 1 : 0;
-    if (rider.activeParcelsCount - alreadyReserved >= getPlatformSettings().maxActiveParcelsPerRider) {
+    if (rider.activeParcelsCount - alreadyReserved >= (await getPlatformSettings()).maxActiveParcelsPerRider) {
       res.status(409).json({ error: 'This rider has reached the active parcel limit.' });
       return;
     }
     const now = new Date().toISOString();
-    db.prepare(
+    await db.prepare(
       `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
     ).run(now, delivery.id);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_assignments (
         id, delivery_id, rider_id, status, score, distance_to_pickup_km,
         route_compatibility_score, offered_at, expires_at, responded_at
       ) VALUES (?, ?, ?, 'accepted', 0, 0, 1.0, ?, ?, ?)
     `).run(`asg-${crypto.randomUUID().slice(0, 8)}`, delivery.id, rider.riderId, now, now, now);
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE delivery_requests
       SET assigned_rider_id = ?, status = 'accepted', updated_at = ?
       WHERE id = ?
     `).run(rider.riderId, now, delivery.id);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'accepted', ?, 'admin', ?)
     `).run(
@@ -1532,36 +1532,36 @@ async function startServer() {
       now
     );
 
-    const custRow = db
+    const custRow = await db
       .prepare('SELECT profile_id FROM customers WHERE id = ?')
       .get(delivery.customerId) as { profile_id: string } | undefined;
     if (custRow) {
-      const cNotif = createNotification(
+      const cNotif = await createNotification(
         custRow.profile_id,
         'Rider Assigned',
         `${rider.fullName} (${rider.vehicleType}) has been assigned to parcel ${delivery.trackingCode}.`,
         delivery.id
       );
-      broadcastWsEvent('notification:created', cNotif);
+      await broadcastWsEvent('notification:created', cNotif);
     }
 
-    const rNotif = createNotification(
+    const rNotif = await createNotification(
       rider.id,
       'New Delivery Request Available',
       `Admin assigned ${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} → ${delivery.destinationAddress}, ${delivery.destinationState}.`,
       delivery.id
     );
-    broadcastWsEvent('notification:created', rNotif);
+    await broadcastWsEvent('notification:created', rNotif);
 
-    const updated = getDeliveryById(delivery.id)!;
-    broadcastWsEvent('delivery:updated', updated);
-    dispatchWaitingDeliveries();
+    const updated = (await getDeliveryById(delivery.id))!;
+    await broadcastWsEvent('delivery:updated', updated);
+    await dispatchWaitingDeliveries();
     res.json({ delivery: updated });
-  });
+  }));
 
   // Admin: Override or update delivery status for operational resolution
   app.patch('/api/admin/deliveries/:id/status', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
-    const delivery = getDeliveryById(req.params.id);
+    const delivery = await getDeliveryById(req.params.id);
     if (!delivery) {
       res.status(404).json({ error: 'Delivery not found.' });
       return;
@@ -1600,8 +1600,8 @@ async function startServer() {
         : `SAQO Operations updated status to ${nextStatus.replace(/_/g, ' ')}.`;
 
     const wasDelivered = delivery.status === 'delivered';
-    db.prepare(`UPDATE delivery_requests
-      SET status = ?, updated_at = ?, assigned_rider_id = CASE WHEN ? THEN NULL ELSE assigned_rider_id END
+    await db.prepare(`UPDATE delivery_requests
+      SET status = ?, updated_at = ?, assigned_rider_id = CASE WHEN ? = 1 THEN NULL ELSE assigned_rider_id END
       WHERE id = ?`).run(
       nextStatus,
       now,
@@ -1609,25 +1609,25 @@ async function startServer() {
       delivery.id
     );
     if (requeue || nextStatus !== 'cancelled') {
-      const replaced = db.prepare(`
+      const replaced = await db.prepare(`
         UPDATE delivery_assignments SET status = ?, responded_at = ?
-        WHERE delivery_id = ? AND (status = 'offered' OR (? AND status = 'accepted'))
+        WHERE delivery_id = ? AND (status = 'offered' OR (? = 1 AND status = 'accepted'))
         RETURNING id
       `).all(requeue ? 'reassigned' : 'accepted', now, delivery.id, requeue ? 1 : 0) as Array<{ id: string }>;
       for (const assignment of replaced) clearOfferTimer(assignment.id);
     }
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, ?, ?, 'admin', ?)
     `).run(`hist-${crypto.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
 
     if (nextStatus === 'delivered' && !wasDelivered) {
-      db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
+      await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
       if (delivery.assignedRiderId) {
-        const payment = db
+        const payment = await db
           .prepare('SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?')
           .get(delivery.id) as { rider_payout_ngn: number } | undefined;
-        db.prepare(`
+        await db.prepare(`
           UPDATE riders
           SET completed_deliveries_count = completed_deliveries_count + 1,
               total_earnings_ngn = total_earnings_ngn + ?
@@ -1635,11 +1635,11 @@ async function startServer() {
         `).run(payment?.rider_payout_ngn || 0, delivery.assignedRiderId);
       }
     } else if (nextStatus === 'cancelled') {
-      const offered = db
+      const offered = await db
         .prepare(`SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'`)
         .all(delivery.id) as Array<{ id: string }>;
       offered.forEach((asg) => clearOfferTimer(asg.id));
-      db.prepare(
+      await db.prepare(
         `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
       ).run(now, delivery.id);
       if (delivery.paymentMethod === 'wallet' && delivery.paymentStatus === 'paid') {
@@ -1655,33 +1655,33 @@ async function startServer() {
           // Non-fatal fallback
         }
       } else if (delivery.paymentStatus !== 'paid' && delivery.paymentStatus !== 'collected_by_rider') {
-        cancelDeliveryPayments(delivery.id, {
+        await cancelDeliveryPayments(delivery.id, {
           reason: `Delivery cancelled by operations (${delivery.trackingCode})`,
         });
       }
     }
 
-    const custRow = db
+    const custRow = await db
       .prepare('SELECT profile_id FROM customers WHERE id = ?')
       .get(delivery.customerId) as { profile_id: string } | undefined;
     if (custRow) {
-      const notif = createNotification(
+      const notif = await createNotification(
         custRow.profile_id,
         `${delivery.trackingCode}: Status Updated`,
         note,
         delivery.id
       );
-      broadcastWsEvent('notification:created', notif);
+      await broadcastWsEvent('notification:created', notif);
     }
 
-    const updated = { ...getDeliveryById(delivery.id)!, history: getDeliveryHistory(delivery.id) };
-    broadcastWsEvent('delivery:updated', updated);
-    if (requeue || nextStatus === 'delivered' || nextStatus === 'cancelled') dispatchWaitingDeliveries();
+    const updated = { ...(await getDeliveryById(delivery.id))!, history: await getDeliveryHistory(delivery.id) };
+    await broadcastWsEvent('delivery:updated', updated);
+    if (requeue || nextStatus === 'delivered' || nextStatus === 'cancelled') await dispatchWaitingDeliveries();
     res.json({ delivery: updated });
   }));
 
   // Admin: Issue a new Rider account
-  app.post('/api/admin/riders', authenticate, requireRole('admin'), (req, res) => {
+  app.post('/api/admin/riders', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const {
       fullName,
       phone,
@@ -1709,7 +1709,7 @@ async function startServer() {
       return;
     }
     const cleanEmail = String(email).trim().toLowerCase();
-    const existing = db.prepare('SELECT id FROM profiles WHERE LOWER(email) = ?').get(cleanEmail);
+    const existing = await db.prepare('SELECT id FROM profiles WHERE LOWER(email) = ?').get(cleanEmail);
     if (existing) {
       res.status(409).json({ error: 'An account with this email already exists.' });
       return;
@@ -1725,12 +1725,12 @@ async function startServer() {
     const riderId = `rider-${crypto.randomUUID().slice(0, 8)}`;
     const passHash = hashPassword(String(password));
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
       VALUES (?, ?, ?, ?, ?, 'rider', 'active', ?)
     `).run(profileId, cleanEmail, passHash, String(fullName).trim(), String(phone).trim(), now);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO riders (
         id, profile_id, vehicle_type, plate_number, home_state, verification_status,
         is_online, current_lat, current_lng, last_location_at
@@ -1747,14 +1747,14 @@ async function startServer() {
       now
     );
 
-    const created = getRiderByProfileId(profileId)!;
-    broadcastWsEvent('rider:availability', created);
-    res.status(201).json({ rider: created, riders: getAllRiders() });
-  });
+    const created = (await getRiderByProfileId(profileId))!;
+    await broadcastWsEvent('rider:availability', created);
+    res.status(201).json({ rider: created, riders: await getAllRiders() });
+  }));
 
   // Admin: Update rider vehicle/state/contact info
-  app.patch('/api/admin/riders/:id', authenticate, requireRole('admin'), (req, res) => {
-    const existing = getAllRiders().find((r) => r.riderId === req.params.id);
+  app.patch('/api/admin/riders/:id', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
+    const existing = (await getAllRiders()).find((r) => r.riderId === req.params.id);
     if (!existing) {
       res.status(404).json({ error: 'Rider not found.' });
       return;
@@ -1771,43 +1771,43 @@ async function startServer() {
     const nextName = fullName ? String(fullName).trim() : existing.fullName;
     const nextPhone = phone ? String(phone).trim() : existing.phone;
 
-    db.prepare(`UPDATE profiles SET full_name = ?, phone = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE profiles SET full_name = ?, phone = ? WHERE id = ?`).run(
       nextName,
       nextPhone,
       existing.id
     );
-    db.prepare(
+    await db.prepare(
       `UPDATE riders SET vehicle_type = ?, plate_number = ?, home_state = ? WHERE id = ?`
     ).run(nextVehicle, nextPlate, nextState, existing.riderId);
 
-    const updated = getRiderByProfileId(existing.id)!;
-    broadcastWsEvent('rider:availability', updated);
-    res.json({ rider: updated, riders: getAllRiders() });
-  });
+    const updated = (await getRiderByProfileId(existing.id))!;
+    await broadcastWsEvent('rider:availability', updated);
+    res.json({ rider: updated, riders: await getAllRiders() });
+  }));
 
   // Admin: Enable or revoke rider verification tick
-  app.patch('/api/admin/riders/:id/verify', authenticate, requireRole('admin'), (req, res) => {
+  app.patch('/api/admin/riders/:id/verify', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const status = req.body?.verificationStatus;
     if (!['verified', 'pending', 'rejected'].includes(status)) {
       res.status(400).json({ error: 'Invalid verification status.' });
       return;
     }
-    const rider = getAllRiders().find((r) => r.riderId === req.params.id);
+    const rider = (await getAllRiders()).find((r) => r.riderId === req.params.id);
     if (!rider) {
       res.status(404).json({ error: 'Rider not found.' });
       return;
     }
     if (status === 'verified') {
-      db.prepare('UPDATE riders SET verification_status = ? WHERE id = ?').run(status, req.params.id);
+      await db.prepare('UPDATE riders SET verification_status = ? WHERE id = ?').run(status, req.params.id);
     } else {
-      db.prepare('UPDATE riders SET verification_status = ?, is_online = 0 WHERE id = ?').run(
+      await db.prepare('UPDATE riders SET verification_status = ?, is_online = 0 WHERE id = ?').run(
         status,
         req.params.id
       );
     }
 
-    const updatedRider = getRiderByProfileId(rider.id)!;
-    const notif = createNotification(
+    const updatedRider = (await getRiderByProfileId(rider.id))!;
+    const notif = await createNotification(
       rider.id,
       status === 'verified' ? 'Verification Tick Enabled' : 'Verification Status Updated',
       status === 'verified'
@@ -1815,33 +1815,33 @@ async function startServer() {
         : `Your rider verification status is now set to ${status}. Contact SAQO Operations for details.`,
       null
     );
-    broadcastWsEvent('notification:created', notif);
-    broadcastWsEvent('rider:availability', updatedRider);
-    res.json({ rider: updatedRider, riders: getAllRiders() });
-  });
+    await broadcastWsEvent('notification:created', notif);
+    await broadcastWsEvent('rider:availability', updatedRider);
+    res.json({ rider: updatedRider, riders: await getAllRiders() });
+  }));
 
   // Admin: Suspend or activate account (customer or rider)
-  app.patch('/api/admin/profiles/:id/status', authenticate, requireRole('admin'), (req, res) => {
+  app.patch('/api/admin/profiles/:id/status', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const status = req.body?.accountStatus;
     if (!['active', 'suspended'].includes(status)) {
       res.status(400).json({ error: 'Invalid account status.' });
       return;
     }
-    db.prepare('UPDATE profiles SET account_status = ? WHERE id = ?').run(status, req.params.id);
+    await db.prepare('UPDATE profiles SET account_status = ? WHERE id = ?').run(status, req.params.id);
     if (status === 'suspended') {
-      db.prepare('UPDATE riders SET is_online = 0 WHERE profile_id = ?').run(req.params.id);
+      await db.prepare('UPDATE riders SET is_online = 0 WHERE profile_id = ?').run(req.params.id);
     }
     res.json({ ok: true });
-  });
+  }));
 
   // Admin: Reset password for a rider or customer account
-  app.patch('/api/admin/profiles/:id/reset-password', authenticate, requireRole('admin'), (req, res) => {
+  app.patch('/api/admin/profiles/:id/reset-password', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
     if (newPassword.length < 6) {
       res.status(400).json({ error: 'New password must be at least 6 characters.' });
       return;
     }
-    const target = getProfileById(req.params.id);
+    const target = await getProfileById(req.params.id);
     if (!target) {
       res.status(404).json({ error: 'Account not found.' });
       return;
@@ -1850,16 +1850,16 @@ async function startServer() {
       res.status(403).json({ error: 'Admin password cannot be reset via this endpoint.' });
       return;
     }
-    db.prepare('UPDATE profiles SET password_hash = ? WHERE id = ?').run(
+    await db.prepare('UPDATE profiles SET password_hash = ? WHERE id = ?').run(
       hashPassword(newPassword),
       target.id
     );
     res.json({ ok: true });
-  });
+  }));
 
   // Admin: Update platform settings
-  app.patch('/api/admin/settings', authenticate, requireRole('admin'), (req, res) => {
-    const current = getPlatformSettings();
+  app.patch('/api/admin/settings', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
+    const current = await getPlatformSettings();
     const b = req.body || {};
     const maxActiveParcelsPerRider = Number(b.maxActiveParcelsPerRider ?? current.maxActiveParcelsPerRider);
     if (!Number.isSafeInteger(maxActiveParcelsPerRider) || maxActiveParcelsPerRider < 1) {
@@ -1879,7 +1879,7 @@ async function startServer() {
       whatsappSupportNumber: String(b.whatsappSupportNumber ?? current.whatsappSupportNumber).replace(/[^\d]/g, ''),
     };
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE platform_settings SET
         max_active_parcels_per_rider = ?,
         search_radius_km = ?,
@@ -1903,14 +1903,14 @@ async function startServer() {
       Number(next.showDeliveryStateSelectors)
     );
 
-    broadcastWsEvent('settings:updated', next);
-    dispatchWaitingDeliveries();
+    await broadcastWsEvent('settings:updated', next);
+    await dispatchWaitingDeliveries();
     res.json({ settings: next });
-  });
+  }));
 
   // Admin: Payments & Wallet Management Overview (metrics + paginated transactions + wallets + cash collections + refunds + webhooks + audit logs)
-  app.get('/api/admin/payments/overview', authenticate, requireRole('admin'), (req, res) => {
-    const overview = getAdminPaymentsOverview({
+  app.get('/api/admin/payments/overview', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
+    const overview = await getAdminPaymentsOverview({
       search: typeof req.query.search === 'string' ? req.query.search : undefined,
       method: typeof req.query.method === 'string' ? req.query.method : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
@@ -1920,12 +1920,12 @@ async function startServer() {
       page: req.query.page ? Number(req.query.page) : 1,
       pageSize: req.query.pageSize ? Number(req.query.pageSize) : 15,
     });
-    res.json({ ...overview, auditLogs: getWalletAuditLogs(60) });
-  });
+    res.json({ ...overview, auditLogs: await getWalletAuditLogs(60) });
+  }));
 
   // Admin: Export filtered payment transactions as CSV
-  app.get('/api/admin/payments/export', authenticate, requireRole('admin'), (req, res) => {
-    const csv = exportPaymentsCsv({
+  app.get('/api/admin/payments/export', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
+    const csv = await exportPaymentsCsv({
       search: typeof req.query.search === 'string' ? req.query.search : undefined,
       method: typeof req.query.method === 'string' ? req.query.method : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
@@ -1936,34 +1936,34 @@ async function startServer() {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="saqo-payments-${new Date().toISOString().slice(0, 10)}.csv"`);
     res.send(csv);
-  });
+  }));
 
   // Admin: Inspect individual customer's wallet balance & ledger
-  app.get('/api/admin/customers/:profileId/wallet', authenticate, requireRole('admin'), (req, res) => {
+  app.get('/api/admin/customers/:profileId/wallet', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     try {
-      const profile = getProfileById(req.params.profileId);
+      const profile = await getProfileById(req.params.profileId);
       if (!profile) {
         res.status(404).json({ error: 'Customer profile not found.' });
         return;
       }
-      const summary = getCustomerWalletSummary(profile.id);
-      const auditLogs = getWalletAuditLogs(100).filter((l) => l.userId === profile.id);
+      const summary = await getCustomerWalletSummary(profile.id);
+      const auditLogs = (await getWalletAuditLogs(100)).filter((l) => l.userId === profile.id);
       res.json({ profile, ...summary, auditLogs });
     } catch (err) {
       sendPaymentError(res, err);
     }
-  });
+  }));
 
   // Admin: Adjust wallet balance with mandatory reason & audit trail
-  app.post('/api/admin/wallets/:walletId/adjust', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+  app.post('/api/admin/wallets/:walletId/adjust', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
       const { direction, amountNgn, reason, idempotencyKey } = req.body || {};
       if (!['credit', 'debit'].includes(direction)) {
         res.status(400).json({ error: 'Direction must be credit or debit.' });
         return;
       }
-      const actor = getProfileById(req.auth!.userId);
-      const result = adjustWalletAtomic({
+      const actor = await getProfileById(req.auth!.userId);
+      const result = await adjustWalletAtomic({
         walletId: req.params.walletId,
         direction,
         amountNgn: Number(amountNgn),
@@ -1976,17 +1976,17 @@ async function startServer() {
     } catch (err) {
       sendPaymentError(res, err);
     }
-  });
+  }));
 
   // Admin: Reconcile or dispute cash on delivery / bank transfer collection
-  app.post('/api/admin/cash-collections/:id/reconcile', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+  app.post('/api/admin/cash-collections/:id/reconcile', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
       const { action, collectedAmountNgn, notes } = req.body || {};
       if (!['reconcile', 'dispute'].includes(action)) {
         res.status(400).json({ error: 'Action must be reconcile or dispute.' });
         return;
       }
-      const updated = reconcileCashOrBankCollection({
+      const updated = await reconcileCashOrBankCollection({
         collectionId: req.params.id,
         action,
         adminId: req.auth!.userId,
@@ -1997,12 +1997,12 @@ async function startServer() {
     } catch (err) {
       sendPaymentError(res, err);
     }
-  });
+  }));
 
   // Admin: Manually trigger server-side Flutterwave verification for a pending payment
   app.post('/api/admin/payments/:id/verify', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
-      const row = db
+      const row = await db
         .prepare('SELECT id, reference, provider_tx_id FROM payment_transactions WHERE id = ? OR reference = ?')
         .get(req.params.id, req.params.id) as { id: string; reference: string; provider_tx_id: string | null } | undefined;
       if (!row) {
@@ -2052,18 +2052,18 @@ async function startServer() {
   }));
 
   // Admin: View Payment Gateway (Flutterwave & Bank Account) Settings (secrets strictly masked!)
-  app.get('/api/admin/gateway-settings', authenticate, requireRole('admin'), (req, res) => {
+  app.get('/api/admin/gateway-settings', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     try {
-      res.set('Cache-Control', 'no-store').json(getGatewayAdminView(getWebhookOrigin(req)));
+      res.set('Cache-Control', 'no-store').json(await getGatewayAdminView(getWebhookOrigin(req)));
     } catch (error) {
       sendPaymentError(res, error);
     }
-  });
+  }));
 
   // Admin: Update Payment Gateway Settings (secrets encrypted at rest, never logged or returned)
-  app.patch('/api/admin/gateway-settings', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+  app.patch('/api/admin/gateway-settings', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     try {
-      const updated = updateGatewaySettings(
+      const updated = await updateGatewaySettings(
         req.body || {},
         req.auth!.userId,
         getWebhookOrigin(req)
@@ -2072,35 +2072,35 @@ async function startServer() {
     } catch (err) {
       sendPaymentError(res, err);
     }
-  });
+  }));
 
   // Admin: Resolve / update complaint or suggestion ticket & notify reporter
-  app.patch('/api/admin/complaints/:id', authenticate, requireRole('admin'), (req, res) => {
+  app.patch('/api/admin/complaints/:id', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const { status, resolutionNote } = req.body || {};
     if (!['open', 'investigating', 'resolved'].includes(status)) {
       res.status(400).json({ error: 'Invalid ticket status.' });
       return;
     }
-    const existing = getAllComplaints().find((c) => c.id === req.params.id);
+    const existing = (await getAllComplaints()).find((c) => c.id === req.params.id);
     if (!existing) {
       res.status(404).json({ error: 'Ticket not found.' });
       return;
     }
-    db.prepare('UPDATE complaints SET status = ?, resolution_note = ? WHERE id = ?').run(
+    await db.prepare('UPDATE complaints SET status = ?, resolution_note = ? WHERE id = ?').run(
       status,
       resolutionNote || null,
       req.params.id
     );
-    const notif = createNotification(
+    const notif = await createNotification(
       existing.reporterId,
       `Ticket ${status === 'resolved' ? 'Resolved' : 'Updated'}`,
       `${existing.subject}: ${resolutionNote || `Status updated to ${status}.`}`,
       existing.deliveryId
     );
-    broadcastWsEvent('notification:created', notif);
-    broadcastWsEvent('complaint:updated', { id: req.params.id, status });
-    res.json({ complaints: getAllComplaints() });
-  });
+    await broadcastWsEvent('notification:created', notif);
+    await broadcastWsEvent('complaint:updated', { id: req.params.id, status });
+    res.json({ complaints: await getAllComplaints() });
+  }));
 
   // --- Live Persistent Support Chat API ---
 
@@ -2110,25 +2110,25 @@ async function startServer() {
   });
 
   // Visitor / Client: List persistent conversations
-  app.get('/api/support/conversations', (req, res) => {
-    const auth = tryAuthenticate(req);
+  app.get('/api/support/conversations', asyncRoute(async (req, res) => {
+    const auth = await tryAuthenticate(req);
     const visitorToken =
       typeof req.query.visitorToken === 'string' ? req.query.visitorToken.trim() : null;
     if (!auth && !visitorToken) {
       res.json({ conversations: [], presence: getSupportPresence() });
       return;
     }
-    const conversations = getSupportConversationsForVisitor({
+    const conversations = await getSupportConversationsForVisitor({
       visitorToken,
       userId: auth?.userId || null,
     });
     res.json({ conversations, presence: getSupportPresence() });
-  });
+  }));
 
   // Visitor / Client: Start new persistent support conversation
-  app.post('/api/support/conversations', (req, res) => {
-    const auth = tryAuthenticate(req);
-    const profile = auth ? getProfileById(auth.userId) : null;
+  app.post('/api/support/conversations', asyncRoute(async (req, res) => {
+    const auth = await tryAuthenticate(req);
+    const profile = auth ? await getProfileById(auth.userId) : null;
     const {
       visitorToken,
       visitorName,
@@ -2155,7 +2155,7 @@ async function startServer() {
       return;
     }
 
-    const created = createSupportConversation({
+    const created = await createSupportConversation({
       visitorToken: cleanToken,
       userId: profile?.id || null,
       visitorName: cleanName,
@@ -2166,22 +2166,22 @@ async function startServer() {
       senderRole: profile ? 'client' : 'visitor',
     });
 
-    broadcastWsEvent('support:conversation', created.conversation);
-    broadcastWsEvent('support:message', created.message);
+    await broadcastWsEvent('support:conversation', created.conversation);
+    await broadcastWsEvent('support:message', created.message);
     res.status(201).json({
       conversation: created.conversation,
       message: created.message,
       messages: [created.message],
       presence: getSupportPresence(),
     });
-  });
+  }));
 
   // Visitor / Client: Load conversation messages (never auto-deleted)
-  app.get('/api/support/conversations/:id/messages', (req, res) => {
-    const auth = tryAuthenticate(req);
+  app.get('/api/support/conversations/:id/messages', asyncRoute(async (req, res) => {
+    const auth = await tryAuthenticate(req);
     const visitorToken =
       typeof req.query.visitorToken === 'string' ? req.query.visitorToken.trim() : '';
-    const conv = getSupportConversationById(req.params.id);
+    const conv = await getSupportConversationById(req.params.id);
     if (!conv) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
@@ -2196,20 +2196,20 @@ async function startServer() {
     const updatedConv =
       auth?.role === 'admin'
         ? conv
-        : markSupportConversationRead(conv.id, 'visitor') || conv;
+        : await markSupportConversationRead(conv.id, 'visitor') || conv;
     res.json({
       conversation: updatedConv,
-      messages: getSupportMessages(conv.id),
+      messages: await getSupportMessages(conv.id),
       presence: getSupportPresence(),
     });
-  });
+  }));
 
   // Visitor / Client: Send message in existing conversation
-  app.post('/api/support/conversations/:id/messages', (req, res) => {
-    const auth = tryAuthenticate(req);
-    const profile = auth ? getProfileById(auth.userId) : null;
+  app.post('/api/support/conversations/:id/messages', asyncRoute(async (req, res) => {
+    const auth = await tryAuthenticate(req);
+    const profile = auth ? await getProfileById(auth.userId) : null;
     const { visitorToken, body } = req.body || {};
-    const conv = getSupportConversationById(req.params.id);
+    const conv = await getSupportConversationById(req.params.id);
     if (!conv) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
@@ -2227,26 +2227,26 @@ async function startServer() {
       return;
     }
 
-    const result = addSupportMessage({
+    const result = await addSupportMessage({
       conversationId: conv.id,
       senderRole: profile ? 'client' : 'visitor',
       senderName: profile?.fullName || conv.visitorName,
       body: cleanBody,
     });
-    broadcastWsEvent('support:message', result.message);
-    broadcastWsEvent('support:conversation', result.conversation);
+    await broadcastWsEvent('support:message', result.message);
+    await broadcastWsEvent('support:conversation', result.conversation);
     res.status(201).json({
       conversation: result.conversation,
       message: result.message,
     });
-  });
+  }));
 
   // Visitor / Client: Mark conversation read
-  app.post('/api/support/conversations/:id/read', (req, res) => {
-    const auth = tryAuthenticate(req);
+  app.post('/api/support/conversations/:id/read', asyncRoute(async (req, res) => {
+    const auth = await tryAuthenticate(req);
     const visitorToken =
       typeof req.body?.visitorToken === 'string' ? req.body.visitorToken.trim() : '';
-    const conv = getSupportConversationById(req.params.id);
+    const conv = await getSupportConversationById(req.params.id);
     if (!conv) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
@@ -2258,23 +2258,23 @@ async function startServer() {
       res.status(403).json({ error: 'Access denied.' });
       return;
     }
-    const updated = markSupportConversationRead(conv.id, 'visitor');
+    const updated = await markSupportConversationRead(conv.id, 'visitor');
     if (updated) {
-      broadcastWsEvent('support:conversation', updated);
+      await broadcastWsEvent('support:conversation', updated);
     }
     res.json({ conversation: updated });
-  });
+  }));
 
   // Visitor / Client: Resolve or reopen own conversation
-  app.patch('/api/support/conversations/:id/status', (req, res) => {
-    const auth = tryAuthenticate(req);
-    const profile = auth ? getProfileById(auth.userId) : null;
+  app.patch('/api/support/conversations/:id/status', asyncRoute(async (req, res) => {
+    const auth = await tryAuthenticate(req);
+    const profile = auth ? await getProfileById(auth.userId) : null;
     const { visitorToken, status } = req.body || {};
     if (!['open', 'resolved'].includes(status)) {
       res.status(400).json({ error: 'Invalid status.' });
       return;
     }
-    const conv = getSupportConversationById(req.params.id);
+    const conv = await getSupportConversationById(req.params.id);
     if (!conv) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
@@ -2286,54 +2286,54 @@ async function startServer() {
       res.status(403).json({ error: 'Access denied.' });
       return;
     }
-    const updated = updateSupportConversationStatus(
+    const updated = await updateSupportConversationStatus(
       conv.id,
       status as SupportConversationStatus,
       profile?.fullName || conv.visitorName
     );
     if (updated) {
-      broadcastWsEvent('support:message', updated.systemMessage);
-      broadcastWsEvent('support:conversation', updated.conversation);
+      await broadcastWsEvent('support:message', updated.systemMessage);
+      await broadcastWsEvent('support:conversation', updated.conversation);
     }
     res.json(updated);
-  });
+  }));
 
   // Admin: List all support conversations + presence state
-  app.get('/api/admin/support/conversations', authenticate, requireRole('admin'), (_req, res) => {
+  app.get('/api/admin/support/conversations', authenticate, requireRole('admin'), asyncRoute(async (_req, res) => {
     const accepting = isAdminChatAvailableFlag();
     res.json({
-      conversations: getAllSupportConversations(),
+      conversations: await getAllSupportConversations(),
       presence: getSupportPresence(),
       adminAcceptingChats: accepting,
     });
-  });
+  }));
 
   // Admin: Toggle online/away availability for live support chat
-  app.post('/api/admin/support/presence', authenticate, requireRole('admin'), (req, res) => {
+  app.post('/api/admin/support/presence', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
     const available = Boolean(req.body?.available);
-    const presence = setAdminChatAvailability(available);
+    const presence = await setAdminChatAvailability(available);
     res.json({ presence, adminAcceptingChats: isAdminChatAvailableFlag() });
-  });
+  }));
 
   // Admin: Load messages for a conversation & mark read
-  app.get('/api/admin/support/conversations/:id/messages', authenticate, requireRole('admin'), (req, res) => {
-    const conv = getSupportConversationById(req.params.id);
+  app.get('/api/admin/support/conversations/:id/messages', authenticate, requireRole('admin'), asyncRoute(async (req, res) => {
+    const conv = await getSupportConversationById(req.params.id);
     if (!conv) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
     }
-    const updatedConv = markSupportConversationRead(conv.id, 'admin') || conv;
-    broadcastWsEvent('support:conversation', updatedConv);
+    const updatedConv = await markSupportConversationRead(conv.id, 'admin') || conv;
+    await broadcastWsEvent('support:conversation', updatedConv);
     res.json({
       conversation: updatedConv,
-      messages: getSupportMessages(conv.id),
+      messages: await getSupportMessages(conv.id),
     });
-  });
+  }));
 
   // Admin: Send reply message in a support conversation
   app.post('/api/admin/support/conversations/:id/messages', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
-    const adminProfile = getProfileById(req.auth!.userId);
-    const conv = getSupportConversationById(req.params.id);
+    const adminProfile = await getProfileById(req.auth!.userId);
+    const conv = await getSupportConversationById(req.params.id);
     if (!conv) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
@@ -2349,7 +2349,7 @@ async function startServer() {
       res.status(502).json({ error: error instanceof Error ? error.message : 'WhatsApp reply could not be sent.' });
       return;
     }
-    const result = addSupportMessage({
+    const result = await addSupportMessage({
       conversationId: conv.id,
       senderRole: 'admin',
       senderName: adminProfile?.fullName || 'SAQO Support Agent',
@@ -2357,28 +2357,28 @@ async function startServer() {
       assignedAdminId: req.auth!.userId,
     });
     if (conv.userId) {
-      const notif = createNotification(
+      const notif = await createNotification(
         conv.userId,
         'New Support Reply',
         `SAQO Support: ${cleanBody.slice(0, 120)}`,
         null
       );
-      broadcastWsEvent('notification:created', notif);
+      await broadcastWsEvent('notification:created', notif);
     }
-    broadcastWsEvent('support:message', result.message);
-    broadcastWsEvent('support:conversation', result.conversation);
+    await broadcastWsEvent('support:message', result.message);
+    await broadcastWsEvent('support:conversation', result.conversation);
     res.status(201).json(result);
   }));
 
   // Admin: Update support conversation status (open | pending | resolved | closed)
-  app.patch('/api/admin/support/conversations/:id', authenticate, requireRole('admin'), (req: AuthedRequest, res) => {
+  app.patch('/api/admin/support/conversations/:id', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res) => {
     const { status } = req.body || {};
     if (!['open', 'pending', 'resolved', 'closed'].includes(status)) {
       res.status(400).json({ error: 'Invalid conversation status.' });
       return;
     }
-    const adminProfile = getProfileById(req.auth!.userId);
-    const result = updateSupportConversationStatus(
+    const adminProfile = await getProfileById(req.auth!.userId);
+    const result = await updateSupportConversationStatus(
       req.params.id,
       status as SupportConversationStatus,
       adminProfile?.fullName || 'SAQO Support'
@@ -2387,10 +2387,10 @@ async function startServer() {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
     }
-    broadcastWsEvent('support:message', result.systemMessage);
-    broadcastWsEvent('support:conversation', result.conversation);
+    await broadcastWsEvent('support:message', result.systemMessage);
+    await broadcastWsEvent('support:conversation', result.conversation);
     res.json(result);
-  });
+  }));
 
   app.use('/api', (_req, res) => { res.status(404).json({ error: 'API route not found.' }); });
   app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
@@ -2427,8 +2427,8 @@ async function startServer() {
 
   const PORT = Number(process.env.PORT) || 3000;
   let stopDispatch = () => {};
-  server.listen(PORT, '0.0.0.0', () => {
-    stopDispatch = resumeDispatch();
+  server.listen(PORT, '0.0.0.0', async () => {
+    stopDispatch = await resumeDispatch();
     console.log(`SAQO Logistics server listening on http://localhost:${PORT}`);
   });
   if (process.env.NODE_ENV === 'production') {
@@ -2437,9 +2437,9 @@ async function startServer() {
       clearInterval(wsHeartbeat);
       for (const socket of wss.clients) socket.terminate();
       const timeout = setTimeout(() => process.exit(1), 20_000).unref();
-      server.close(() => {
+      server.close(async () => {
         clearTimeout(timeout);
-        db.close();
+        await db.close();
         process.exit(0);
       });
     };

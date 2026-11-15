@@ -83,7 +83,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   const [trackCode, setTrackCode] = useState(initialTrackCode || '');
   const [trackedDelivery, setTrackedDelivery] = useState<ReturnType<typeof publicTrackingDelivery> | null>(null);
-  const [trackedHistory, setTrackedHistory] = useState<ReturnType<typeof publicTrackingHistory>>([]);
+  const [trackedHistory, setTrackedHistory] = useState<Awaited<ReturnType<typeof publicTrackingHistory>>>([]);
   const [trackError, setTrackError] = useState<string | null>(null);
   const [trackLoading, setTrackLoading] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -156,7 +156,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     try {
       const res = await apiRequest<{
         delivery: ReturnType<typeof publicTrackingDelivery>;
-        history: ReturnType<typeof publicTrackingHistory>;
+        history: Awaited<ReturnType<typeof publicTrackingHistory>>;
       }>(`/api/track/${encodeURIComponent(code)}`);
       setTrackedDelivery(res.delivery);
       setTrackedHistory(res.history);
@@ -184,7 +184,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         if (updated.status) setTrackedDelivery(updated);
         apiRequest<{
           delivery: ReturnType<typeof publicTrackingDelivery>;
-          history: ReturnType<typeof publicTrackingHistory>;
+          history: Awaited<ReturnType<typeof publicTrackingHistory>>;
         }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}`)
           .then((res) => {
             setTrackedDelivery(res.delivery);
@@ -228,7 +228,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     try {
       const res = await apiRequest<{
         delivery: ReturnType<typeof publicTrackingDelivery>;
-        history: ReturnType<typeof publicTrackingHistory>;
+        history: Awaited<ReturnType<typeof publicTrackingHistory>>;
       }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}/confirm-otp`, {
         method: 'POST',
         body: JSON.stringify({ otp: otpInput.trim() }),

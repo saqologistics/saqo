@@ -70,7 +70,7 @@ function cancelOfflineGrace(): void {
   adminOfflineGraceTimer = null;
 }
 
-function broadcastPresenceIfChanged(): SupportPresence {
+async function broadcastPresenceIfChanged(): Promise<SupportPresence> {
   const presence = getSupportPresence();
   if (
     !lastBroadcastPresence ||
@@ -78,38 +78,38 @@ function broadcastPresenceIfChanged(): SupportPresence {
     lastBroadcastPresence.onlineAdminCount !== presence.onlineAdminCount
   ) {
     lastBroadcastPresence = presence;
-    broadcastWsEvent('support:presence', presence);
+    await broadcastWsEvent('support:presence', presence);
   }
   return presence;
 }
 
-export function setAdminChatAvailability(available: boolean): SupportPresence {
+export async function setAdminChatAvailability(available: boolean): Promise<SupportPresence> {
   adminAcceptingChats = available;
   cancelOfflineGrace();
-  return broadcastPresenceIfChanged();
+  return await broadcastPresenceIfChanged();
 }
 
 export function isAdminChatAvailableFlag(): boolean {
   return adminAcceptingChats;
 }
 
-export function setWsClientAuth(ws: WebSocket, userId: string, role: UserRole, expiresAt: number): void {
+export async function setWsClientAuth(ws: WebSocket, userId: string, role: UserRole, expiresAt: number): Promise<void> {
   const prev = wsAuthMeta.get(ws);
   wsAuthMeta.set(ws, { userId, role, expiresAt });
   if (role === 'admin') {
     cancelOfflineGrace();
-    broadcastPresenceIfChanged();
+    await broadcastPresenceIfChanged();
   } else if (prev?.role === 'admin') {
-    broadcastPresenceIfChanged();
+    await broadcastPresenceIfChanged();
   }
 }
 
-export function clearWsClientAuth(ws: WebSocket): void {
+export async function clearWsClientAuth(ws: WebSocket): Promise<void> {
   const prev = wsAuthMeta.get(ws);
   wsAuthMeta.delete(ws);
   if (prev?.role === 'admin') {
     cancelOfflineGrace();
-    broadcastPresenceIfChanged();
+    await broadcastPresenceIfChanged();
   }
 }
 
@@ -123,7 +123,7 @@ export function setWsSupportVisitor(ws: WebSocket, token: string): void {
   else wsSupportVisitors.delete(ws);
 }
 
-function canReadSupport(ws: WebSocket, conversation: ReturnType<typeof getSupportConversationById>): boolean {
+function canReadSupport(ws: WebSocket, conversation: Awaited<ReturnType<typeof getSupportConversationById>>): boolean {
   if (!conversation) return false;
   const auth = wsAuthMeta.get(ws);
   if (auth && auth.expiresAt > Date.now()) {
@@ -132,13 +132,13 @@ function canReadSupport(ws: WebSocket, conversation: ReturnType<typeof getSuppor
   return Boolean(conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
 }
 
-export function sendSupportTyping(ws: WebSocket, conversationId: string, isTyping: boolean): void {
-  const conversation = getSupportConversationById(conversationId);
+export async function sendSupportTyping(ws: WebSocket, conversationId: string, isTyping: boolean): Promise<void> {
+  const conversation = await getSupportConversationById(conversationId);
   if (!conversation || !canReadSupport(ws, conversation)) return;
   const auth = wsAuthMeta.get(ws);
-  const profile = auth && auth.expiresAt > Date.now() ? getProfileById(auth.userId) : null;
+  const profile = auth && auth.expiresAt > Date.now() ? await getProfileById(auth.userId) : null;
   const admin = profile?.role === 'admin' && profile.accountStatus === 'active';
-  broadcastWsEvent('support:typing', {
+  await broadcastWsEvent('support:typing', {
     conversationId,
     senderRole: admin ? 'admin' : 'visitor',
     senderName: admin ? profile.fullName : conversation.visitorName,
@@ -148,7 +148,7 @@ export function sendSupportTyping(ws: WebSocket, conversationId: string, isTypin
 
 export function registerWsClient(ws: WebSocket): void {
   wsClients.add(ws);
-  ws.on('close', () => {
+  ws.on('close', async () => {
     const meta = wsAuthMeta.get(ws);
     wsAuthMeta.delete(ws);
     wsClients.delete(ws);
@@ -157,20 +157,20 @@ export function registerWsClient(ws: WebSocket): void {
     if (meta?.role !== 'admin') return;
 
     if (getConnectedAdminPresence().adminOnline || !lastBroadcastPresence?.adminOnline) {
-      broadcastPresenceIfChanged();
+      await broadcastPresenceIfChanged();
       return;
     }
     // Keep API reads and WebSocket events consistent during short reconnects.
     if (!adminOfflineGraceTimer) {
-      adminOfflineGraceTimer = setTimeout(() => {
+      adminOfflineGraceTimer = setTimeout(async () => {
         adminOfflineGraceTimer = null;
-        broadcastPresenceIfChanged();
+        await broadcastPresenceIfChanged();
       }, 5000);
     }
   });
 }
 
-export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): void {
+export async function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): Promise<void> {
   const eventObj: LiveWsEvent = {
     type,
     payload,
@@ -184,7 +184,7 @@ export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): v
   }
   const supportId = type === 'support:conversation' ? data?.id :
     type === 'support:message' || type === 'support:typing' ? data?.conversationId : undefined;
-  const conversation = typeof supportId === 'string' ? getSupportConversationById(supportId) : null;
+  const conversation = typeof supportId === 'string' ? await getSupportConversationById(supportId) : null;
   const message = JSON.stringify(eventObj);
 
   for (const client of wsClients) {
@@ -210,7 +210,7 @@ export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): v
     } else if (type === 'rider:location') {
       allowed = Boolean(auth?.role === 'admin');
       if (!allowed && tracked) {
-        const current = db.prepare(`
+        const current = await db.prepare(`
           SELECT 1 FROM delivery_requests
           WHERE tracking_code = ? AND assigned_rider_id = ? AND status NOT IN ('delivered','cancelled')
         `).get(tracked, String(data?.riderId ?? ''));
@@ -255,71 +255,71 @@ export function canDispatch(delivery: { paymentMethod: string; paymentStatus: st
   return delivery.paymentMethod === 'cash' || delivery.paymentStatus === 'paid';
 }
 
-export function dispatchWaitingDeliveries(): void {
-  const waiting = db.prepare(`
+export async function dispatchWaitingDeliveries(): Promise<void> {
+  const waiting = await db.prepare(`
     SELECT id FROM delivery_requests
     WHERE status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
     ORDER BY created_at, rowid
   `).all() as Array<{ id: string }>;
-  for (const { id } of waiting) dispatchNextRiderForDelivery(id);
+  for (const { id } of waiting) await dispatchNextRiderForDelivery(id);
 }
 
 function scheduleOfferExpiry(assignmentId: string, expiresAt: string): void {
   clearOfferTimer(assignmentId);
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     offerTimers.delete(assignmentId);
     const now = new Date().toISOString();
-    const expired = persistDispatchChange(() => {
-      const assignment = db.prepare(`
+    const expired = await persistDispatchChange(async () => {
+      const assignment = await db.prepare(`
         UPDATE delivery_assignments SET status = 'timed_out', responded_at = ?
         WHERE id = ? AND status = 'offered'
         RETURNING delivery_id, rider_id
       `).get(now, assignmentId) as { delivery_id: string; rider_id: string } | undefined;
-      if (assignment) releaseOffer(assignment.delivery_id, assignment.rider_id);
+      if (assignment) await releaseOffer(assignment.delivery_id, assignment.rider_id);
       return assignment;
     });
     if (!expired) return;
-    broadcastWsEvent('assignment:updated', { id: assignmentId, status: 'timed_out' });
-    dispatchWaitingDeliveries();
+    await broadcastWsEvent('assignment:updated', { id: assignmentId, status: 'timed_out' });
+    await dispatchWaitingDeliveries();
   }, Math.max(0, Date.parse(expiresAt) - Date.now()));
   timer.unref();
   offerTimers.set(assignmentId, timer);
 }
 
-export function releaseOffer(deliveryId: string, riderId: string): void {
-  db.prepare(`
+export async function releaseOffer(deliveryId: string, riderId: string): Promise<void> {
+  await db.prepare(`
     UPDATE delivery_requests SET status = 'pending_dispatch', assigned_rider_id = NULL, updated_at = ?
     WHERE id = ? AND assigned_rider_id = ? AND status = 'assigned'
   `).run(new Date().toISOString(), deliveryId, riderId);
 }
 
-export function resumeDispatch(): () => void {
-  db.prepare(`
+export async function resumeDispatch(): Promise<() => void> {
+  await db.prepare(`
     UPDATE delivery_requests SET status = 'pending_dispatch', assigned_rider_id = NULL, updated_at = ?
     WHERE status = 'assigned' AND NOT EXISTS (
       SELECT 1 FROM delivery_assignments a WHERE a.delivery_id = delivery_requests.id
         AND a.rider_id = delivery_requests.assigned_rider_id AND a.status IN ('offered', 'accepted')
     )
   `).run(new Date().toISOString());
-  const offers = db.prepare(`SELECT id, expires_at FROM delivery_assignments WHERE status = 'offered'`)
+  const offers = await db.prepare(`SELECT id, expires_at FROM delivery_assignments WHERE status = 'offered'`)
     .all() as Array<{ id: string; expires_at: string }>;
   for (const offer of offers) scheduleOfferExpiry(offer.id, offer.expires_at);
-  dispatchWaitingDeliveries();
+  await dispatchWaitingDeliveries();
   const configuredDelay = Number(process.env.SAQO_DISPATCH_ALERT_SECONDS);
   const delaySeconds = configuredDelay > 0 && Number.isFinite(configuredDelay) ? configuredDelay : 300;
-  const checkQueue = () => {
+  const checkQueue = async () => {
     const cutoff = new Date(Date.now() - delaySeconds * 1000).toISOString();
-    const { total } = db.prepare(`
+    const { total } = await db.prepare(`
       SELECT COUNT(*) AS total FROM delivery_requests
       WHERE status IN ('pending_dispatch', 'no_rider_available')
         AND (payment_method = 'cash' OR payment_status = 'paid') AND created_at <= ?
     `).get(cutoff) as { total: number };
-    if (total) void sendOpsAlert('dispatch_delay', { waitingDeliveries: total, delaySeconds });
+    if (Number(total) > 0) void sendOpsAlert('dispatch_delay', { waitingDeliveries: Number(total), delaySeconds });
   };
-  checkQueue();
-  const poll = setInterval(() => {
-    dispatchWaitingDeliveries();
-    checkQueue();
+  await checkQueue();
+  const poll = setInterval(async () => {
+    await dispatchWaitingDeliveries();
+    await checkQueue();
   }, 10_000).unref();
   return () => {
     clearInterval(poll);
@@ -328,21 +328,21 @@ export function resumeDispatch(): () => void {
   };
 }
 
-export function dispatchNextRiderForDelivery(deliveryId: string): {
+export async function dispatchNextRiderForDelivery(deliveryId: string): Promise<{
   offered: boolean;
   riderId?: string;
   riderName?: string;
-} {
-  const delivery = getDeliveryById(deliveryId);
+}> {
+  const delivery = await getDeliveryById(deliveryId);
   if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
     return { offered: false };
   }
 
-  const settings = getPlatformSettings();
-  const riders = getAllRiders();
-  const allDeliveries = listDeliveries();
+  const settings = await getPlatformSettings();
+  const riders = await getAllRiders();
+  const allDeliveries = await listDeliveries();
 
-  const previousAttempts = db
+  const previousAttempts = await db
     .prepare(
       `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
     )
@@ -368,11 +368,11 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
   if (ranked.length === 0) {
     if (delivery.status === 'no_rider_available') return { offered: false };
     const now = new Date().toISOString();
-    db.prepare(`UPDATE delivery_requests SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE delivery_requests SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ? WHERE id = ?`).run(
       now,
       deliveryId
     );
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
     `).run(
@@ -382,21 +382,21 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
       now
     );
 
-    const custRow = db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId) as {
+    const custRow = await db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId) as {
       profile_id: string;
     } | undefined;
     if (custRow) {
-      const notif = createNotification(
+      const notif = await createNotification(
         custRow.profile_id,
         'No rider available right now',
         `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
         deliveryId
       );
-      broadcastWsEvent('notification:created', notif);
+      await broadcastWsEvent('notification:created', notif);
     }
 
-    const updated = getDeliveryById(deliveryId);
-    broadcastWsEvent('delivery:updated', updated);
+    const updated = await getDeliveryById(deliveryId);
+    await broadcastWsEvent('delivery:updated', updated);
     return { offered: false };
   }
 
@@ -405,8 +405,8 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1000);
 
-  persistDispatchChange(() => {
-    db.prepare(`
+  await persistDispatchChange(async () => {
+    await db.prepare(`
       INSERT INTO delivery_assignments (
         id, delivery_id, rider_id, status, score, distance_to_pickup_km,
         route_compatibility_score, offered_at, expires_at
@@ -422,13 +422,13 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
       expiresAt.toISOString()
     );
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE delivery_requests
       SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
       WHERE id = ?
     `).run(topCandidate.rider.riderId, now.toISOString(), deliveryId);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'assigned', ?, 'system', ?)
     `).run(
@@ -441,30 +441,30 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
     );
   });
 
-  const riderNotif = createNotification(
+  const riderNotif = await createNotification(
     topCandidate.rider.id,
     'New Delivery Request Available',
     `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} → ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
     deliveryId
   );
-  broadcastWsEvent('notification:created', riderNotif);
+  await broadcastWsEvent('notification:created', riderNotif);
 
-  const custRow = db
+  const custRow = await db
     .prepare('SELECT profile_id FROM customers WHERE id = ?')
     .get(delivery.customerId) as { profile_id: string } | undefined;
   if (custRow) {
-    const custNotif = createNotification(
+    const custNotif = await createNotification(
       custRow.profile_id,
       'Rider Assigned',
       `${topCandidate.rider.fullName} (${topCandidate.rider.vehicleType}) has been matched to parcel ${delivery.trackingCode}.`,
       deliveryId
     );
-    broadcastWsEvent('notification:created', custNotif);
+    await broadcastWsEvent('notification:created', custNotif);
   }
 
-  const updatedDelivery = getDeliveryById(deliveryId);
-  broadcastWsEvent('delivery:updated', updatedDelivery);
-  broadcastWsEvent('assignment:offered', {
+  const updatedDelivery = await getDeliveryById(deliveryId);
+  await broadcastWsEvent('delivery:updated', updatedDelivery);
+  await broadcastWsEvent('assignment:offered', {
     id: assignmentId,
     deliveryId,
     trackingCode: delivery.trackingCode,
