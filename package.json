@@ -7,11 +7,12 @@
     "dev": "tsx server.ts",
     "start": "node --import tsx --eval \"process.env.NODE_ENV = 'production'; import('./server.ts')\"",
     "build": "vite build",
+    "build:edge": "node scripts/buildEdgeFunction.mjs",
     "preview": "vite preview",
     "test:whatsapp:tunnel": "tsx scripts/whatsappSandbox.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/shared/logic.test.ts src/server/paymentService.test.ts"
+    "test": "tsx --test src/shared/logic.test.ts src/server/paymentService.test.ts src/server/webApp.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

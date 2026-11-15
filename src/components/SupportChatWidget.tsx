@@ -234,6 +234,9 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
           typingTimerRef.current = window.setTimeout(() => setAdminTyping(false), 3500);
         }
       }
+    } else if (evt.type === 'notifications:refresh' && open) {
+      if (view === 'thread' && activeConvId) void loadMessages(activeConvId);
+      else void loadConversations();
     }
   });
 

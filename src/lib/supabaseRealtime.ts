@@ -13,6 +13,14 @@ const supabase = isSupabaseRealtimeConfigured
 let activeChannel: RealtimeChannel | null = null;
 const listeners = new Set<(event: LiveWsEvent) => void>();
 
+const PUBLIC_REALTIME_EVENTS = new Set([
+  'notifications:refresh',
+  'delivery:created',
+  'delivery:updated',
+  'settings:updated',
+  'support:presence',
+]);
+
 function ensureChannel() {
   if (!supabase || activeChannel) return;
   try {
@@ -21,7 +29,9 @@ function ensureChannel() {
       .on('broadcast', { event: 'saqo-event' }, (payload) => {
         if (payload?.payload) {
           const evt = payload.payload as LiveWsEvent;
-          if (evt.type === 'notifications:refresh') listeners.forEach((cb) => cb(evt));
+          if (PUBLIC_REALTIME_EVENTS.has(evt.type)) {
+            listeners.forEach((cb) => cb(evt));
+          }
         }
       })
       .subscribe();

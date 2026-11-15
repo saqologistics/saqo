@@ -1,27 +1,37 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import pg, { type PoolClient, type QueryResultRow } from 'pg';
 
 pg.types.setTypeParser(pg.types.builtins.INT8, (value) => Number(value));
 pg.types.setTypeParser(pg.types.builtins.NUMERIC, (value) => Number(value));
 
-// Supabase Postgres is the default backend whenever SAQO_DATABASE_URL is set. SQLite is only a
-// local-development/test fallback and is refused in production so data is never silently lost.
+// Supabase Postgres is the default backend whenever SAQO_DATABASE_URL (or Supabase Edge SUPABASE_DB_URL)
+// is set. SQLite is only a local-development/test fallback and is refused in production.
 const isProduction = process.env.NODE_ENV === 'production';
-const connectionString = process.env.SAQO_DATABASE_URL?.trim() || undefined;
+const connectionString =
+  process.env.SAQO_DATABASE_URL?.trim() || process.env.SUPABASE_DB_URL?.trim() || undefined;
 if (isProduction && !connectionString) {
   throw new Error('SAQO_DATABASE_URL (Supabase Postgres connection string) is required in production.');
 }
 const schema = process.env.SAQO_PG_SCHEMA?.trim() || 'saqo';
 if (!/^[a-z][a-z0-9_]{0,51}$/.test(schema)) throw new Error('Invalid SAQO Postgres schema name.');
 
-export const sqlite = connectionString ? null : new DatabaseSync(process.env.SAQO_DB_PATH || path.resolve('saqo.db'));
-sqlite?.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+function openSqliteFallback(): DatabaseSync | null {
+  if (connectionString) return null;
+  const { DatabaseSync: SqliteDatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+  const dbPath = process.env.SAQO_DB_PATH || path.resolve('saqo.db');
+  const instance = new SqliteDatabaseSync(dbPath);
+  instance.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+  return instance;
+}
+
+export const sqlite: DatabaseSync | null = openSqliteFallback();
 
 export const pool = connectionString ? new pg.Pool({
   connectionString,
-  max: 4,
+  max: process.env.SAQO_EDGE_RUNTIME === '1' ? 2 : 4,
   connectionTimeoutMillis: 8000,
   idleTimeoutMillis: 10000,
   options: `-c search_path=pg_catalog,${schema} -c timezone=UTC -c statement_timeout=12000`,

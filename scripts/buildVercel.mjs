@@ -1,12 +1,14 @@
 import WebSocket from 'ws';
 
-function httpsOrigin(value, name) {
+function httpsOrigin(value, name, allowPath = false) {
   let url;
   try { url = new URL(value); } catch { /* Report the setting name below. */ }
-  if (!url || url.protocol !== 'https:' || (value !== url.origin && value !== `${url.origin}/`)) {
+  const cleanPath = url ? url.pathname.replace(/\/+$/, '') : '';
+  const validPath = allowPath || cleanPath === '';
+  if (!url || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !validPath) {
     throw new Error(`${name} must be a public HTTPS origin.`);
   }
-  return url.origin;
+  return `${url.origin}${cleanPath}`;
 }
 
 async function assertApiReady(api, site) {
@@ -62,13 +64,20 @@ function assertRealtimeReady(api, site) {
 }
 
 if (process.env.VERCEL_ENV === 'production') {
-  const api = httpsOrigin(process.env.VITE_SAQO_API_ORIGIN?.trim(), 'VITE_SAQO_API_ORIGIN');
+  const api = httpsOrigin(process.env.VITE_SAQO_API_ORIGIN?.trim(), 'VITE_SAQO_API_ORIGIN', true);
   const site = httpsOrigin(
     process.env.SAQO_FRONTEND_ORIGIN?.trim() || `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL || ''}`,
     'SAQO_FRONTEND_ORIGIN',
   );
   await assertApiReady(api, site);
-  await assertRealtimeReady(api, site);
+  if (api.includes('/functions/v1/')) {
+    httpsOrigin(process.env.VITE_SUPABASE_URL?.trim(), 'VITE_SUPABASE_URL');
+    if (!process.env.VITE_SUPABASE_ANON_KEY?.trim()) {
+      throw new Error('VITE_SUPABASE_ANON_KEY is required for Supabase Realtime.');
+    }
+  } else {
+    await assertRealtimeReady(api, site);
+  }
   process.env.VITE_SAQO_API_ORIGIN = api;
   process.env.VITE_SAQO_STATIC_PREVIEW = '0';
 } else if (['preview', 'development'].includes(process.env.VERCEL_ENV)) {

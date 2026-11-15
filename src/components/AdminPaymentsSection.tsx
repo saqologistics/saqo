@@ -128,6 +128,7 @@ export const AdminPaymentsSection: React.FC<{
 
   useRealtime((evt) => {
     if (
+      evt.type === 'notifications:refresh' ||
       evt.type === 'wallet:updated' ||
       evt.type === 'payment:updated' ||
       evt.type === 'cash_collection:updated' ||

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import express, { type Express } from 'express';
+import type { RouteHandler, SaqoApp, SaqoRequest, SaqoResponse, NextFn } from './webApp';
 import { calculateDeliveryQuote, formatNaira, isValidNigerianPhone } from '../shared/pricing';
 import { searchSmartAddresses, type AddressSuggestion } from '../shared/nigeria';
 import { addSupportMessage, createSupportConversation, db, getDeliveryById, getPlatformSettings, getSupportConversationById, hashPassword } from './db';
@@ -9,8 +9,8 @@ import { createDeliveryPaymentRecords, getPaymentMethods, withImmediateTransacti
 
 export const TWILIO_WHATSAPP_PATH = '/api/webhooks/twilio/whatsapp';
 
-export function registerTwilioWhatsAppWebhook(app: Express): void {
-  app.post(TWILIO_WHATSAPP_PATH, express.urlencoded({ extended: false, limit: '24kb', parameterLimit: 150 }), async (req, res, next) => {
+export function registerTwilioWhatsAppWebhook(app: SaqoApp, urlencodedMiddleware?: RouteHandler): void {
+  const handler: RouteHandler = async (req: SaqoRequest, res: SaqoResponse, next: NextFn) => {
     if (!req.is('application/x-www-form-urlencoded')) {
       res.status(415).send('Expected a Twilio form request.');
       return;
@@ -21,7 +21,12 @@ export function registerTwilioWhatsAppWebhook(app: Express): void {
     } catch (error) {
       next(error);
     }
-  });
+  };
+  if (urlencodedMiddleware) {
+    app.post(TWILIO_WHATSAPP_PATH, urlencodedMiddleware, handler);
+  } else {
+    app.post(TWILIO_WHATSAPP_PATH, handler);
+  }
 }
 
 const state = 'Katsina';
@@ -40,8 +45,9 @@ function getConfig() {
     const appUrl = new URL(configuredUrl);
     const webhook = new URL(configuredWebhookOrigin || appUrl.origin);
     if (appUrl.protocol !== 'https:' || webhook.protocol !== 'https:' || webhook.username || webhook.password ||
-        webhook.pathname !== '/' || webhook.search || webhook.hash) return null;
-    return { accountSid, authToken, sender, appUrl: appUrl.origin, webhookOrigin: webhook.origin };
+        webhook.search || webhook.hash) return null;
+    const webhookBase = `${webhook.origin}${webhook.pathname === '/' ? '' : webhook.pathname.replace(/\/+$/, '')}`;
+    return { accountSid, authToken, sender, appUrl: appUrl.origin, webhookOrigin: webhookBase };
   } catch {
     return null;
   }

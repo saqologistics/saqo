@@ -26,24 +26,39 @@ const offerTimers = new Map<string, NodeJS.Timeout>();
 let adminOfflineGraceTimer: NodeJS.Timeout | null = null;
 let lastBroadcastPresence: SupportPresence | null = null;
 
-const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-const supabaseKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  process.env.VITE_SUPABASE_ANON_KEY;
+const isEdgeRuntime = () => process.env.SAQO_EDGE_RUNTIME === '1';
 
+let supabaseClient: ReturnType<typeof createClient> | null = null;
 let supabaseChannel: RealtimeChannel | null = null;
-if (supabaseUrl && supabaseKey) {
-  try {
-    const supabase = createClient(supabaseUrl, supabaseKey);
-    supabaseChannel = supabase.channel('saqo-notifications');
-    supabaseChannel.subscribe();
-  } catch {
-    supabaseChannel = null;
+
+function getSupabaseBroadcastChannel(): RealtimeChannel | null {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  if (!supabaseClient) {
+    try {
+      supabaseClient = createClient(url, key);
+    } catch {
+      return null;
+    }
   }
+  if (!supabaseChannel) {
+    supabaseChannel = supabaseClient.channel('saqo-notifications');
+    if (!isEdgeRuntime()) {
+      supabaseChannel.subscribe();
+    }
+  }
+  return supabaseChannel;
 }
 
 function getConnectedAdminPresence(): SupportPresence {
+  if (isEdgeRuntime()) {
+    const onlineAdminCount = adminAcceptingChats ? 1 : 0;
+    return { adminOnline: onlineAdminCount > 0, onlineAdminCount };
+  }
   const uniqueAdminIds = new Set<string>();
   for (const [client, meta] of wsAuthMeta.entries()) {
     if (meta.role === 'admin' && meta.expiresAt > Date.now() && client.readyState === 1) {
@@ -230,13 +245,41 @@ export async function broadcastWsEvent(type: LiveWsEvent['type'], payload: unkno
     if (allowed) client.send(message);
   }
 
-  if (supabaseChannel && type === 'notification:created') {
-    // This shared channel only signals a refresh. The authenticated API returns the recipient's inbox.
-    void supabaseChannel.send({
-      type: 'broadcast',
-      event: 'saqo-event',
-      payload: { type: 'notifications:refresh', payload: null, timestamp: eventObj.timestamp },
-    }).catch(() => {});
+  const channel = getSupabaseBroadcastChannel();
+  if (channel) {
+    // Only send non-sensitive public/refresh signals over shared Supabase Realtime channels.
+    let publicEvt: LiveWsEvent | null = null;
+    if (type === 'settings:updated') {
+      publicEvt = {
+        type: 'settings:updated',
+        payload: { showDeliveryStateSelectors: Boolean(data?.showDeliveryStateSelectors) },
+        timestamp: eventObj.timestamp,
+      };
+    } else if (type === 'support:presence') {
+      publicEvt = { type: 'support:presence', payload, timestamp: eventObj.timestamp };
+    } else if (isDelivery) {
+      publicEvt = {
+        type,
+        payload: { id: data?.id, trackingCode: data?.trackingCode },
+        timestamp: eventObj.timestamp,
+      };
+    } else if (type !== 'support:typing') {
+      publicEvt = { type: 'notifications:refresh', payload: null, timestamp: eventObj.timestamp };
+    }
+    if (publicEvt) {
+      const sendViaChannel = async () => {
+        if (typeof channel.httpSend === 'function' && (isEdgeRuntime() || channel.state !== 'joined')) {
+          await channel.httpSend('saqo-event', publicEvt);
+        } else {
+          await channel.send({ type: 'broadcast', event: 'saqo-event', payload: publicEvt });
+        }
+      };
+      if (isEdgeRuntime()) {
+        await sendViaChannel().catch(() => {});
+      } else {
+        void sendViaChannel().catch(() => {});
+      }
+    }
   }
 }
 
@@ -255,6 +298,34 @@ export function canDispatch(delivery: { paymentMethod: string; paymentStatus: st
   return delivery.paymentMethod === 'cash' || delivery.paymentStatus === 'paid';
 }
 
+let lastSweepAt = 0;
+
+export async function expireTimedOutOffers(force = false): Promise<number> {
+  const nowMs = Date.now();
+  if (!force && nowMs - lastSweepAt < 5000) return 0;
+  lastSweepAt = nowMs;
+  const nowIso = new Date(nowMs).toISOString();
+  const expired = await persistDispatchChange(async () => {
+    const rows = await db.prepare(`
+      UPDATE delivery_assignments SET status = 'timed_out', responded_at = ?
+      WHERE status = 'offered' AND expires_at <= ?
+      RETURNING id, delivery_id, rider_id
+    `).all(nowIso, nowIso) as Array<{ id: string; delivery_id: string; rider_id: string }>;
+    for (const row of rows) {
+      clearOfferTimer(row.id);
+      await releaseOffer(row.delivery_id, row.rider_id);
+    }
+    return rows;
+  });
+  for (const row of expired) {
+    await broadcastWsEvent('assignment:updated', { id: row.id, status: 'timed_out' });
+  }
+  if (expired.length > 0) {
+    await dispatchWaitingDeliveries();
+  }
+  return expired.length;
+}
+
 export async function dispatchWaitingDeliveries(): Promise<void> {
   const waiting = await db.prepare(`
     SELECT id FROM delivery_requests
@@ -266,6 +337,7 @@ export async function dispatchWaitingDeliveries(): Promise<void> {
 
 function scheduleOfferExpiry(assignmentId: string, expiresAt: string): void {
   clearOfferTimer(assignmentId);
+  if (isEdgeRuntime()) return;
   const timer = setTimeout(async () => {
     offerTimers.delete(assignmentId);
     const now = new Date().toISOString();

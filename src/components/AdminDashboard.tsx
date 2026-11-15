@@ -266,6 +266,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const { sendEvent } = useRealtime((evt) => {
     if (
       evt.type === 'connected' ||
+      evt.type === 'notifications:refresh' ||
       evt.type === 'settings:updated' ||
       evt.type === 'delivery:created' ||
       evt.type === 'delivery:updated' ||

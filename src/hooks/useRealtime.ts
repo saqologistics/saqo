@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getStoredToken } from '../lib/api';
-import { realtimeUrl, staticPreview } from '../lib/deployment';
+import { isSupabaseEdgeApi, realtimeUrl, staticPreview } from '../lib/deployment';
 import { subscribeSupabaseNotifications } from '../lib/supabaseRealtime';
 import type { LiveWsEvent } from '../shared/types';
 
@@ -44,9 +44,11 @@ function ensureSharedConnection() {
 
   if (!unsubscribeSupabase) {
     unsubscribeSupabase = subscribeSupabaseNotifications((evt) => {
-      if (evt.type === 'notifications:refresh' && !sharedConnected) dispatchEvent(evt);
+      if (!sharedConnected) dispatchEvent(evt);
     });
   }
+
+  if (isSupabaseEdgeApi) return;
 
   if (
     sharedWs &&
