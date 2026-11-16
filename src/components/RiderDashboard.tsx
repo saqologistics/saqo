@@ -80,7 +80,26 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [liveToast, setLiveToast] = useState<NotificationItem | null>(null);
   const [settings, setSettings] = useState<PlatformSettings | null>(null);
-  const [tab, setTab] = useState<'active' | 'history' | 'notifications' | 'profile'>('active');
+  const tabStorageKey = `saqo_rider_tab_${profile.id}`;
+  const [tab, setTab] = useState<'active' | 'history' | 'notifications' | 'profile'>(() => {
+    try {
+      const saved = window.sessionStorage.getItem(tabStorageKey);
+      if (saved && ['active', 'history', 'notifications', 'profile'].includes(saved)) {
+        return saved as 'active' | 'history' | 'notifications' | 'profile';
+      }
+    } catch {
+      // Ignore storage read errors.
+    }
+    return 'active';
+  });
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(tabStorageKey, tab);
+    } catch {
+      // Ignore storage write errors.
+    }
+  }, [tabStorageKey, tab]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -515,19 +534,19 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-neutral-50 text-black flex flex-col">
+    <div className="min-h-screen bg-[#F4F4F4] text-black flex flex-col">
       {/* Header */}
       <header className="bg-black text-white border-b border-white/15 px-4 sm:px-6 h-16 flex items-center justify-between gap-4 sticky top-0 z-30">
         <button type="button" onClick={onGoHome} className="cursor-pointer shrink-0">
           <SaqoLogo inverted />
         </button>
 
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium">
+        <nav className="hidden md:flex items-center gap-2 text-sm font-display font-bold">
           <button
             type="button"
             onClick={() => setTab('active')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'active' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
+              tab === 'active' ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight' : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Active Dispatch ({activeDeliveries.length})
@@ -536,7 +555,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             type="button"
             onClick={() => setTab('history')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'history' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
+              tab === 'history' ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight' : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Earnings & History
@@ -546,8 +565,8 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             onClick={() => setTab('notifications')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
               tab === 'notifications'
-                ? 'text-white underline underline-offset-8'
-                : 'text-neutral-400 hover:text-white'
+                ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
+                : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Notifications{unreadCount > 0 ? ` (${unreadCount})` : ''}
@@ -557,8 +576,8 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             onClick={() => setTab('profile')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
               tab === 'profile'
-                ? 'text-white underline underline-offset-8'
-                : 'text-neutral-400 hover:text-white'
+                ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
+                : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Account
@@ -735,7 +754,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         }
       />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 sm:pt-8 pb-24 md:pb-12 space-y-6">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 sm:pt-8 pb-28 md:pb-14 space-y-6">
         {liveToast && (
           <div
             role="status"
@@ -804,7 +823,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             )}
 
             {/* Rider Status & Controls Bar */}
-            <section className="bg-white border border-neutral-200 rounded-xl p-6 flex flex-wrap items-center justify-between gap-6">
+            <section className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6 flex flex-wrap items-center justify-between gap-6">
               <div className="space-y-1">
                 <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-600">
                   {rider.verificationStatus === 'verified' ? (
@@ -971,9 +990,9 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
 
                   {/* Active Assigned Parcels */}
                   {activeDeliveries.length === 0 && pendingOffers.length === 0 ? (
-                    <div className="bg-white border border-neutral-200 rounded-xl p-10 text-center space-y-2">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-10 text-center space-y-2">
                       <Truck className="w-8 h-8 mx-auto text-neutral-400" />
-                      <p className="font-display font-bold text-lg">No active parcels</p>
+                      <p className="font-display font-extrabold text-xl tracking-tight">No active parcels</p>
                       <p className="text-sm text-neutral-600">
                         {rider.isOnline
                           ? 'Stay online — nearby & route-compatible parcels will appear here automatically.'
@@ -999,14 +1018,14 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
                       return (
                         <div
                           key={del.id}
-                          className="bg-white border border-neutral-200 rounded-xl p-5 sm:p-6 space-y-4"
+                          className="bg-white border-2 border-neutral-200 hover:border-black rounded-2xl shadow-xs p-5 sm:p-6 space-y-4 transition-colors"
                         >
-                          <div className="flex items-start justify-between gap-4 border-b border-neutral-200 pb-3">
+                          <div className="flex items-start justify-between gap-4 border-b border-neutral-200 pb-3.5">
                             <div>
                               <p className="font-mono text-xs text-neutral-500">
                                 {del.trackingCode} · {del.parcelCategory}
                               </p>
-                              <h3 className="font-display font-bold text-lg mt-0.5">
+                              <h3 className="font-display font-extrabold text-xl tracking-tight mt-0.5">
                                 {del.pickupState} → {del.destinationState}
                               </h3>
                               <p className="text-xs text-neutral-600 mt-0.5 capitalize">
@@ -1222,29 +1241,35 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             {tab === 'history' && (
               <div className="space-y-6">
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                    <p className="text-xs text-neutral-500">Completed Deliveries</p>
-                    <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                  <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Completed Deliveries
+                    </p>
+                    <p className="font-display font-extrabold text-3xl sm:text-4xl tracking-tight mt-2 tabular-nums">
                       {rider.completedDeliveriesCount}
                     </p>
                   </div>
-                  <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                    <p className="text-xs text-neutral-500">Total Rider Earnings</p>
-                    <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                  <div className="bg-black text-white border-2 border-black rounded-2xl shadow-sm p-5 sm:p-6">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-400">
+                      Total Rider Earnings
+                    </p>
+                    <p className="font-display font-extrabold text-3xl sm:text-4xl tracking-tight mt-2 tabular-nums">
                       {formatNaira(rider.totalEarningsNgn)}
                     </p>
                   </div>
-                  <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                    <p className="text-xs text-neutral-500">Rider Rating</p>
-                    <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                  <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Rider Rating
+                    </p>
+                    <p className="font-display font-extrabold text-3xl sm:text-4xl tracking-tight mt-2 tabular-nums">
                       {rider.rating.toFixed(2)} / 5.0
                     </p>
                   </div>
                 </div>
 
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                  <div className="px-6 py-4 border-b border-neutral-200">
-                    <h2 className="font-display font-bold text-lg">Completed Deliveries</h2>
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+                  <div className="px-5 sm:px-6 py-4 sm:py-5 border-b border-neutral-200">
+                    <h2 className="font-display font-extrabold text-xl tracking-tight">Completed Deliveries</h2>
                   </div>
                   {completedDeliveries.length === 0 ? (
                     <div className="p-8 text-center text-sm text-neutral-500">
@@ -1332,19 +1357,28 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
               </div>
             )}
             {tab === 'notifications' && (
-              <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                <div className="px-6 py-5 border-b border-neutral-200 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Bell className="w-4 h-4" />
-                    <h2 className="font-display font-bold text-xl">Rider Dispatch Notifications</h2>
+              <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+                <div className="px-5 sm:px-6 py-5 border-b border-neutral-200 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="w-10 h-10 rounded-xl bg-black text-white flex items-center justify-center shrink-0">
+                      <Bell className="w-5 h-5" />
+                    </span>
+                    <div>
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Dispatch Feed
+                      </p>
+                      <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight">
+                        Rider Dispatch Alerts
+                      </h2>
+                    </div>
                   </div>
                   {unreadCount > 0 && (
                     <button
                       type="button"
                       onClick={handleMarkNotificationsRead}
-                      className="text-xs font-semibold underline cursor-pointer"
+                      className="bg-black text-white px-3.5 py-2 rounded-full font-display font-bold text-xs hover:bg-neutral-800 transition-colors cursor-pointer"
                     >
-                      Mark all as read
+                      Mark all read
                     </button>
                   )}
                 </div>
@@ -1635,47 +1669,81 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
       {/* Native Mobile Bottom Navigation */}
       <nav
         aria-label="Rider mobile navigation"
-        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-4 pb-[env(safe-area-inset-bottom)]"
+        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur-md border-t-2 border-black shadow-[0_-8px_28px_rgba(0,0,0,0.08)] grid grid-cols-4 gap-1.5 px-2 pt-1.5 pb-[calc(0.45rem+env(safe-area-inset-bottom))]"
       >
         <button
           type="button"
           onClick={() => setTab('active')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'active' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`relative flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'active'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <Truck className="w-4 h-4" />
-          <span>Dispatch ({activeDeliveries.length})</span>
+          <Truck className="w-[18px] h-[18px]" strokeWidth={tab === 'active' ? 2.5 : 2} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Dispatch
+          </span>
+          {activeDeliveries.length > 0 && (
+            <span
+              className={`absolute top-1 right-2.5 min-w-[16px] h-4 px-1 rounded-full font-mono font-bold text-[10px] leading-none flex items-center justify-center tabular-nums ${
+                tab === 'active' ? 'bg-white text-black' : 'bg-black text-white'
+              }`}
+            >
+              {activeDeliveries.length > 9 ? '9+' : activeDeliveries.length}
+            </span>
+          )}
         </button>
         <button
           type="button"
           onClick={() => setTab('history')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'history' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'history'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <Clock className="w-4 h-4" />
-          <span>Earnings</span>
+          <Clock className="w-[18px] h-[18px]" strokeWidth={tab === 'history' ? 2.5 : 2} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Earnings
+          </span>
         </button>
         <button
           type="button"
           onClick={() => setTab('notifications')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'notifications' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`relative flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'notifications'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <Bell className="w-4 h-4" />
-          <span>Alerts{unreadCount > 0 ? ` (${unreadCount})` : ''}</span>
+          <Bell className="w-[18px] h-[18px]" strokeWidth={tab === 'notifications' ? 2.5 : 2} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Alerts
+          </span>
+          {unreadCount > 0 && (
+            <span
+              className={`absolute top-1 right-2.5 min-w-[16px] h-4 px-1 rounded-full font-mono font-bold text-[10px] leading-none flex items-center justify-center tabular-nums ${
+                tab === 'notifications' ? 'bg-white text-black' : 'bg-black text-white'
+              }`}
+            >
+              {unreadCount > 9 ? '9+' : unreadCount}
+            </span>
+          )}
         </button>
         <button
           type="button"
           onClick={() => setTab('profile')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'profile' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'profile'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <User className="w-4 h-4" />
-          <span>Account</span>
+          <User className="w-[18px] h-[18px]" strokeWidth={tab === 'profile' ? 2.5 : 2} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Account
+          </span>
         </button>
       </nav>
     </div>

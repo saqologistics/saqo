@@ -5,6 +5,7 @@
   "buildCommand": "node scripts/buildVercel.mjs",
   "outputDirectory": "dist",
   "rewrites": [
+    { "source": "/dashboard", "destination": "/index.html" },
     { "source": "/dashboard/:path*", "destination": "/index.html" }
   ]
 }

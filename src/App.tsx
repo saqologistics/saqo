@@ -17,8 +17,49 @@ const createEmptyKatsinaDraft = (): QuickDraft => ({
 
 type Screen = 'landing' | 'auth' | 'dashboard';
 
+const SCREEN_STORAGE_KEY = 'saqo_active_screen';
+
+function getStoredScreen(): 'landing' | 'dashboard' | null {
+  try {
+    const val = window.sessionStorage.getItem(SCREEN_STORAGE_KEY) ?? window.localStorage.getItem(SCREEN_STORAGE_KEY);
+    return val === 'landing' || val === 'dashboard' ? val : null;
+  } catch {
+    return null;
+  }
+}
+
+function setStoredScreen(next: Screen | null) {
+  try {
+    if (next === 'landing' || next === 'dashboard') {
+      window.sessionStorage.setItem(SCREEN_STORAGE_KEY, next);
+      window.localStorage.setItem(SCREEN_STORAGE_KEY, next);
+    } else {
+      window.sessionStorage.removeItem(SCREEN_STORAGE_KEY);
+      window.localStorage.removeItem(SCREEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage quota or private-mode restrictions.
+  }
+}
+
+function clearDashboardTabStorage() {
+  try {
+    const prefixes = ['saqo_client_tab_', 'saqo_rider_tab_', 'saqo_admin_section_'];
+    for (let i = window.sessionStorage.length - 1; i >= 0; i--) {
+      const key = window.sessionStorage.key(i);
+      if (key && prefixes.some((prefix) => key.startsWith(prefix))) {
+        window.sessionStorage.removeItem(key);
+      }
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
 export default function App() {
-  const [screen, setScreen] = useState<Screen>('landing');
+  const [screen, setScreen] = useState<Screen>(() =>
+    getStoredToken() && getStoredScreen() === 'dashboard' ? 'dashboard' : 'landing',
+  );
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authRole, setAuthRole] = useState<'client' | 'rider'>('client');
   const [quickDraft, setQuickDraft] = useState<QuickDraft | null>(null);
@@ -80,13 +121,23 @@ export default function App() {
             }).then((session) => {
               setProfile(session.profile);
               setRider(session.rider);
-              if (order && session.profile.role === 'client') setScreen('dashboard');
-              if (params.get('autostart') === '1' || params.get('flw_callback') === '1' ||
-                  params.has('tx_ref') || window.location.pathname.startsWith('/dashboard')) {
+              const forceDashboard =
+                (order && session.profile.role === 'client') ||
+                params.get('autostart') === '1' ||
+                params.get('flw_callback') === '1' ||
+                params.has('tx_ref') ||
+                window.location.pathname.startsWith('/dashboard');
+              if (forceDashboard || (!params.has('track') && getStoredScreen() === 'dashboard')) {
+                setStoredScreen('dashboard');
                 setScreen('dashboard');
               }
             }).catch((error: unknown) => {
-              if (error instanceof ApiError && [401, 403].includes(error.status)) setStoredToken(null);
+              if (error instanceof ApiError && [401, 403].includes(error.status)) {
+                setStoredToken(null);
+                setStoredScreen(null);
+                clearDashboardTabStorage();
+              }
+              setScreen('landing');
             })
           : Promise.resolve(),
       ]);
@@ -119,14 +170,22 @@ export default function App() {
   const handleAuthenticated = (nextProfile: Profile, nextRider: RiderProfile | null) => {
     setProfile(nextProfile);
     setRider(nextRider);
+    setStoredScreen('dashboard');
     setScreen('dashboard');
   };
 
   const handleLogout = () => {
     setStoredToken(null);
+    setStoredScreen(null);
+    clearDashboardTabStorage();
     setProfile(null);
     setRider(null);
     setQuickDraft(null);
+    setScreen('landing');
+  };
+
+  const goHome = () => {
+    setStoredScreen('landing');
     setScreen('landing');
   };
 
@@ -151,6 +210,7 @@ export default function App() {
           onNavigateAuth={handleNavigateAuth}
           onOpenDashboard={(draft) => {
             setQuickDraft(draft || null);
+            setStoredScreen('dashboard');
             setScreen('dashboard');
           }}
           onOpenSupportChat={(code) =>
@@ -174,7 +234,7 @@ export default function App() {
           showDeliveryStateSelectors={showDeliveryStateSelectors}
           whatsappNumber={whatsappNumber}
           initialDraft={quickDraft}
-          onGoHome={() => setScreen('landing')}
+          onGoHome={goHome}
           onLogout={handleLogout}
           onProfileUpdated={(nextProfile) => setProfile(nextProfile)}
         />
@@ -183,7 +243,7 @@ export default function App() {
       {screen === 'dashboard' && profile?.role === 'rider' && (
         <RiderDashboard
           profile={profile}
-          onGoHome={() => setScreen('landing')}
+          onGoHome={goHome}
           onLogout={handleLogout}
           onProfileUpdated={(nextProfile) => setProfile(nextProfile)}
         />
@@ -192,7 +252,7 @@ export default function App() {
       {screen === 'dashboard' && profile?.role === 'admin' && (
         <AdminDashboard
           profile={profile}
-          onGoHome={() => setScreen('landing')}
+          onGoHome={goHome}
           onLogout={handleLogout}
           onSettingsChanged={(s: PlatformSettings) => {
             setWhatsappNumber(s.whatsappSupportNumber);

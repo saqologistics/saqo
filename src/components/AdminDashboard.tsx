@@ -80,7 +80,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onLogout,
   onSettingsChanged,
 }) => {
-  const [section, setSection] = useState<AdminSection>('overview');
+  const sectionStorageKey = `saqo_admin_section_${profile.id}`;
+  const [section, setSection] = useState<AdminSection>(() => {
+    try {
+      const saved = window.sessionStorage.getItem(sectionStorageKey);
+      if (
+        saved &&
+        ['overview', 'deliveries', 'riders', 'customers', 'chats', 'settings', 'finance'].includes(
+          saved,
+        )
+      ) {
+        return saved as AdminSection;
+      }
+    } catch {
+      // Ignore storage read errors.
+    }
+    return 'overview';
+  });
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(sectionStorageKey, section);
+    } catch {
+      // Ignore storage write errors.
+    }
+  }, [sectionStorageKey, section]);
   const [deliveries, setDeliveries] = useState<AdminDeliveryRecord[]>([]);
   const [riders, setRiders] = useState<RiderProfile[]>([]);
   const [customers, setCustomers] = useState<CustomerSummary[]>([]);
@@ -873,7 +897,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   ];
 
   return (
-    <div className="min-h-screen bg-neutral-50 text-black flex">
+    <div className="min-h-screen bg-[#F4F4F4] text-black flex">
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex w-64 bg-black text-white flex-col justify-between shrink-0">
         <div>
@@ -882,16 +906,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <SaqoLogo inverted />
             </button>
           </div>
-          <nav className="p-4 space-y-1">
+          <nav className="p-4 space-y-1.5">
             {navItems.map((item) => (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => setSection(item.id)}
-                className={`w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+                className={`w-full flex items-center justify-between gap-2 px-3.5 py-3 rounded-xl text-sm font-display transition-colors cursor-pointer ${
                   section === item.id
-                    ? 'bg-white text-black font-semibold'
-                    : 'text-neutral-300 hover:bg-white/10 hover:text-white'
+                    ? 'bg-white text-black font-extrabold tracking-tight shadow-sm'
+                    : 'text-neutral-300 font-bold hover:bg-white/10 hover:text-white'
                 }`}
               >
                 <span className="flex items-center gap-3 min-w-0">
@@ -931,12 +955,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Top Bar */}
-        <header className="bg-white border-b border-neutral-200 px-4 sm:px-6 h-16 flex items-center justify-between gap-3 sticky top-0 z-30">
+        <header className="bg-white border-b-2 border-neutral-200 px-4 sm:px-6 h-16 flex items-center justify-between gap-3 sticky top-0 z-30">
           <div className="flex items-center gap-3 min-w-0">
             <button type="button" onClick={onGoHome} className="lg:hidden cursor-pointer shrink-0">
               <SaqoLogo />
             </button>
-            <h1 className="font-display font-extrabold text-base sm:text-lg capitalize truncate">
+            <h1 className="font-display font-extrabold text-lg sm:text-xl tracking-tight capitalize truncate">
               <span className="hidden sm:inline">SAQO Operations / </span>
               {section === 'overview'
                 ? 'Live Fleet'
@@ -955,7 +979,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <button
               type="button"
               onClick={loadOverview}
-              className="hidden sm:inline-flex border border-neutral-300 px-3 py-1.5 rounded-lg text-xs font-semibold hover:border-black cursor-pointer"
+              className="hidden sm:inline-flex border-2 border-neutral-300 px-3.5 py-1.5 rounded-full font-display text-xs font-bold hover:border-black cursor-pointer"
             >
               Refresh
             </button>
@@ -964,14 +988,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               onClick={() => setMobileMoreOpen(true)}
               aria-label="Open admin navigation menu"
               aria-expanded={mobileMoreOpen}
-              className="lg:hidden p-2 rounded-lg text-black hover:bg-neutral-100 transition-colors cursor-pointer"
+              className="lg:hidden p-2 rounded-xl text-black hover:bg-neutral-100 transition-colors cursor-pointer"
             >
               <Menu className="w-5 h-5" />
             </button>
           </div>
         </header>
 
-        <main className="flex-1 px-4 sm:px-6 pt-5 sm:pt-6 pb-24 lg:pb-10 max-w-7xl w-full mx-auto space-y-6">
+        <main className="flex-1 px-4 sm:px-6 pt-5 sm:pt-6 pb-28 lg:pb-12 max-w-7xl w-full mx-auto space-y-6">
           {error && (
             <div role="alert" className="bg-white border border-black rounded-xl p-4 text-sm font-medium flex justify-between">
               <span>{error}</span>
@@ -999,39 +1023,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               {section === 'overview' && (
                 <div className="space-y-6">
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Active Deliveries</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Active Deliveries
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {activeDeliveries.length}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {completedDeliveries.length} completed · {cancelledDeliveries.length} cancelled
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Fleet Status ({riders.length} Riders)</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Fleet Status ({riders.length} Riders)
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {availableRiders.length + busyRiders.length} Online
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {availableRiders.length} available · {busyRiders.length} busy · {offlineRiders.length} offline
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Registered Customers</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Registered Customers
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {customers.length}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {deliveries.length} total parcel orders
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Gross Parcel Volume</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-black text-white border-2 border-black rounded-2xl shadow-sm p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-400">
+                        Gross Parcel Volume
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(grossVolumeNgn)}
                       </p>
-                      <p className="text-xs text-neutral-500 mt-1 tabular-nums">
+                      <p className="text-xs text-neutral-300 mt-1 tabular-nums">
                         Max {settings?.maxActiveParcelsPerRider} parcels/rider
                       </p>
                     </div>
@@ -1180,9 +1212,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* DELIVERIES MANAGEMENT */}
               {section === 'deliveries' && (
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
                   <div className="p-4 sm:p-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-lg overflow-x-auto max-w-full">
+                    <div className="flex items-center gap-1.5 p-1 bg-neutral-100 rounded-xl overflow-x-auto max-w-full">
                       {(
                         [
                           { id: 'all', label: 'All' },
@@ -1196,8 +1228,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           key={f.id}
                           type="button"
                           onClick={() => setDeliveryFilter(f.id)}
-                          className={`px-3 py-1.5 rounded-md text-xs font-semibold cursor-pointer whitespace-nowrap ${
-                            deliveryFilter === f.id ? 'bg-white text-black shadow-sm' : 'text-neutral-600'
+                          className={`px-3.5 py-1.5 rounded-lg text-xs font-display font-bold cursor-pointer whitespace-nowrap transition-colors ${
+                            deliveryFilter === f.id
+                              ? 'bg-black text-white shadow-xs'
+                              : 'text-neutral-600 hover:text-black'
                           }`}
                         >
                           {f.label}
@@ -1429,10 +1463,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* RIDERS MANAGEMENT */}
               {section === 'riders' && (
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                  <div className="px-4 sm:px-6 py-4 sm:py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+                  <div className="px-4 sm:px-6 py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
                     <div>
-                      <h2 className="font-display font-bold text-xl">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Fleet Roster
+                      </p>
+                      <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight mt-0.5">
                         Fleet Riders ({filteredRiders.length})
                       </h2>
                       <p className="text-xs text-neutral-500 mt-0.5">
@@ -1677,10 +1714,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* CUSTOMERS MANAGEMENT */}
               {section === 'customers' && (
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                  <div className="px-4 sm:px-6 py-4 sm:py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+                  <div className="px-4 sm:px-6 py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
                     <div>
-                      <h2 className="font-display font-bold text-xl">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Client Directory
+                      </p>
+                      <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight mt-0.5">
                         Customer Accounts ({filteredCustomers.length})
                       </h2>
                       <p className="text-xs text-neutral-500 mt-0.5">
@@ -1816,10 +1856,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <>
                 <form
                   onSubmit={handleSaveSettings}
-                  className="bg-white border border-neutral-200 rounded-xl p-6 sm:p-8 max-w-3xl space-y-6"
+                  className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-6 sm:p-8 max-w-3xl space-y-6"
                 >
                   <div>
-                    <h2 className="font-display font-bold text-xl">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Dispatch Controls
+                    </p>
+                    <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight mt-0.5">
                       Smart Dispatch, Pricing & WhatsApp Settings
                     </h2>
                     <p className="text-sm text-neutral-600 mt-1">
@@ -2013,48 +2056,56 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <AdminPaymentsSection onNotify={(msg) => setToast(msg)} />
                   {/* Financial Summary Breakdown */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Gross Parcel Volume</p>
-                      <p className="font-display font-extrabold text-2xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Gross Parcel Volume
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(grossVolumeNgn)}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {nonRefundedPayments.length} active/settled transactions
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Rider Payout Pool</p>
-                      <p className="font-display font-extrabold text-2xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Rider Payout Pool
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(riderPayoutsNgn)}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1">Allocated to verified fleet</p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">SAQO Net Revenue</p>
-                      <p className="font-display font-extrabold text-2xl mt-1 tabular-nums">
+                    <div className="bg-black text-white border-2 border-black rounded-2xl shadow-sm p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-400">
+                        SAQO Net Revenue
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(platformRevenueNgn)}
                       </p>
-                      <p className="text-xs text-neutral-500 mt-1">Platform commission share</p>
+                      <p className="text-xs text-neutral-300 mt-1">Platform commission share</p>
                     </div>
                   </div>
 
-                  <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
+                  <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
                     <div className="px-4 sm:px-6 py-4 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-3">
                       <div className="flex items-center gap-2">
                         <AlertTriangle className="w-4 h-4" />
-                        <h2 className="font-display font-bold text-lg">
+                        <h2 className="font-display font-extrabold text-lg tracking-tight">
                           Tickets: Complaints & Suggestions ({filteredTickets.length})
                         </h2>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
-                        <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-lg">
+                        <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-xl">
                           {(['all', 'complaint', 'suggestion'] as const).map((tf) => (
                             <button
                               key={tf}
                               type="button"
                               onClick={() => setTicketFilter(tf)}
-                              className={`px-3 py-1 rounded-md text-xs font-semibold capitalize cursor-pointer ${
-                                ticketFilter === tf ? 'bg-white text-black shadow-sm' : 'text-neutral-600'
+                              className={`px-3 py-1 rounded-lg text-xs font-display font-bold capitalize cursor-pointer transition-colors ${
+                                ticketFilter === tf
+                                  ? 'bg-black text-white shadow-xs'
+                                  : 'text-neutral-600 hover:text-black'
                               }`}
                             >
                               {tf}
@@ -2222,7 +2273,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               {section === 'chats' && (
                 <div className="space-y-4">
                   {/* Live Presence & Filters Bar */}
-                  <div className="bg-white border border-neutral-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-4 sm:p-5 flex flex-wrap items-center justify-between gap-3">
                     <div className="flex items-center gap-3 min-w-0">
                       <span
                         className={`w-2.5 h-2.5 rounded-full shrink-0 ${
@@ -2569,11 +2620,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* Native Mobile Bottom Navigation (5 crisp quick slots + Full Bold Drawer) */}
       <nav
         aria-label="Admin mobile navigation"
-        className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-5 pb-[env(safe-area-inset-bottom)]"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur-md border-t-2 border-black shadow-[0_-8px_28px_rgba(0,0,0,0.08)] grid grid-cols-5 gap-1 px-1.5 pt-1.5 pb-[calc(0.45rem+env(safe-area-inset-bottom))]"
       >
         {navItems.slice(0, 4).map((item) => {
           const targetId = item.id === 'customers' ? 'chats' : item.id;
           const navItem = navItems.find((n) => n.id === targetId)!;
+          const isActive = section === navItem.id && !mobileMoreOpen;
           return (
             <button
               key={navItem.id}
@@ -2582,14 +2634,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 setSection(navItem.id);
                 setMobileMoreOpen(false);
               }}
-              className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-xs font-bold border-t-2 transition-colors ${
-                section === navItem.id ? 'border-black text-black' : 'border-transparent text-neutral-500'
+              className={`relative flex flex-col items-center justify-center py-2 px-0.5 rounded-xl gap-1 transition-all cursor-pointer ${
+                isActive
+                  ? 'bg-black text-white shadow-sm'
+                  : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
               }`}
             >
               {navItem.icon}
-              <span className="truncate max-w-full">{navItem.mobileLabel}</span>
+              <span className="font-display font-extrabold text-[10.5px] sm:text-[11px] leading-none tracking-tight truncate max-w-full">
+                {navItem.mobileLabel}
+              </span>
               {navItem.badge && (
-                <span className="absolute top-1 right-2 min-w-[15px] h-[15px] px-1 rounded-full bg-black text-white text-[9px] font-mono font-bold flex items-center justify-center tabular-nums">
+                <span
+                  className={`absolute top-1 right-1.5 min-w-[15px] h-[15px] px-1 rounded-full text-[9px] font-mono font-bold flex items-center justify-center tabular-nums ${
+                    isActive ? 'bg-white text-black' : 'bg-black text-white'
+                  }`}
+                >
                   {navItem.badge}
                 </span>
               )}
@@ -2600,16 +2660,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           type="button"
           onClick={() => setMobileMoreOpen((v) => !v)}
           aria-expanded={mobileMoreOpen}
-          className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-xs font-bold border-t-2 transition-colors ${
+          className={`relative flex flex-col items-center justify-center py-2 px-0.5 rounded-xl gap-1 transition-all cursor-pointer ${
             ['customers', 'settings', 'finance'].includes(section) || mobileMoreOpen
-              ? 'border-black text-black'
-              : 'border-transparent text-neutral-500'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <MoreHorizontal className="w-4 h-4" />
-          <span>Menu</span>
+          <MoreHorizontal className="w-4 h-4" strokeWidth={2.5} />
+          <span className="font-display font-extrabold text-[10.5px] sm:text-[11px] leading-none tracking-tight">
+            Menu
+          </span>
           {openTicketsCount > 0 && (
-            <span className="absolute top-1 right-2 min-w-[15px] h-[15px] px-1 rounded-full bg-black text-white text-[9px] font-mono font-bold flex items-center justify-center tabular-nums">
+            <span
+              className={`absolute top-1 right-1.5 min-w-[15px] h-[15px] px-1 rounded-full text-[9px] font-mono font-bold flex items-center justify-center tabular-nums ${
+                ['customers', 'settings', 'finance'].includes(section) || mobileMoreOpen
+                  ? 'bg-white text-black'
+                  : 'bg-black text-white'
+              }`}
+            >
               {openTicketsCount}
             </span>
           )}

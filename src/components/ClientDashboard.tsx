@@ -108,9 +108,48 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   onLogout,
   onProfileUpdated,
 }) => {
+  const tabStorageKey = `saqo_client_tab_${profile.id}`;
   const [tab, setTab] = useState<
     'active' | 'send' | 'wallet' | 'history' | 'notifications' | 'tickets' | 'profile' | 'more'
-  >(initialDraft ? 'send' : 'active');
+  >(() => {
+    if (initialDraft) return 'send';
+    try {
+      const saved = window.sessionStorage.getItem(tabStorageKey);
+      if (
+        saved &&
+        ['active', 'send', 'wallet', 'history', 'notifications', 'tickets', 'profile', 'more'].includes(
+          saved,
+        )
+      ) {
+        return saved as
+          | 'active'
+          | 'send'
+          | 'wallet'
+          | 'history'
+          | 'notifications'
+          | 'tickets'
+          | 'profile'
+          | 'more';
+      }
+    } catch {
+      // Ignore storage read errors.
+    }
+    return 'active';
+  });
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(tabStorageKey, tab);
+    } catch {
+      // Ignore storage write errors.
+    }
+  }, [tabStorageKey, tab]);
+
+  useEffect(() => {
+    if (initialDraft) {
+      setTab('send');
+    }
+  }, [initialDraft]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [deliveries, setDeliveries] = useState<DeliveryWithHistory[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -876,19 +915,21 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const unreadCount = notifications.filter((n) => !n.isRead).length;
 
   return (
-    <div className="min-h-screen bg-neutral-50 text-black flex flex-col">
+    <div className="min-h-screen bg-[#F4F4F4] text-black flex flex-col">
       {/* Top Bar */}
       <header className="bg-black text-white border-b border-white/15 px-4 sm:px-6 h-16 flex items-center justify-between gap-4 sticky top-0 z-30">
         <button type="button" onClick={onGoHome} className="cursor-pointer shrink-0">
           <SaqoLogo inverted />
         </button>
 
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium">
+        <nav className="hidden md:flex items-center gap-2 text-sm font-display font-bold">
           <button
             type="button"
             onClick={() => setTab('active')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'active' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
+              tab === 'active'
+  ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
+  : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Track
@@ -897,7 +938,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             type="button"
             onClick={() => setTab('send')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'send' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
+              tab === 'send'
+  ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
+  : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Send a Parcel
@@ -906,7 +949,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             type="button"
             onClick={() => setTab('wallet')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
-              tab === 'wallet' ? 'text-white underline underline-offset-8' : 'text-neutral-400 hover:text-white'
+              tab === 'wallet'
+  ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
+  : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             Wallet
@@ -916,8 +961,8 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             onClick={() => setTab('more')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${
               ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab)
-                ? 'text-white underline underline-offset-8'
-                : 'text-neutral-400 hover:text-white'
+                ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
+                : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
             More{unreadCount > 0 ? ` (${unreadCount})` : ''}
@@ -1157,10 +1202,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             <form
               id="client-send-parcel-form"
               onSubmit={handleCreateDelivery}
-              className="lg:col-span-7 bg-white border border-neutral-200 rounded-xl p-5 sm:p-8 space-y-6"
+              className="lg:col-span-7 bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-8 space-y-6"
             >
               <div>
-                <h1 className="font-display font-extrabold text-2xl">Request a Parcel Pickup</h1>
+                <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                  Book Dispatch
+                </p>
+                <h1 className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-0.5">
+                  Request a Parcel Pickup
+                </h1>
                 <p className="text-sm text-neutral-600 mt-1">
                   Tap any address field to search landmarks or detect GPS location.
                 </p>
@@ -1678,15 +1728,20 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div>
-                <h1 className="font-display font-extrabold text-2xl">Active Parcel Deliveries</h1>
-                <p className="text-sm text-neutral-600">
+                <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                  Live Dispatch
+                </p>
+                <h1 className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-0.5">
+                  Active Parcel Deliveries
+                </h1>
+                <p className="text-sm text-neutral-600 mt-0.5">
                   Real-time rider location, status updates, and delivery OTP confirmation.
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => setTab('send')}
-                className="inline-flex items-center gap-2 bg-black text-white px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-neutral-800 transition-colors cursor-pointer"
+                className="inline-flex items-center gap-2 bg-black text-white px-5 py-3 rounded-xl font-display font-bold text-sm hover:bg-neutral-800 shadow-sm transition-colors cursor-pointer"
               >
                 <Plus className="w-4 h-4" />
                 <span>Send a Parcel</span>
@@ -1694,11 +1749,11 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             </div>
 
             {loading ? (
-              <div className="bg-white border border-neutral-200 rounded-xl p-10 text-sm text-neutral-500">
+              <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-10 text-sm text-neutral-500">
                 Loading deliveries...
               </div>
             ) : activeTabList.length === 0 ? (
-              <div className="bg-white border border-neutral-200 rounded-xl p-10 text-center space-y-3">
+              <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-10 text-center space-y-3">
                 <Package className="w-8 h-8 mx-auto text-neutral-400" />
                 <p className="font-display font-bold text-lg">
                   {pastDeliveries.length === 0
@@ -1815,7 +1870,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                       heightClass="h-[360px]"
                     />
 
-                    <div className="bg-white border border-neutral-200 rounded-xl p-6 space-y-6">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-7 space-y-6">
                       <div className="flex flex-wrap items-start justify-between gap-4 border-b border-neutral-200 pb-4">
                         <div>
                           <div className="flex flex-wrap items-center gap-2 font-mono text-xs text-neutral-500">
@@ -1942,17 +1997,19 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                           </div>
                         </div>
 
-                        <div className="bg-neutral-50 border border-neutral-200 rounded-lg p-4 space-y-3">
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs text-neutral-500 font-medium">Delivery OTP</span>
-                            <span className="font-mono font-bold text-lg tracking-widest tabular-nums">
+                        <div className="bg-black text-white rounded-2xl p-4 sm:p-5 space-y-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-[11px] uppercase tracking-widest text-neutral-400">
+                              Delivery OTP
+                            </span>
+                            <span className="font-mono font-extrabold text-2xl tracking-[0.2em] tabular-nums bg-white text-black px-3 py-1 rounded-lg">
                               {selectedDelivery.deliveryOtp}
                             </span>
                           </div>
-                          <div className="border-t border-neutral-200 pt-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <div className="border-t border-white/15 pt-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
                             <div>
-                              <span className="text-neutral-500">Payment: </span>
-                              <span className="font-semibold text-black">
+                              <span className="text-neutral-400">Payment: </span>
+                              <span className="font-semibold text-white">
                                 {formatPaymentMethodLabel(selectedDelivery.paymentMethod)}
                               </span>
                             </div>
@@ -2295,10 +2352,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                   d.status !== 'cancelled' &&
                   ['unpaid', 'pending', 'failed', 'reversed'].includes(d.paymentStatus || 'pending')
               )) && (
-              <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
+              <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
                 <div className="px-6 py-4 border-b border-neutral-200 flex items-center justify-between">
                   <div>
-                    <h2 className="font-display font-bold text-base">Deliveries Awaiting Payment</h2>
+                    <h2 className="font-display font-extrabold text-base tracking-tight">Deliveries Awaiting Payment</h2>
                     <p className="text-xs text-neutral-500">
                       Settle unpaid or pending parcel deliveries directly from your wallet or via Flutterwave.
                     </p>
@@ -2376,7 +2433,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             {/* Filterable Transaction & Ledger History */}
             <div
               id="wallet-transactions-list"
-              className="bg-white border border-neutral-200 rounded-xl overflow-hidden"
+              className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden"
             >
               <div className="px-6 py-4 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
                 <div>
@@ -2628,11 +2685,16 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
         {/* HISTORY TAB */}
         {tab === 'history' && (
-          <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-            <div className="px-4 sm:px-6 py-4 sm:py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-3">
+          <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+            <div className="px-4 sm:px-6 py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h1 className="font-display font-bold text-xl">Delivery History</h1>
-                <p className="text-xs text-neutral-500 mt-0.5">
+                <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                  Archive &amp; Receipts
+                </p>
+                <h1 className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-0.5">
+                  Delivery History
+                </h1>
+                <p className="text-xs font-medium text-neutral-500 mt-0.5">
                   Completed and cancelled parcels ({filteredPastDeliveries.length})
                 </p>
               </div>
@@ -2847,19 +2909,28 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
         {/* NOTIFICATIONS TAB */}
         {tab === 'notifications' && (
-          <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-            <div className="px-6 py-5 border-b border-neutral-200 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Bell className="w-4 h-4" />
-                <h1 className="font-display font-bold text-xl">Delivery Notifications</h1>
+          <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+            <div className="px-5 sm:px-6 py-5 border-b border-neutral-200 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <span className="w-10 h-10 rounded-xl bg-black text-white flex items-center justify-center shrink-0">
+                  <Bell className="w-5 h-5" />
+                </span>
+                <div>
+                  <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                    Inbox
+                  </p>
+                  <h1 className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight">
+                    Delivery Alerts
+                  </h1>
+                </div>
               </div>
               {unreadCount > 0 && (
                 <button
                   type="button"
                   onClick={handleMarkNotificationsRead}
-                  className="text-xs font-semibold underline cursor-pointer"
+                  className="bg-black text-white px-3.5 py-2 rounded-full font-display font-bold text-xs hover:bg-neutral-800 transition-colors cursor-pointer"
                 >
-                  Mark all as read
+                  Mark all read
                 </button>
               )}
             </div>
@@ -2890,10 +2961,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <form
               onSubmit={handleSubmitTicket}
-              className="lg:col-span-5 bg-white border border-neutral-200 rounded-xl p-5 sm:p-6 space-y-5"
+              className="lg:col-span-5 bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6 space-y-5"
             >
               <div>
-                <h1 className="font-display font-extrabold text-xl">Create a Ticket</h1>
+                <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                  Support Desk
+                </p>
+                <h1 className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-0.5">
+                  Create a Ticket
+                </h1>
                 <p className="text-xs text-neutral-600 mt-1">
                   Share a product suggestion or report a delivery complaint directly to SAQO Operations.
                 </p>
@@ -2988,9 +3064,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
               </button>
             </form>
 
-            <div className="lg:col-span-7 bg-white border border-neutral-200 rounded-xl overflow-hidden">
+            <div className="lg:col-span-7 bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
               <div className="px-5 sm:px-6 py-4 border-b border-neutral-200 flex items-center justify-between">
-                <h2 className="font-display font-bold text-lg">
+                <h2 className="font-display font-extrabold text-lg tracking-tight">
                   Your Tickets ({tickets.length})
                 </h2>
               </div>
@@ -3058,20 +3134,22 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
               </button>
             </div>
 
-            <div className="bg-white border border-neutral-200 rounded-2xl divide-y divide-neutral-200 overflow-hidden">
+            <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs divide-y divide-neutral-200 overflow-hidden">
               <button
                 type="button"
                 onClick={() => setTab('history')}
                 className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
               >
                 <div className="flex items-center gap-3.5">
-                  <Clock className="w-5 h-5 text-black" />
+                  <span className="w-10 h-10 rounded-xl bg-neutral-100 text-black flex items-center justify-center shrink-0">
+                    <Clock className="w-5 h-5" />
+                  </span>
                   <div>
-                    <p className="font-display font-bold text-base">Delivery History</p>
+                    <p className="font-display font-extrabold text-base tracking-tight">Delivery History</p>
                     <p className="text-xs text-neutral-500">Past parcels, receipts &amp; rider ratings ({pastDeliveries.length})</p>
                   </div>
                 </div>
-                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+                <ArrowUpRight className="w-4 h-4 text-neutral-500" />
               </button>
 
               <button
@@ -3080,15 +3158,17 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
               >
                 <div className="flex items-center gap-3.5">
-                  <Bell className="w-5 h-5 text-black" />
+                  <span className="w-10 h-10 rounded-xl bg-neutral-100 text-black flex items-center justify-center shrink-0">
+                    <Bell className="w-5 h-5" />
+                  </span>
                   <div>
-                    <p className="font-display font-bold text-base">
+                    <p className="font-display font-extrabold text-base tracking-tight">
                       Alerts &amp; Updates{unreadCount > 0 ? ` (${unreadCount})` : ''}
                     </p>
                     <p className="text-xs text-neutral-500">Real-time parcel &amp; rider dispatch alerts</p>
                   </div>
                 </div>
-                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+                <ArrowUpRight className="w-4 h-4 text-neutral-500" />
               </button>
 
               <button
@@ -3097,15 +3177,17 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
               >
                 <div className="flex items-center gap-3.5">
-                  <MessageSquarePlus className="w-5 h-5 text-black" />
+                  <span className="w-10 h-10 rounded-xl bg-neutral-100 text-black flex items-center justify-center shrink-0">
+                    <MessageSquarePlus className="w-5 h-5" />
+                  </span>
                   <div>
-                    <p className="font-display font-bold text-base">
+                    <p className="font-display font-extrabold text-base tracking-tight">
                       Support &amp; Tickets{tickets.length > 0 ? ` (${tickets.length})` : ''}
                     </p>
                     <p className="text-xs text-neutral-500">Complaints, suggestions &amp; ops follow-up</p>
                   </div>
                 </div>
-                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+                <ArrowUpRight className="w-4 h-4 text-neutral-500" />
               </button>
 
               <button
@@ -3114,13 +3196,17 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors cursor-pointer"
               >
                 <div className="flex items-center gap-3.5">
-                  <User className="w-5 h-5 text-black" />
+                  <span className="w-10 h-10 rounded-xl bg-neutral-100 text-black flex items-center justify-center shrink-0">
+                    <User className="w-5 h-5" />
+                  </span>
                   <div>
-                    <p className="font-display font-bold text-base">Profile &amp; Alert Settings</p>
+                    <p className="font-display font-extrabold text-base tracking-tight">
+                      Profile &amp; Alert Settings
+                    </p>
                     <p className="text-xs text-neutral-500">Update name, phone &amp; notification preferences</p>
                   </div>
                 </div>
-                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+                <ArrowUpRight className="w-4 h-4 text-neutral-500" />
               </button>
 
               <a
@@ -3130,13 +3216,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-neutral-50 transition-colors"
               >
                 <div className="flex items-center gap-3.5">
-                  <MessageCircle className="w-5 h-5 text-black" />
+                  <span className="w-10 h-10 rounded-xl bg-neutral-100 text-black flex items-center justify-center shrink-0">
+                    <MessageCircle className="w-5 h-5" />
+                  </span>
                   <div>
-                    <p className="font-display font-bold text-base">WhatsApp Support</p>
+                    <p className="font-display font-extrabold text-base tracking-tight">WhatsApp Support</p>
                     <p className="text-xs text-neutral-500">Chat directly with SAQO Operations</p>
                   </div>
                 </div>
-                <ArrowUpRight className="w-4 h-4 text-neutral-400" />
+                <ArrowUpRight className="w-4 h-4 text-neutral-500" />
               </a>
             </div>
 
@@ -3517,49 +3605,79 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       {/* Native 4-Item Mobile Bottom Navigation */}
       <nav
         aria-label="Client mobile navigation"
-        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-4 pb-[env(safe-area-inset-bottom)]"
+        className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur-md border-t-2 border-black shadow-[0_-8px_28px_rgba(0,0,0,0.08)] grid grid-cols-4 gap-1.5 px-2 pt-1.5 pb-[calc(0.45rem+env(safe-area-inset-bottom))]"
       >
         <button
           type="button"
           onClick={() => setTab('active')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'active' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'active'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <MapPin className="w-4 h-4" />
-          <span>Track</span>
+          <MapPin className="w-[18px] h-[18px]" strokeWidth={tab === 'active' ? 2.5 : 2} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Track
+          </span>
         </button>
         <button
           type="button"
           onClick={() => setTab('send')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'send' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'send'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <Plus className="w-4 h-4" />
-          <span>Send</span>
+          <Plus className="w-[18px] h-[18px]" strokeWidth={tab === 'send' ? 2.75 : 2.25} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Send
+          </span>
         </button>
         <button
           type="button"
           onClick={() => setTab('wallet')}
-          className={`flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
-            tab === 'wallet' ? 'border-black text-black' : 'border-transparent text-neutral-500'
+          className={`flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
+            tab === 'wallet'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <Wallet className="w-4 h-4" />
-          <span>Wallet</span>
+          <Wallet className="w-[18px] h-[18px]" strokeWidth={tab === 'wallet' ? 2.5 : 2} />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            Wallet
+          </span>
         </button>
         <button
           type="button"
           onClick={() => setTab('more')}
-          className={`relative flex flex-col items-center justify-center py-2.5 gap-1 text-xs font-bold border-t-2 transition-colors ${
+          className={`relative flex flex-col items-center justify-center py-2 px-1 rounded-xl gap-1 transition-all cursor-pointer ${
             ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab)
-              ? 'border-black text-black'
-              : 'border-transparent text-neutral-500'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <LayoutGrid className="w-4 h-4" />
-          <span>More{unreadCount > 0 ? ` (${unreadCount})` : ''}</span>
+          <LayoutGrid
+            className="w-[18px] h-[18px]"
+            strokeWidth={
+              ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab) ? 2.5 : 2
+            }
+          />
+          <span className="font-display font-extrabold text-[11px] leading-none tracking-tight">
+            More
+          </span>
+          {unreadCount > 0 && (
+            <span
+              className={`absolute top-1 right-2.5 min-w-[16px] h-4 px-1 rounded-full font-mono font-bold text-[10px] leading-none flex items-center justify-center tabular-nums ${
+                ['more', 'history', 'notifications', 'tickets', 'profile'].includes(tab)
+                  ? 'bg-white text-black'
+                  : 'bg-black text-white'
+              }`}
+            >
+              {unreadCount > 9 ? '9+' : unreadCount}
+            </span>
+          )}
         </button>
       </nav>
     </div>
