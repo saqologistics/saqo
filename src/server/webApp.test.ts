@@ -586,6 +586,45 @@ test('Concurrency, race conditions, OTP isolation, wallet atomicity, and DB supp
       (acceptRace.status !== 200 && cancelRace.status === 200 && matched.status === 'cancelled'),
     'Accept vs cancel race must resolve deterministically cleanly'
   );
+
+  // 4. Going offline while holding an unaccepted offer immediately releases the offer
+  const offDelRes = await api(
+    '/api/deliveries',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        pickupState: 'Katsina',
+        pickupAddress: 'Batagarawa Road, Katsina',
+        pickupLat: 12.95,
+        pickupLng: 7.60,
+        destinationState: 'Katsina',
+        destinationAddress: 'Central Market, Katsina',
+        destinationLat: 12.989,
+        destinationLng: 7.601,
+        recipientName: 'Offline Release Receiver',
+        recipientPhone: '+2348087776655',
+        parcelCategory: 'Documents',
+        parcelDescription: 'Offline offer release test',
+        weightKg: 1,
+        paymentMethod: 'cash',
+      }),
+    },
+    cliToken
+  );
+  assert.equal(offDelRes.status, 201);
+  const { delivery: offDel } = (await offDelRes.json()) as { delivery: { id: string; assignedRiderId: string } };
+  assert.equal(offDel.assignedRiderId, rcRider.riderId);
+
+  const goOffline = await api(
+    '/api/rider/availability',
+    { method: 'PATCH', body: JSON.stringify({ isOnline: false }) },
+    rcToken
+  );
+  assert.equal(goOffline.status, 200);
+  const stillOfferedForOffline = (await db
+    .prepare("SELECT id FROM delivery_assignments WHERE delivery_id = ? AND rider_id = ? AND status = 'offered'")
+    .all(offDel.id, rcRider.riderId)) as Array<{ id: string }>;
+  assert.equal(stillOfferedForOffline.length, 0, 'Offline rider must no longer hold an open offered assignment');
 });
 
 test.after(() => {

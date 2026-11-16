@@ -1554,27 +1554,28 @@ export async function createDeliveryPaymentRecords(params: {
       now
     );
 
-    syncAsync((sb) =>
-      Promise.resolve(
-        sb.from('cash_collections').upsert({
-          id: ccId,
-          delivery_id: params.deliveryId,
-          tracking_code: params.trackingCode,
-          payment_transaction_id: tx.id,
-          customer_id: params.customerProfileId,
-          payment_method: params.paymentMethod,
-          expected_amount_ngn: roundCurrency(params.amountNgn),
-          collected_amount_ngn: 0,
-          status: initialStatus,
-          transfer_reference: params.transferReference?.trim() || null,
-          transfer_proof_note: params.transferProofNote?.trim() || null,
-          created_at: now,
-          updated_at: now,
-        })
-      )
-    );
-
-    const publish = async () => await broadcastWsEvent('cash_collection:updated', { deliveryId: params.deliveryId, status: initialStatus });
+    const publish = async () => {
+      syncAsync((sb) =>
+        Promise.resolve(
+          sb.from('cash_collections').upsert({
+            id: ccId,
+            delivery_id: params.deliveryId,
+            tracking_code: params.trackingCode,
+            payment_transaction_id: tx.id,
+            customer_id: params.customerProfileId,
+            payment_method: params.paymentMethod,
+            expected_amount_ngn: roundCurrency(params.amountNgn),
+            collected_amount_ngn: 0,
+            status: initialStatus,
+            transfer_reference: params.transferReference?.trim() || null,
+            transfer_proof_note: params.transferProofNote?.trim() || null,
+            created_at: now,
+            updated_at: now,
+          })
+        )
+      );
+      await broadcastWsEvent('cash_collection:updated', { deliveryId: params.deliveryId, status: initialStatus });
+    };
     if (!deferDatabaseEffect(() => void publish().catch(console.error))) await publish();
     return { paymentStatus: initialStatus, paymentReference: reference, paymentTransaction: tx };
   }
@@ -2723,49 +2724,54 @@ export async function processAdminRefund(params: {
     if (refundStatus === 'completed') isFullyRefunded = await applyCompletedRefund(tx.id, now);
   });
 
-  if (refundStatus === 'pending') {
-    await notifyUser(tx.userId, 'Refund Initiated', `Flutterwave is processing refund ${refundRef}.`, tx.deliveryId);
-  } else await notifyUser(
-    tx.userId,
-    isFullyRefunded ? 'Payment Refunded' : 'Partial Payment Refunded',
-    `₦${amount.toLocaleString()} refunded (${params.destination}) for ${tx.trackingCode || tx.reference}. Reason: ${cleanReason}`,
-    tx.deliveryId
-  );
-  await broadcastWsEvent('payment:updated', mapPaymentTxRow(await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id)));
-  if (tx.deliveryId) {
-    const d = await getDeliveryById(tx.deliveryId);
-    if (d) await broadcastWsEvent('delivery:updated', d);
-  }
-
-  syncAsync(async (sb) => {
-    await sb.from('refunds').upsert({
-      id: refundId,
-      reference: refundRef,
-      payment_transaction_id: tx.id,
-      delivery_id: tx.deliveryId,
-      user_id: tx.userId,
-      amount_ngn: amount,
-      destination: params.destination,
-      reason: cleanReason,
-      status: refundStatus,
-      provider_refund_id: providerRefundId,
-      initiated_by: params.adminId,
-      processed_at: refundStatus === 'completed' ? now : null,
-      created_at: now,
-    });
-    if (isFullyRefunded) {
-      await sb
-        .from('payment_transactions')
-        .update({ status: 'refunded', updated_at: now })
-        .eq('reference', tx.reference);
-      if (tx.deliveryId && (await getDeliveryById(tx.deliveryId))?.paymentReference === tx.reference) {
-        await sb
-          .from('delivery_requests')
-          .update({ payment_status: 'refunded', updated_at: now })
-          .eq('id', tx.deliveryId);
-      }
+  const publish = async () => {
+    if (refundStatus === 'pending') {
+      await notifyUser(tx.userId, 'Refund Initiated', `Flutterwave is processing refund ${refundRef}.`, tx.deliveryId);
+    } else await notifyUser(
+      tx.userId,
+      isFullyRefunded ? 'Payment Refunded' : 'Partial Payment Refunded',
+      `₦${amount.toLocaleString()} refunded (${params.destination}) for ${tx.trackingCode || tx.reference}. Reason: ${cleanReason}`,
+      tx.deliveryId
+    );
+    await broadcastWsEvent('payment:updated', mapPaymentTxRow(await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id)));
+    if (tx.deliveryId) {
+      const d = await getDeliveryById(tx.deliveryId);
+      if (d) await broadcastWsEvent('delivery:updated', d);
     }
-  });
+
+    syncAsync(async (sb) => {
+      await sb.from('refunds').upsert({
+        id: refundId,
+        reference: refundRef,
+        payment_transaction_id: tx.id,
+        delivery_id: tx.deliveryId,
+        user_id: tx.userId,
+        amount_ngn: amount,
+        destination: params.destination,
+        reason: cleanReason,
+        status: refundStatus,
+        provider_refund_id: providerRefundId,
+        initiated_by: params.adminId,
+        processed_at: refundStatus === 'completed' ? now : null,
+        created_at: now,
+      });
+      if (isFullyRefunded) {
+        await sb
+          .from('payment_transactions')
+          .update({ status: 'refunded', updated_at: now })
+          .eq('reference', tx.reference);
+        if (tx.deliveryId && (await getDeliveryById(tx.deliveryId))?.paymentReference === tx.reference) {
+          await sb
+            .from('delivery_requests')
+            .update({ payment_status: 'refunded', updated_at: now })
+            .eq('id', tx.deliveryId);
+        }
+      }
+    });
+  };
+  if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+    await publish();
+  }
 
   const inserted = await db.prepare(`
     SELECT rf.*, pt.reference as payment_reference, dr.tracking_code, p.full_name as customer_name
@@ -3305,21 +3311,26 @@ export async function cancelDeliveryPayments(deliveryId: string, opts?: { reason
     ).run(deliveryId);
   });
 
-  for (const id of updatedIds) {
-    const row = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id);
-    if (row) await broadcastWsEvent('payment:updated', mapPaymentTxRow(row));
-  }
+  const publish = async () => {
+    for (const id of updatedIds) {
+      const row = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id);
+      if (row) await broadcastWsEvent('payment:updated', mapPaymentTxRow(row));
+    }
 
-  syncAsync(async (sb) => {
-    await sb
-      .from('payment_transactions')
-      .update({ status: 'failed', failure_reason: reason, updated_at: now })
-      .eq('delivery_id', deliveryId)
-      .in('status', ['pending', 'pending_verification']);
-    await sb
-      .from('cash_collections')
-      .delete()
-      .eq('delivery_id', deliveryId)
-      .in('status', ['pending', 'pending_verification', 'disputed']);
-  });
+    syncAsync(async (sb) => {
+      await sb
+        .from('payment_transactions')
+        .update({ status: 'failed', failure_reason: reason, updated_at: now })
+        .eq('delivery_id', deliveryId)
+        .in('status', ['pending', 'pending_verification']);
+      await sb
+        .from('cash_collections')
+        .delete()
+        .eq('delivery_id', deliveryId)
+        .in('status', ['pending', 'pending_verification', 'disputed']);
+    });
+  };
+  if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+    await publish();
+  }
 }
