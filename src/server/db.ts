@@ -287,6 +287,11 @@ function initSqliteDatabase(): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS support_agent_heartbeats (
+      profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_deliveries_customer ON delivery_requests(customer_id);
     CREATE INDEX IF NOT EXISTS idx_deliveries_rider ON delivery_requests(assigned_rider_id);
     CREATE INDEX IF NOT EXISTS idx_deliveries_status ON delivery_requests(status);
@@ -601,6 +606,24 @@ export async function getAdminAcceptingChats(): Promise<boolean> {
 
 export async function setAdminAcceptingChatsDb(available: boolean): Promise<void> {
   await db.prepare('UPDATE platform_settings SET admin_accepting_chats = ? WHERE id = 1').run(available ? 1 : 0);
+}
+
+export async function refreshSupportAgentHeartbeat(profileId: string): Promise<void> {
+  const expiresAt = new Date(Date.now() + 75000).toISOString();
+  await db.prepare(`
+    INSERT INTO support_agent_heartbeats (profile_id, expires_at) VALUES (?, ?)
+    ON CONFLICT (profile_id) DO UPDATE SET expires_at = EXCLUDED.expires_at
+    WHERE support_agent_heartbeats.expires_at < EXCLUDED.expires_at
+  `).run(profileId, expiresAt);
+}
+
+export async function countActiveSupportAgents(): Promise<number> {
+  const row = await db.prepare(`
+    SELECT COUNT(*) AS total FROM support_agent_heartbeats h
+    JOIN profiles p ON p.id = h.profile_id
+    WHERE p.role = 'admin' AND p.account_status = 'active' AND h.expires_at > ?
+  `).get(new Date().toISOString());
+  return Number(row?.total || 0);
 }
 
 export async function initDatabase() {
@@ -1052,15 +1075,14 @@ export async function getSupportConversationsForVisitor(params: {
   const { visitorToken, userId } = params;
   if (userId && visitorToken) {
     // Associate any anonymous conversations started in the same browser with this signed-in user
-    await db.prepare(
-      `UPDATE support_conversations SET user_id = ? WHERE visitor_token = ? AND user_id IS NULL`
-    ).run(userId, visitorToken);
-    const rows = await db
-      .prepare(
-        `SELECT * FROM support_conversations WHERE user_id = ? OR visitor_token = ? ORDER BY last_message_at DESC`
-      )
-      .all(userId, visitorToken) as any[];
-    return rows.map(mapSupportConversationRow);
+    return databaseTransaction(async () => {
+      await db.prepare(
+        `UPDATE support_conversations SET user_id = ? WHERE visitor_token = ? AND user_id IS NULL`
+      ).run(userId, visitorToken);
+      const rows = await db.prepare('SELECT * FROM support_conversations WHERE user_id = ? ORDER BY last_message_at DESC')
+        .all(userId);
+      return rows.map(mapSupportConversationRow);
+    });
   }
   if (userId) {
     const rows = await db
@@ -1071,7 +1093,7 @@ export async function getSupportConversationsForVisitor(params: {
   if (visitorToken) {
     const rows = await db
       .prepare(
-        `SELECT * FROM support_conversations WHERE visitor_token = ? ORDER BY last_message_at DESC`
+        `SELECT * FROM support_conversations WHERE visitor_token = ? AND user_id IS NULL ORDER BY last_message_at DESC`
       )
       .all(visitorToken) as any[];
     return rows.map(mapSupportConversationRow);
@@ -1103,46 +1125,48 @@ export async function createSupportConversation(input: {
   initialMessage: string;
   senderRole: SupportSenderRole;
 }): Promise<{ conversation: SupportConversation; message: SupportMessage }> {
-  const convId = `chat-${crypto.randomUUID().slice(0, 8)}`;
-  const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
-  const now = new Date().toISOString();
-  const cleanPreview = input.initialMessage.trim().slice(0, 140);
+  return databaseTransaction(async () => {
+    const convId = `chat-${crypto.randomUUID().slice(0, 8)}`;
+    const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
+    const now = new Date().toISOString();
+    const cleanPreview = input.initialMessage.trim().slice(0, 140);
 
-  await db.prepare(`
-    INSERT INTO support_conversations (
-      id, visitor_token, user_id, visitor_name, visitor_email, visitor_phone,
-      tracking_code, status, assigned_admin_id, unread_by_admin, unread_by_visitor,
-      last_message_preview, last_message_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, 1, 0, ?, ?, ?)
-  `).run(
-    convId,
-    input.visitorToken,
-    input.userId,
-    input.visitorName.trim(),
-    input.visitorEmail ? input.visitorEmail.trim() : null,
-    input.visitorPhone ? input.visitorPhone.trim() : null,
-    input.trackingCode ? input.trackingCode.trim().toUpperCase() : null,
-    cleanPreview,
-    now,
-    now
-  );
+    await db.prepare(`
+      INSERT INTO support_conversations (
+        id, visitor_token, user_id, visitor_name, visitor_email, visitor_phone,
+        tracking_code, status, assigned_admin_id, unread_by_admin, unread_by_visitor,
+        last_message_preview, last_message_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, 1, 0, ?, ?, ?)
+    `).run(
+      convId,
+      input.visitorToken,
+      input.userId,
+      input.visitorName.trim(),
+      input.visitorEmail ? input.visitorEmail.trim() : null,
+      input.visitorPhone ? input.visitorPhone.trim() : null,
+      input.trackingCode ? input.trackingCode.trim().toUpperCase() : null,
+      cleanPreview,
+      now,
+      now
+    );
 
-  await db.prepare(`
-    INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(msgId, convId, input.senderRole, input.visitorName.trim(), input.initialMessage.trim(), now);
+    await db.prepare(`
+      INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(msgId, convId, input.senderRole, input.visitorName.trim(), input.initialMessage.trim(), now);
 
-  return {
-    conversation: (await getSupportConversationById(convId))!,
-    message: {
-      id: msgId,
-      conversationId: convId,
-      senderRole: input.senderRole,
-      senderName: input.visitorName.trim(),
-      body: input.initialMessage.trim(),
-      createdAt: now,
-    },
-  };
+    return {
+      conversation: (await getSupportConversationById(convId))!,
+      message: {
+        id: msgId,
+        conversationId: convId,
+        senderRole: input.senderRole,
+        senderName: input.visitorName.trim(),
+        body: input.initialMessage.trim(),
+        createdAt: now,
+      },
+    };
+  });
 }
 
 export async function addSupportMessage(input: {
@@ -1152,56 +1176,58 @@ export async function addSupportMessage(input: {
   body: string;
   assignedAdminId?: string | null;
 }): Promise<{ conversation: SupportConversation; message: SupportMessage }> {
-  const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
-  const now = new Date().toISOString();
-  const cleanBody = input.body.trim();
-  const preview = cleanBody.slice(0, 140);
+  return databaseTransaction(async () => {
+    const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
+    const now = new Date().toISOString();
+    const cleanBody = input.body.trim();
+    const preview = cleanBody.slice(0, 140);
 
-  await db.prepare(`
-    INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(msgId, input.conversationId, input.senderRole, input.senderName, cleanBody, now);
+    await db.prepare(`
+      INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(msgId, input.conversationId, input.senderRole, input.senderName, cleanBody, now);
 
-  if (input.senderRole === 'admin') {
-    await db.prepare(`
-      UPDATE support_conversations
-      SET unread_by_visitor = unread_by_visitor + 1,
-          unread_by_admin = 0,
-          status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
-          assigned_admin_id = COALESCE(?, assigned_admin_id),
-          last_message_preview = ?,
-          last_message_at = ?
-      WHERE id = ?
-    `).run(input.assignedAdminId || null, preview, now, input.conversationId);
-  } else if (input.senderRole === 'system') {
-    await db.prepare(`
-      UPDATE support_conversations
-      SET last_message_preview = ?, last_message_at = ?
-      WHERE id = ?
-    `).run(preview, now, input.conversationId);
-  } else {
-    await db.prepare(`
-      UPDATE support_conversations
-      SET unread_by_admin = unread_by_admin + 1,
-          unread_by_visitor = 0,
-          status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
-          last_message_preview = ?,
-          last_message_at = ?
-      WHERE id = ?
-    `).run(preview, now, input.conversationId);
-  }
+    if (input.senderRole === 'admin') {
+      await db.prepare(`
+        UPDATE support_conversations
+        SET unread_by_visitor = unread_by_visitor + 1,
+            unread_by_admin = 0,
+            status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
+            assigned_admin_id = COALESCE(?, assigned_admin_id),
+            last_message_preview = ?,
+            last_message_at = ?
+        WHERE id = ?
+      `).run(input.assignedAdminId || null, preview, now, input.conversationId);
+    } else if (input.senderRole === 'system') {
+      await db.prepare(`
+        UPDATE support_conversations
+        SET last_message_preview = ?, last_message_at = ?
+        WHERE id = ?
+      `).run(preview, now, input.conversationId);
+    } else {
+      await db.prepare(`
+        UPDATE support_conversations
+        SET unread_by_admin = unread_by_admin + 1,
+            unread_by_visitor = 0,
+            status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
+            last_message_preview = ?,
+            last_message_at = ?
+        WHERE id = ?
+      `).run(preview, now, input.conversationId);
+    }
 
-  return {
-    conversation: (await getSupportConversationById(input.conversationId))!,
-    message: {
-      id: msgId,
-      conversationId: input.conversationId,
-      senderRole: input.senderRole,
-      senderName: input.senderName,
-      body: cleanBody,
-      createdAt: now,
-    },
-  };
+    return {
+      conversation: (await getSupportConversationById(input.conversationId))!,
+      message: {
+        id: msgId,
+        conversationId: input.conversationId,
+        senderRole: input.senderRole,
+        senderName: input.senderName,
+        body: cleanBody,
+        createdAt: now,
+      },
+    };
+  });
 }
 
 export async function markSupportConversationRead(
@@ -1225,23 +1251,25 @@ export async function updateSupportConversationStatus(
   status: SupportConversationStatus,
   actorName: string
 ): Promise<{ conversation: SupportConversation; systemMessage: SupportMessage } | null> {
-  const existing = await getSupportConversationById(conversationId);
-  if (!existing) return null;
-  await db.prepare('UPDATE support_conversations SET status = ? WHERE id = ?').run(
-    status,
-    conversationId
-  );
-  const labelMap: Record<SupportConversationStatus, string> = {
-    open: 'reopened',
-    pending: 'marked as awaiting response',
-    resolved: 'marked as resolved',
-    closed: 'closed',
-  };
-  const { conversation, message } = await addSupportMessage({
-    conversationId,
-    senderRole: 'system',
-    senderName: 'SAQO Support',
-    body: `Conversation ${labelMap[status]} by ${actorName}.`,
+  return databaseTransaction(async () => {
+    const existing = await getSupportConversationById(conversationId);
+    if (!existing) return null;
+    await db.prepare('UPDATE support_conversations SET status = ? WHERE id = ?').run(
+      status,
+      conversationId
+    );
+    const labelMap: Record<SupportConversationStatus, string> = {
+      open: 'reopened',
+      pending: 'marked as awaiting response',
+      resolved: 'marked as resolved',
+      closed: 'closed',
+    };
+    const { conversation, message } = await addSupportMessage({
+      conversationId,
+      senderRole: 'system',
+      senderName: 'SAQO Support',
+      body: `Conversation ${labelMap[status]} by ${actorName}.`,
+    });
+    return { conversation, systemMessage: message };
   });
-  return { conversation, systemMessage: message };
 }

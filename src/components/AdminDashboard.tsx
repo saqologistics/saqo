@@ -27,6 +27,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiRequest } from '../lib/api';
+import { isSupabaseEdgeApi } from '../lib/deployment';
 import { useRealtime } from '../hooks/useRealtime';
 import { NIGERIA_STATES } from '../shared/nigeria';
 import { formatNaira } from '../shared/pricing';
@@ -189,6 +190,35 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const adminChatEndRef = React.useRef<HTMLDivElement | null>(null);
   const lastAdminTypingEmitRef = React.useRef<number>(0);
   const presenceUpdateCount = React.useRef(0);
+  const activeAdminThread = React.useRef(activeChatId);
+  activeAdminThread.current = activeChatId;
+  const chatMessageRequest = React.useRef(0);
+  const changingPresence = React.useRef(false);
+
+  useEffect(() => {
+    if (!isSupabaseEdgeApi) return;
+    const controller = new AbortController();
+    let timer: number;
+    const heartbeat = async () => {
+      const revision = presenceUpdateCount.current;
+      try {
+        const { presence } = await apiRequest<{ presence: SupportPresence }>('/api/admin/support/heartbeat', {
+          method: 'POST',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]),
+        });
+        if (!controller.signal.aborted && revision === presenceUpdateCount.current) setChatPresence(presence);
+      } catch {
+        // The next heartbeat retries a transient connection failure.
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(heartbeat, 25000);
+      }
+    };
+    void heartbeat();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [profile.id]);
 
   const loadSupportChats = useCallback(async () => {
     const presenceUpdate = presenceUpdateCount.current;
@@ -199,9 +229,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         adminAcceptingChats: boolean;
       }>('/api/admin/support/conversations');
       setConversations(res.conversations);
-      if (res.presence && presenceUpdate === presenceUpdateCount.current) setChatPresence(res.presence);
-      if (typeof res.adminAcceptingChats === 'boolean') {
-        setAdminAcceptingChats(res.adminAcceptingChats);
+      if (presenceUpdate === presenceUpdateCount.current) {
+        if (res.presence) setChatPresence(res.presence);
+        if (typeof res.adminAcceptingChats === 'boolean') {
+          setAdminAcceptingChats(res.adminAcceptingChats);
+        }
       }
     } catch {
       // non-fatal if support chats endpoint temporarily unavailable
@@ -209,20 +241,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, []);
 
   const loadChatMessages = useCallback(async (convId: string) => {
+    const request = ++chatMessageRequest.current;
+    const isCurrent = () => request === chatMessageRequest.current && activeAdminThread.current === convId;
     setLoadingChatMessages(true);
     try {
       const res = await apiRequest<{
         conversation: SupportConversation;
         messages: SupportMessage[];
       }>(`/api/admin/support/conversations/${encodeURIComponent(convId)}/messages`);
-      setChatMessages(res.messages);
+      if (!isCurrent()) return;
+      setChatMessages((prev) => {
+        const loaded = new Set(res.messages.map((message) => message.id));
+        return [
+          ...res.messages,
+          ...prev.filter((message) => message.conversationId === convId && !loaded.has(message.id)),
+        ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      });
       setConversations((prev) =>
         prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
       );
     } catch (err: any) {
-      setError(err.message || 'Could not load chat history.');
+      if (isCurrent()) setError(err.message || 'Could not load chat history.');
     } finally {
-      setLoadingChatMessages(false);
+      if (isCurrent()) setLoadingChatMessages(false);
     }
   }, []);
 
@@ -301,6 +342,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       evt.type === 'complaint:updated'
     ) {
       loadOverview();
+    } else if (evt.type === 'support:refresh') {
+      void loadSupportChats();
+      if (section === 'chats' && activeChatId) void loadChatMessages(activeChatId);
     } else if (evt.type === 'support:presence') {
       presenceUpdateCount.current += 1;
       setChatPresence(evt.payload as SupportPresence);
@@ -757,8 +801,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   });
 
   const activeConversation = conversations.find((c) => c.id === activeChatId) || null;
+  const activeChatMessages = chatMessages.filter((message) => message.conversationId === activeChatId);
 
   const handleToggleAdminPresence = async () => {
+    if (changingPresence.current) return;
+    changingPresence.current = true;
+    presenceUpdateCount.current += 1;
     try {
       const nextAvailable = !adminAcceptingChats;
       const res = await apiRequest<{
@@ -768,6 +816,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         method: 'POST',
         body: JSON.stringify({ available: nextAvailable }),
       });
+      presenceUpdateCount.current += 1;
       setChatPresence(res.presence);
       setAdminAcceptingChats(res.adminAcceptingChats);
       setToast(
@@ -777,6 +826,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       );
     } catch (err: any) {
       setError(err.message || 'Could not update availability.');
+    } finally {
+      changingPresence.current = false;
     }
   };
 
@@ -793,10 +844,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         method: 'POST',
         body: JSON.stringify({ body: text }),
       });
-      if (!presetBody) setChatReply('');
-      setChatMessages((prev) =>
-        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
-      );
+      if (activeAdminThread.current === activeChatId) {
+        if (!presetBody) setChatReply((prev) => prev.trim() === text ? '' : prev);
+        setChatMessages((prev) =>
+          prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+        );
+      }
       setConversations((prev) =>
         prev
           .map((c) => (c.id === res.conversation.id ? res.conversation : c))
@@ -831,7 +884,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setConversations((prev) =>
         prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
       );
-      if (convId === activeChatId) {
+      if (convId === activeAdminThread.current) {
         setChatMessages((prev) =>
           prev.some((m) => m.id === res.systemMessage.id)
             ? prev
@@ -2503,16 +2556,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
                           {/* Message History */}
                           <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-neutral-50">
-                            {loadingChatMessages ? (
+                            {loadingChatMessages && activeChatMessages.length === 0 ? (
                               <p className="text-xs text-neutral-500 text-center py-6">
                                 Loading message history...
                               </p>
-                            ) : chatMessages.length === 0 ? (
+                            ) : activeChatMessages.length === 0 ? (
                               <p className="text-xs text-neutral-500 text-center py-6">
                                 No messages yet.
                               </p>
                             ) : (
-                              chatMessages.map((m) => {
+                              activeChatMessages.map((m) => {
                                 if (m.senderRole === 'system') {
                                   return (
                                     <div key={m.id} className="flex justify-center">

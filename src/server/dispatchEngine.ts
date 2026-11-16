@@ -5,6 +5,7 @@ import { rankEligibleRiders } from '../shared/dispatch';
 import { sendOpsAlert } from './opsAlerts';
 import type { DeliveryRequest, LiveWsEvent, SupportPresence, UserRole } from '../shared/types';
 import {
+  countActiveSupportAgents,
   createNotification,
   db,
   getAdminAcceptingChats,
@@ -57,10 +58,6 @@ function getSupabaseBroadcastChannel(): RealtimeChannel | null {
 }
 
 function getConnectedAdminPresence(): SupportPresence {
-  if (isEdgeRuntime()) {
-    const onlineAdminCount = adminAcceptingChats ? 1 : 0;
-    return { adminOnline: onlineAdminCount > 0, onlineAdminCount };
-  }
   const uniqueAdminIds = new Set<string>();
   for (const [client, meta] of wsAuthMeta.entries()) {
     if (meta.role === 'admin' && meta.expiresAt > Date.now() && client.readyState === 1) {
@@ -83,6 +80,11 @@ export function getSupportPresence(): SupportPresence {
 }
 
 export async function getSupportPresenceAsync(): Promise<SupportPresence> {
+  if (isEdgeRuntime()) {
+    const accepting = await getAdminAcceptingChats();
+    const onlineAdminCount = accepting ? await countActiveSupportAgents() : 0;
+    return { adminOnline: onlineAdminCount > 0, onlineAdminCount };
+  }
   adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
   return getSupportPresence();
 }
@@ -157,7 +159,7 @@ function canReadSupport(ws: WebSocket, conversation: Awaited<ReturnType<typeof g
   if (auth && auth.expiresAt > Date.now()) {
     if (auth.role === 'admin' || auth.userId === conversation.userId) return true;
   }
-  return Boolean(conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
+  return Boolean(!conversation.userId && conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
 }
 
 export async function sendSupportTyping(ws: WebSocket, conversationId: string, isTyping: boolean): Promise<void> {
@@ -268,15 +270,15 @@ export async function broadcastWsEvent(type: LiveWsEvent['type'], payload: unkno
         payload: { showDeliveryStateSelectors: Boolean(data?.showDeliveryStateSelectors) },
         timestamp: eventObj.timestamp,
       };
-    } else if (type === 'support:presence') {
-      publicEvt = { type: 'support:presence', payload, timestamp: eventObj.timestamp };
     } else if (isDelivery) {
       publicEvt = {
         type,
-        payload: { id: data?.id, trackingCode: data?.trackingCode },
+        payload: null,
         timestamp: eventObj.timestamp,
       };
-    } else if (type !== 'support:typing') {
+    } else if (type === 'support:conversation') {
+      publicEvt = { type: 'support:refresh', payload: null, timestamp: eventObj.timestamp };
+    } else if (!type.startsWith('support:')) {
       publicEvt = { type: 'notifications:refresh', payload: null, timestamp: eventObj.timestamp };
     }
     if (publicEvt) {
@@ -343,6 +345,7 @@ export async function dispatchWaitingDeliveries(): Promise<void> {
   const waiting = await db.prepare(`
     SELECT id FROM delivery_requests
     WHERE status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+      AND (payment_method = 'cash' OR payment_status = 'paid')
     ORDER BY created_at, rowid
   `).all() as Array<{ id: string }>;
   for (const { id } of waiting) await dispatchNextRiderForDelivery(id);

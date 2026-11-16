@@ -66,6 +66,7 @@ async function startServer() {
   });
 
   wss.on('connection', (ws) => {
+    let authVersion = 0;
     wsAlive.set(ws, true);
     ws.on('pong', () => wsAlive.set(ws, true));
 
@@ -89,18 +90,22 @@ async function startServer() {
       try {
         const msg = JSON.parse(String(raw));
         if (msg?.type === 'auth' && typeof msg.token === 'string') {
+          const version = ++authVersion;
+          await clearWsClientAuth(ws);
+          if (version !== authVersion || ws.readyState !== 1) return;
           const payload = verifySessionToken(msg.token);
           if (payload) {
             const prof = await getProfileById(payload.userId);
+            if (version !== authVersion || ws.readyState !== 1) return;
             if (prof && prof.accountStatus === 'active') {
               await setWsClientAuth(ws, prof.id, prof.role, payload.expiresAt);
               return;
             }
           }
-          await clearWsClientAuth(ws);
         } else if (msg?.type === 'track' && typeof msg.trackingCode === 'string') {
           setWsTracking(ws, msg.trackingCode.trim().toUpperCase().slice(0, 32));
         } else if (msg?.type === 'logout') {
+          authVersion += 1;
           await clearWsClientAuth(ws);
         } else if (msg?.type === 'support:subscribe' && typeof msg.visitorToken === 'string') {
           setWsSupportVisitor(ws, msg.visitorToken);
@@ -122,7 +127,7 @@ async function startServer() {
   registerSaqoRoutes(app as unknown as SaqoApp, { twilioUrlencodedMiddleware: urlencodedMiddleware });
 
   // Vite / Static Middleware
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
@@ -148,7 +153,7 @@ async function startServer() {
     stopDispatch = await resumeDispatch();
     console.log(`SAQO Logistics server listening on http://localhost:${PORT}`);
   });
-  if (process.env.NODE_ENV === 'production') {
+  if (process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'test') {
     const shutdown = () => {
       stopDispatch();
       clearInterval(wsHeartbeat);

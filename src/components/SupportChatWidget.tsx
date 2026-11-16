@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useRealtime } from '../hooks/useRealtime';
 import { apiRequest } from '../lib/api';
+import { isSupabaseEdgeApi } from '../lib/deployment';
 import type {
   Profile,
   SupportConversation,
@@ -84,6 +85,9 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
   const typingTimerRef = useRef<number | null>(null);
   const lastTypingEmitRef = useRef<number>(0);
   const presenceEventCount = useRef(0);
+  const messageRequest = useRef(0);
+  const activeThread = useRef(activeConvId);
+  activeThread.current = activeConvId;
 
   useEffect(() => {
     if (currentUser) {
@@ -110,6 +114,8 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
 
   const loadMessages = useCallback(
     async (convId: string) => {
+      const request = ++messageRequest.current;
+      const isCurrent = () => request === messageRequest.current && activeThread.current === convId;
       setLoadingMsgs(true);
       setError(null);
       try {
@@ -121,14 +127,21 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
             visitorToken
           )}`
         );
-        setMessages(res.messages);
+        if (!isCurrent()) return;
+        setMessages((prev) => {
+          const loaded = new Set(res.messages.map((message) => message.id));
+          return [
+            ...res.messages,
+            ...prev.filter((message) => message.conversationId === convId && !loaded.has(message.id)),
+          ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        });
         setConversations((prev) =>
           prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
         );
       } catch (err: any) {
-        setError(err.message || 'Could not load conversation history.');
+        if (isCurrent()) setError(err.message || 'Could not load conversation history.');
       } finally {
-        setLoadingMsgs(false);
+        if (isCurrent()) setLoadingMsgs(false);
       }
     },
     [visitorToken]
@@ -234,8 +247,8 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
           typingTimerRef.current = window.setTimeout(() => setAdminTyping(false), 3500);
         }
       }
-    } else if (evt.type === 'notifications:refresh' && open) {
-      if (view === 'thread' && activeConvId) void loadMessages(activeConvId);
+    } else if (evt.type === 'support:refresh' || (evt.type === 'notifications:refresh' && open)) {
+      if (open && view === 'thread' && activeConvId) void loadMessages(activeConvId);
       else void loadConversations();
     }
   });
@@ -247,7 +260,7 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
   }, [connected, sendEvent, visitorToken]);
 
   useEffect(() => {
-    if (connected) return;
+    if (connected && !isSupabaseEdgeApi) return;
     let active = true;
     let timer: number;
     let request: AbortController;
@@ -283,6 +296,7 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
     () => conversations.find((c) => c.id === activeConvId) || null,
     [conversations, activeConvId]
   );
+  const activeMessages = messages.filter((message) => message.conversationId === activeConvId);
 
   const totalUnread = useMemo(
     () => conversations.reduce((sum, c) => sum + (c.unreadByVisitor || 0), 0),
@@ -348,10 +362,12 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
           body: text,
         }),
       });
-      setReplyBody('');
-      setMessages((prev) =>
-        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
-      );
+      if (activeThread.current === activeConvId) {
+        setReplyBody((prev) => prev.trim() === text ? '' : prev);
+        setMessages((prev) =>
+          prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+        );
+      }
       setConversations((prev) =>
         prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
       );
@@ -384,7 +400,7 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
           prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
         );
       }
-      if (res?.systemMessage) {
+      if (res?.systemMessage && activeThread.current === activeConvId) {
         setMessages((prev) =>
           prev.some((m) => m.id === res.systemMessage.id)
             ? prev
@@ -719,12 +735,12 @@ export const SupportChatWidget: React.FC<SupportChatWidgetProps> = ({
               </div>
 
               <div className="flex-1 overflow-y-auto p-3.5 space-y-3 bg-white min-h-[220px]">
-                {loadingMsgs && messages.length === 0 ? (
+                {loadingMsgs && activeMessages.length === 0 ? (
                   <p className="text-xs text-neutral-500 text-center py-8">
                     Loading conversation...
                   </p>
                 ) : (
-                  messages.map((m) => {
+                  activeMessages.map((m) => {
                     if (m.senderRole === 'system') {
                       return (
                         <div key={m.id} className="text-center py-1">

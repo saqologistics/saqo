@@ -20,7 +20,8 @@ await new Promise((resolve) => portProbe.close(resolve));
 const origin = 'http://127.0.0.1:' + port;
 const credentials = { email: 'admin@saqo.test', password: 'SmokeTestAdminPassword1' };
 const env = {
-  ...process.env, NODE_ENV: 'production', PORT: String(port),
+  ...process.env, NODE_ENV: 'test', PORT: String(port),
+  SAQO_DATABASE_URL: '', SUPABASE_DB_URL: '',
   APP_URL: 'https://saqo.test', SAQO_SESSION_SECRET: 'local-smoke-test-secret-at-least-32-characters',
   SAQO_API_ORIGIN: 'https://api.saqo.test',
   SAQO_ADMIN_EMAIL: credentials.email, SAQO_ADMIN_PASSWORD: credentials.password,
@@ -102,6 +103,11 @@ try {
   const customer = await api('POST', '/api/auth/register', {
     email: 'customer@saqo.test', password: 'SmokeCustomerPassword1', fullName: 'Smoke Customer', phone: '08012345679',
   }, undefined, 201);
+  for (const route of ['/api/admin/overview', '/api/admin/payments/overview', '/api/admin/gateway-settings']) {
+    await api('GET', route, null, admin.token);
+    await api('GET', route, null, rider.token, 403);
+    await api('GET', route, null, customer.token, 403);
+  }
   const booking = {
     pickupAddress: 'Kofar Kaura, Katsina', destinationAddress: 'Daura Town, Katsina',
     recipientName: 'Smoke Recipient', recipientPhone: '08012345680', parcelDescription: 'Smoke Parcel', paymentMethod: 'cash',

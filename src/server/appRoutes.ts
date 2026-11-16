@@ -33,6 +33,7 @@ import {
   listDeliveries,
   markSupportConversationRead,
   persistDispatchChange,
+  refreshSupportAgentHeartbeat,
   signSessionToken,
   updateSupportConversationStatus,
   verifyPassword,
@@ -475,7 +476,9 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       return;
     }
 
-    if (!email || !password || !fullName || !phone) {
+    if (typeof email !== 'string' || !email.trim() || email.trim().length > 254 ||
+        typeof password !== 'string' || !password || password.length > 1024 ||
+        typeof fullName !== 'string' || !fullName.trim() || typeof phone !== 'string' || !phone.trim()) {
       res.status(400).json({ error: 'Full name, phone number, email, and password are required.' });
       return;
     }
@@ -489,29 +492,25 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       return;
     }
     const targetRole: UserRole = 'client';
-    const existing = await db
-      .prepare('SELECT id FROM profiles WHERE LOWER(email) = LOWER(?)')
-      .get(String(email).trim());
-    if (existing) {
+    const profileId = `prof-${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    const passHash = hashPassword(String(password));
+    const state = typeof homeState === 'string' && homeState.trim() ? homeState.trim() : 'Katsina';
+    const created = await persistDispatchChange(async () => {
+      const existing = await db.prepare('SELECT id FROM profiles WHERE LOWER(email) = LOWER(?)').get(email.trim());
+      if (existing) return false;
+      await db.prepare(`
+        INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+      `).run(profileId, email.trim().toLowerCase(), passHash, fullName.trim(), phone.trim(), targetRole, now);
+      await db.prepare('INSERT INTO customers (id, profile_id, default_state) VALUES (?, ?, ?)')
+        .run(`cust-${crypto.randomUUID()}`, profileId, state);
+      return true;
+    });
+    if (!created) {
       res.status(409).json({ error: 'An account with this email already exists.' });
       return;
     }
-
-    const profileId = `prof-${crypto.randomUUID().slice(0, 8)}`;
-    const now = new Date().toISOString();
-    const passHash = hashPassword(String(password));
-    const state = homeState || 'Katsina';
-
-    await db.prepare(`
-      INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-    `).run(profileId, String(email).trim().toLowerCase(), passHash, String(fullName).trim(), String(phone).trim(), targetRole, now);
-
-    await db.prepare(`INSERT INTO customers (id, profile_id, default_state) VALUES (?, ?, ?)`).run(
-      `cust-${crypto.randomUUID().slice(0, 8)}`,
-      profileId,
-      state
-    );
 
     const token = signSessionToken({ userId: profileId, role: targetRole });
     const profile = (await getProfileById(profileId))!;
@@ -2458,10 +2457,10 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     } = req.body || {};
 
     const cleanToken = typeof visitorToken === 'string' ? visitorToken.trim() : '';
-    const cleanName = (profile?.fullName || visitorName || '').trim();
+    const cleanName = profile?.fullName || (typeof visitorName === 'string' ? visitorName.trim() : '');
     const cleanMsg = typeof message === 'string' ? message.trim() : '';
 
-    if (!cleanToken) {
+    if (!cleanToken || cleanToken.length > 128) {
       res.status(400).json({ error: 'Chat session token is required.' });
       return;
     }
@@ -2478,9 +2477,9 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       visitorToken: cleanToken,
       userId: profile?.id || null,
       visitorName: cleanName,
-      visitorEmail: profile?.email || visitorEmail || null,
-      visitorPhone: profile?.phone || visitorPhone || null,
-      trackingCode: trackingCode || null,
+      visitorEmail: profile?.email || (typeof visitorEmail === 'string' ? visitorEmail : null),
+      visitorPhone: profile?.phone || (typeof visitorPhone === 'string' ? visitorPhone : null),
+      trackingCode: typeof trackingCode === 'string' ? trackingCode : null,
       initialMessage: cleanMsg,
       senderRole: profile ? 'client' : 'visitor',
     });
@@ -2500,27 +2499,21 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     const auth = await tryAuthenticate(req);
     const visitorToken =
       typeof req.query.visitorToken === 'string' ? req.query.visitorToken.trim() : '';
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: 'Conversation not found.' });
-      return;
-    }
-    const isOwner =
-      (auth && (auth.role === 'admin' || conv.userId === auth.userId)) ||
-      (visitorToken && conv.visitorToken === visitorToken);
-    if (!isOwner) {
-      res.status(403).json({ error: 'Access denied for this conversation.' });
-      return;
-    }
-    const updatedConv =
-      auth?.role === 'admin'
-        ? conv
-        : await markSupportConversationRead(conv.id, 'visitor') || conv;
-    res.json({
-      conversation: updatedConv,
-      messages: await getSupportMessages(conv.id),
-      presence: await getSupportPresenceAsync(),
+    const thread = await persistDispatchChange(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 as const };
+      if (!(auth && (auth.role === 'admin' || conv.userId === auth.userId)) &&
+          !(!conv.userId && visitorToken && conv.visitorToken === visitorToken)) {
+        return { status: 403 as const };
+      }
+      const conversation = auth?.role === 'admin' ? conv : await markSupportConversationRead(conv.id, 'visitor') || conv;
+      return { status: 200 as const, conversation, messages: await getSupportMessages(conv.id) };
     });
+    if (thread.status !== 200) {
+      res.status(thread.status).json({ error: thread.status === 404 ? 'Conversation not found.' : 'Access denied for this conversation.' });
+      return;
+    }
+    res.json({ conversation: thread.conversation, messages: thread.messages, presence: await getSupportPresenceAsync() });
   }));
 
   // Visitor / Client: Send message in existing conversation
@@ -2528,30 +2521,32 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     const auth = await tryAuthenticate(req);
     const profile = auth ? await getProfileById(auth.userId) : null;
     const { visitorToken, body } = req.body || {};
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: 'Conversation not found.' });
-      return;
-    }
-    const isOwner =
-      (auth && conv.userId === auth.userId) ||
-      (typeof visitorToken === 'string' && visitorToken.trim() === conv.visitorToken);
-    if (!isOwner) {
-      res.status(403).json({ error: 'Access denied for this conversation.' });
-      return;
-    }
     const cleanBody = typeof body === 'string' ? body.trim() : '';
     if (!cleanBody) {
       res.status(400).json({ error: 'Message cannot be empty.' });
       return;
     }
 
-    const result = await addSupportMessage({
-      conversationId: conv.id,
-      senderRole: profile ? 'client' : 'visitor',
-      senderName: profile?.fullName || conv.visitorName,
-      body: cleanBody,
+    const outcome = await persistDispatchChange(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 as const };
+      if (!(auth && conv.userId === auth.userId) &&
+          !(!conv.userId && typeof visitorToken === 'string' && visitorToken.trim() === conv.visitorToken)) {
+        return { status: 403 as const };
+      }
+      const result = await addSupportMessage({
+        conversationId: conv.id,
+        senderRole: profile ? 'client' : 'visitor',
+        senderName: profile?.fullName || conv.visitorName,
+        body: cleanBody,
+      });
+      return { status: 201 as const, result };
     });
+    if (outcome.status !== 201) {
+      res.status(outcome.status).json({ error: outcome.status === 404 ? 'Conversation not found.' : 'Access denied for this conversation.' });
+      return;
+    }
+    const { result } = outcome;
     await broadcastWsEvent('support:message', result.message);
     await broadcastWsEvent('support:conversation', result.conversation);
     res.status(201).json({
@@ -2565,19 +2560,18 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     const auth = await tryAuthenticate(req);
     const visitorToken =
       typeof req.body?.visitorToken === 'string' ? req.body.visitorToken.trim() : '';
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: 'Conversation not found.' });
+    const outcome = await persistDispatchChange(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 as const };
+      if (!(auth && conv.userId === auth.userId) &&
+          !(!conv.userId && visitorToken && visitorToken === conv.visitorToken)) return { status: 403 as const };
+      return { status: 200 as const, updated: await markSupportConversationRead(conv.id, 'visitor') };
+    });
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.status === 404 ? 'Conversation not found.' : 'Access denied.' });
       return;
     }
-    const isOwner =
-      (auth && conv.userId === auth.userId) ||
-      (visitorToken && visitorToken === conv.visitorToken);
-    if (!isOwner) {
-      res.status(403).json({ error: 'Access denied.' });
-      return;
-    }
-    const updated = await markSupportConversationRead(conv.id, 'visitor');
+    const { updated } = outcome;
     if (updated) {
       await broadcastWsEvent('support:conversation', updated);
     }
@@ -2593,23 +2587,23 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
       res.status(400).json({ error: 'Invalid status.' });
       return;
     }
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: 'Conversation not found.' });
+    const outcome = await persistDispatchChange(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 as const };
+      if (!(auth && conv.userId === auth.userId) &&
+          !(!conv.userId && typeof visitorToken === 'string' && visitorToken.trim() === conv.visitorToken)) {
+        return { status: 403 as const };
+      }
+      const updated = await updateSupportConversationStatus(
+        conv.id, status as SupportConversationStatus, profile?.fullName || conv.visitorName,
+      );
+      return { status: 200 as const, updated };
+    });
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.status === 404 ? 'Conversation not found.' : 'Access denied.' });
       return;
     }
-    const isOwner =
-      (auth && conv.userId === auth.userId) ||
-      (typeof visitorToken === 'string' && visitorToken.trim() === conv.visitorToken);
-    if (!isOwner) {
-      res.status(403).json({ error: 'Access denied.' });
-      return;
-    }
-    const updated = await updateSupportConversationStatus(
-      conv.id,
-      status as SupportConversationStatus,
-      profile?.fullName || conv.visitorName
-    );
+    const { updated } = outcome;
     if (updated) {
       await broadcastWsEvent('support:message', updated.systemMessage);
       await broadcastWsEvent('support:conversation', updated.conversation);
@@ -2633,24 +2627,36 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
 
   // Admin: Toggle online/away availability for live support chat
   app.post('/api/admin/support/presence', authenticate, requireRole('admin'), asyncRoute(async (req: SaqoRequest, res: SaqoResponse) => {
-    const available = Boolean(req.body?.available);
+    const available = req.body?.available;
+    if (typeof available !== 'boolean') {
+      res.status(400).json({ error: 'Availability must be true or false.' });
+      return;
+    }
+    if (available) await refreshSupportAgentHeartbeat(req.auth!.userId);
     const presence = await setAdminChatAvailability(available);
     res.json({ presence, adminAcceptingChats: await isAdminChatAvailableFlagAsync() });
   }));
 
+  app.post('/api/admin/support/heartbeat', authenticate, requireRole('admin'), asyncRoute(async (req: AuthedRequest, res: SaqoResponse) => {
+    await refreshSupportAgentHeartbeat(req.auth!.userId);
+    res.json({ presence: await getSupportPresenceAsync() });
+  }));
+
   // Admin: Load messages for a conversation & mark read
   app.get('/api/admin/support/conversations/:id/messages', authenticate, requireRole('admin'), asyncRoute(async (req: SaqoRequest, res: SaqoResponse) => {
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
+    const thread = await persistDispatchChange(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return null;
+      const markedRead = conv.unreadByAdmin > 0;
+      const conversation = markedRead ? await markSupportConversationRead(conv.id, 'admin') || conv : conv;
+      return { conversation, messages: await getSupportMessages(conv.id), markedRead };
+    });
+    if (!thread) {
       res.status(404).json({ error: 'Conversation not found.' });
       return;
     }
-    const updatedConv = await markSupportConversationRead(conv.id, 'admin') || conv;
-    await broadcastWsEvent('support:conversation', updatedConv);
-    res.json({
-      conversation: updatedConv,
-      messages: await getSupportMessages(conv.id),
-    });
+    if (thread.markedRead) await broadcastWsEvent('support:conversation', thread.conversation);
+    res.json({ conversation: thread.conversation, messages: thread.messages });
   }));
 
   // Admin: Send reply message in a support conversation
@@ -2720,7 +2726,7 @@ export function registerSaqoRoutes(app: SaqoApp, options?: RegisterRoutesOptions
     const key = process.env.SAQO_CRON_SECRET?.trim() || process.env.SAQO_SESSION_SECRET?.trim() || process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
     const expected = key ? crypto.createHmac('sha256', key).update('saqo-dispatch-tick').digest('hex') : '';
     const provided = (req.get('X-Saqo-Cron-Secret') || '').trim();
-    if (!expected || !provided || provided.length !== expected.length ||
+    if (!expected || !/^[a-f0-9]{64}$/.test(provided) ||
         !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
       res.status(403).json({ error: 'Invalid cron authorization.' });
       return;

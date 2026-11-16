@@ -178,6 +178,33 @@ test('concurrent checkout requests reuse the same link and enforce customer owne
   assert.equal(provider.mock.callCount(), 1);
 });
 
+test('Simultaneous wallet funding with the same key creates one checkout', async (t) => {
+  const { profileId, email } = await createTestUser();
+  const oldSecret = process.env.FLUTTERWAVE_SECRET_KEY;
+  process.env.FLUTTERWAVE_SECRET_KEY = 'mock-secret';
+  await db.prepare("UPDATE payment_gateway_settings SET is_enabled = 1 WHERE id = 'default'").run();
+  t.after(async () => {
+    if (oldSecret === undefined) delete process.env.FLUTTERWAVE_SECRET_KEY;
+    else process.env.FLUTTERWAVE_SECRET_KEY = oldSecret;
+    await db.prepare("UPDATE payment_gateway_settings SET is_enabled = 0 WHERE id = 'default'").run();
+  });
+  const provider = t.mock.method(globalThis, 'fetch', async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    return Response.json({ status: 'success', data: { link: 'https://checkout.flutterwave.com/mock' } });
+  });
+  const request = {
+    userId: profileId, customerEmail: email, customerName: 'Test Client',
+    customerPhone: '08000000000', amountNgn: 2000, redirectUrl: 'https://saqo.test/',
+    idempotencyKey: crypto.randomUUID(),
+  };
+  const [first, second] = await Promise.all([
+    pay.initializeWalletFunding(request), pay.initializeWalletFunding(request),
+  ]);
+  assert.equal(first.id, second.id);
+  assert.equal(first.checkoutUrl, second.checkoutUrl);
+  assert.equal(provider.mock.callCount(), 1);
+});
+
 test('wallet credit failure rolls back paid status and a later verification credits once', async () => {
   const { profileId } = await createTestUser();
   const wallet = await pay.ensureWallet(profileId);
@@ -950,13 +977,19 @@ test('Webhook charge.reversed debits wallet funding when sufficient and freezes 
   });
   assert.equal((await pay.ensureWallet(c1.profileId)).balanceNgn, 3000);
 
-  await pay.processFlutterwaveWebhook({
+  const reversal = {
     headers: { 'verif-hash': 'rev-webhook-secret' },
     rawBody: '{}',
     payload: { event: 'charge.reversed', data: { id: '777101', tx_ref: ref1 } },
-  });
+  };
+  const outcomes = await Promise.all([
+    pay.processFlutterwaveWebhook(reversal), pay.processFlutterwaveWebhook(reversal),
+  ]);
+  assert.ok(outcomes.every((outcome) => outcome.accepted && outcome.status !== 'failed'));
   assert.equal((await pay.ensureWallet(c1.profileId)).balanceNgn, 0);
   assert.equal((await pay.ensureWallet(c1.profileId)).status, 'active');
+  const ledger = (await pay.getCustomerWalletSummary(c1.profileId)).walletTransactions;
+  assert.equal(ledger.filter((entry) => entry.category === 'reversal').length, 1);
 
   // Case 2: Customer already spent funds -> wallet frozen instead of negative balance
   const c2 = await createTestUser('client');

@@ -33,7 +33,7 @@ function compileRoutePattern(pathPattern) {
   return { regex: new RegExp(`^${escaped}/?$`), paramNames };
 }
 function parseFormEncoded(raw, maxParams = 150) {
-  const result = {};
+  const result = /* @__PURE__ */ Object.create(null);
   const params = new URLSearchParams(raw);
   let count = 0;
   for (const [key, value] of params.entries()) {
@@ -291,9 +291,14 @@ var init_webApp = __esm({
             const match = layer.pattern.exec(pathname);
             if (!match) continue;
             const params = {};
-            layer.paramNames.forEach((name, idx) => {
-              params[name] = decodeURIComponent(match[idx + 1] || "");
-            });
+            try {
+              layer.paramNames.forEach((name, idx) => {
+                params[name] = decodeURIComponent(match[idx + 1] || "");
+              });
+            } catch {
+              res.status(400).json({ error: "Invalid URL parameter." });
+              break;
+            }
             req.params = params;
           } else if (layer.prefix !== null && layer.prefix !== "") {
             if (pathname !== layer.prefix && !pathname.startsWith(`${layer.prefix}/`)) continue;
@@ -352,6 +357,15 @@ function deferDatabaseEffect(effect) {
 function afterDatabaseCommit(effect) {
   if (!deferDatabaseEffect(effect)) effect();
 }
+function runCommittedEffects(effects) {
+  for (const effect of effects) {
+    try {
+      effect();
+    } catch {
+      console.error("A post-commit database effect failed.");
+    }
+  }
+}
 async function databaseTransaction(work) {
   if (transactionContext.getStore()?.open) return await work();
   if (pool) {
@@ -363,7 +377,7 @@ async function databaseTransaction(work) {
       const result = await transactionContext.run(state2, work);
       await client.query("COMMIT");
       state2.open = false;
-      for (const effect of state2.effects) effect();
+      runCommittedEffects(state2.effects);
       return result;
     } catch (error) {
       if (state2.open) await client.query("ROLLBACK").catch(() => {
@@ -381,7 +395,7 @@ async function databaseTransaction(work) {
       const result = await transactionContext.run(state2, work);
       sqlite.exec("COMMIT");
       state2.open = false;
-      for (const effect of state2.effects) effect();
+      runCommittedEffects(state2.effects);
       return result;
     } catch (error) {
       if (state2.open) sqlite.exec("ROLLBACK");
@@ -617,6 +631,7 @@ var init_pricing = __esm({
 var db_exports = {};
 __export(db_exports, {
   addSupportMessage: () => addSupportMessage,
+  countActiveSupportAgents: () => countActiveSupportAgents,
   createNotification: () => createNotification,
   createSupportConversation: () => createSupportConversation,
   db: () => db,
@@ -645,6 +660,7 @@ __export(db_exports, {
   persistDispatchChange: () => databaseTransaction,
   publicTrackingDelivery: () => publicTrackingDelivery,
   publicTrackingHistory: () => publicTrackingHistory,
+  refreshSupportAgentHeartbeat: () => refreshSupportAgentHeartbeat,
   riderDelivery: () => riderDelivery,
   setAdminAcceptingChatsDb: () => setAdminAcceptingChatsDb,
   signSessionToken: () => signSessionToken,
@@ -895,6 +911,11 @@ function initSqliteDatabase() {
       sender_name TEXT NOT NULL,
       body TEXT NOT NULL,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS support_agent_heartbeats (
+      profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_deliveries_customer ON delivery_requests(customer_id);
@@ -1193,6 +1214,22 @@ async function getAdminAcceptingChats() {
 }
 async function setAdminAcceptingChatsDb(available) {
   await db.prepare("UPDATE platform_settings SET admin_accepting_chats = ? WHERE id = 1").run(available ? 1 : 0);
+}
+async function refreshSupportAgentHeartbeat(profileId) {
+  const expiresAt = new Date(Date.now() + 75e3).toISOString();
+  await db.prepare(`
+    INSERT INTO support_agent_heartbeats (profile_id, expires_at) VALUES (?, ?)
+    ON CONFLICT (profile_id) DO UPDATE SET expires_at = EXCLUDED.expires_at
+    WHERE support_agent_heartbeats.expires_at < EXCLUDED.expires_at
+  `).run(profileId, expiresAt);
+}
+async function countActiveSupportAgents() {
+  const row = await db.prepare(`
+    SELECT COUNT(*) AS total FROM support_agent_heartbeats h
+    JOIN profiles p ON p.id = h.profile_id
+    WHERE p.role = 'admin' AND p.account_status = 'active' AND h.expires_at > ?
+  `).get((/* @__PURE__ */ new Date()).toISOString());
+  return Number(row?.total || 0);
 }
 async function initDatabase() {
   if (sqlite) initSqliteDatabase();
@@ -1634,13 +1671,13 @@ async function getAllSupportConversations() {
 async function getSupportConversationsForVisitor(params) {
   const { visitorToken, userId } = params;
   if (userId && visitorToken) {
-    await db.prepare(
-      `UPDATE support_conversations SET user_id = ? WHERE visitor_token = ? AND user_id IS NULL`
-    ).run(userId, visitorToken);
-    const rows = await db.prepare(
-      `SELECT * FROM support_conversations WHERE user_id = ? OR visitor_token = ? ORDER BY last_message_at DESC`
-    ).all(userId, visitorToken);
-    return rows.map(mapSupportConversationRow);
+    return databaseTransaction(async () => {
+      await db.prepare(
+        `UPDATE support_conversations SET user_id = ? WHERE visitor_token = ? AND user_id IS NULL`
+      ).run(userId, visitorToken);
+      const rows = await db.prepare("SELECT * FROM support_conversations WHERE user_id = ? ORDER BY last_message_at DESC").all(userId);
+      return rows.map(mapSupportConversationRow);
+    });
   }
   if (userId) {
     const rows = await db.prepare(`SELECT * FROM support_conversations WHERE user_id = ? ORDER BY last_message_at DESC`).all(userId);
@@ -1648,7 +1685,7 @@ async function getSupportConversationsForVisitor(params) {
   }
   if (visitorToken) {
     const rows = await db.prepare(
-      `SELECT * FROM support_conversations WHERE visitor_token = ? ORDER BY last_message_at DESC`
+      `SELECT * FROM support_conversations WHERE visitor_token = ? AND user_id IS NULL ORDER BY last_message_at DESC`
     ).all(visitorToken);
     return rows.map(mapSupportConversationRow);
   }
@@ -1666,92 +1703,96 @@ async function getSupportMessages(conversationId) {
   }));
 }
 async function createSupportConversation(input) {
-  const convId = `chat-${crypto.randomUUID().slice(0, 8)}`;
-  const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const cleanPreview = input.initialMessage.trim().slice(0, 140);
-  await db.prepare(`
-    INSERT INTO support_conversations (
-      id, visitor_token, user_id, visitor_name, visitor_email, visitor_phone,
-      tracking_code, status, assigned_admin_id, unread_by_admin, unread_by_visitor,
-      last_message_preview, last_message_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, 1, 0, ?, ?, ?)
-  `).run(
-    convId,
-    input.visitorToken,
-    input.userId,
-    input.visitorName.trim(),
-    input.visitorEmail ? input.visitorEmail.trim() : null,
-    input.visitorPhone ? input.visitorPhone.trim() : null,
-    input.trackingCode ? input.trackingCode.trim().toUpperCase() : null,
-    cleanPreview,
-    now,
-    now
-  );
-  await db.prepare(`
-    INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(msgId, convId, input.senderRole, input.visitorName.trim(), input.initialMessage.trim(), now);
-  return {
-    conversation: await getSupportConversationById(convId),
-    message: {
-      id: msgId,
-      conversationId: convId,
-      senderRole: input.senderRole,
-      senderName: input.visitorName.trim(),
-      body: input.initialMessage.trim(),
-      createdAt: now
-    }
-  };
+  return databaseTransaction(async () => {
+    const convId = `chat-${crypto.randomUUID().slice(0, 8)}`;
+    const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const cleanPreview = input.initialMessage.trim().slice(0, 140);
+    await db.prepare(`
+      INSERT INTO support_conversations (
+        id, visitor_token, user_id, visitor_name, visitor_email, visitor_phone,
+        tracking_code, status, assigned_admin_id, unread_by_admin, unread_by_visitor,
+        last_message_preview, last_message_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, 1, 0, ?, ?, ?)
+    `).run(
+      convId,
+      input.visitorToken,
+      input.userId,
+      input.visitorName.trim(),
+      input.visitorEmail ? input.visitorEmail.trim() : null,
+      input.visitorPhone ? input.visitorPhone.trim() : null,
+      input.trackingCode ? input.trackingCode.trim().toUpperCase() : null,
+      cleanPreview,
+      now,
+      now
+    );
+    await db.prepare(`
+      INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(msgId, convId, input.senderRole, input.visitorName.trim(), input.initialMessage.trim(), now);
+    return {
+      conversation: await getSupportConversationById(convId),
+      message: {
+        id: msgId,
+        conversationId: convId,
+        senderRole: input.senderRole,
+        senderName: input.visitorName.trim(),
+        body: input.initialMessage.trim(),
+        createdAt: now
+      }
+    };
+  });
 }
 async function addSupportMessage(input) {
-  const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const cleanBody = input.body.trim();
-  const preview = cleanBody.slice(0, 140);
-  await db.prepare(`
-    INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(msgId, input.conversationId, input.senderRole, input.senderName, cleanBody, now);
-  if (input.senderRole === "admin") {
+  return databaseTransaction(async () => {
+    const msgId = `cmsg-${crypto.randomUUID().slice(0, 8)}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const cleanBody = input.body.trim();
+    const preview = cleanBody.slice(0, 140);
     await db.prepare(`
-      UPDATE support_conversations
-      SET unread_by_visitor = unread_by_visitor + 1,
-          unread_by_admin = 0,
-          status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
-          assigned_admin_id = COALESCE(?, assigned_admin_id),
-          last_message_preview = ?,
-          last_message_at = ?
-      WHERE id = ?
-    `).run(input.assignedAdminId || null, preview, now, input.conversationId);
-  } else if (input.senderRole === "system") {
-    await db.prepare(`
-      UPDATE support_conversations
-      SET last_message_preview = ?, last_message_at = ?
-      WHERE id = ?
-    `).run(preview, now, input.conversationId);
-  } else {
-    await db.prepare(`
-      UPDATE support_conversations
-      SET unread_by_admin = unread_by_admin + 1,
-          unread_by_visitor = 0,
-          status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
-          last_message_preview = ?,
-          last_message_at = ?
-      WHERE id = ?
-    `).run(preview, now, input.conversationId);
-  }
-  return {
-    conversation: await getSupportConversationById(input.conversationId),
-    message: {
-      id: msgId,
-      conversationId: input.conversationId,
-      senderRole: input.senderRole,
-      senderName: input.senderName,
-      body: cleanBody,
-      createdAt: now
+      INSERT INTO support_messages (id, conversation_id, sender_role, sender_name, body, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(msgId, input.conversationId, input.senderRole, input.senderName, cleanBody, now);
+    if (input.senderRole === "admin") {
+      await db.prepare(`
+        UPDATE support_conversations
+        SET unread_by_visitor = unread_by_visitor + 1,
+            unread_by_admin = 0,
+            status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
+            assigned_admin_id = COALESCE(?, assigned_admin_id),
+            last_message_preview = ?,
+            last_message_at = ?
+        WHERE id = ?
+      `).run(input.assignedAdminId || null, preview, now, input.conversationId);
+    } else if (input.senderRole === "system") {
+      await db.prepare(`
+        UPDATE support_conversations
+        SET last_message_preview = ?, last_message_at = ?
+        WHERE id = ?
+      `).run(preview, now, input.conversationId);
+    } else {
+      await db.prepare(`
+        UPDATE support_conversations
+        SET unread_by_admin = unread_by_admin + 1,
+            unread_by_visitor = 0,
+            status = CASE WHEN status IN ('resolved', 'closed') THEN 'open' ELSE status END,
+            last_message_preview = ?,
+            last_message_at = ?
+        WHERE id = ?
+      `).run(preview, now, input.conversationId);
     }
-  };
+    return {
+      conversation: await getSupportConversationById(input.conversationId),
+      message: {
+        id: msgId,
+        conversationId: input.conversationId,
+        senderRole: input.senderRole,
+        senderName: input.senderName,
+        body: cleanBody,
+        createdAt: now
+      }
+    };
+  });
 }
 async function markSupportConversationRead(conversationId, reader) {
   if (reader === "admin") {
@@ -1766,25 +1807,27 @@ async function markSupportConversationRead(conversationId, reader) {
   return await getSupportConversationById(conversationId);
 }
 async function updateSupportConversationStatus(conversationId, status, actorName) {
-  const existing = await getSupportConversationById(conversationId);
-  if (!existing) return null;
-  await db.prepare("UPDATE support_conversations SET status = ? WHERE id = ?").run(
-    status,
-    conversationId
-  );
-  const labelMap = {
-    open: "reopened",
-    pending: "marked as awaiting response",
-    resolved: "marked as resolved",
-    closed: "closed"
-  };
-  const { conversation, message } = await addSupportMessage({
-    conversationId,
-    senderRole: "system",
-    senderName: "SAQO Support",
-    body: `Conversation ${labelMap[status]} by ${actorName}.`
+  return databaseTransaction(async () => {
+    const existing = await getSupportConversationById(conversationId);
+    if (!existing) return null;
+    await db.prepare("UPDATE support_conversations SET status = ? WHERE id = ?").run(
+      status,
+      conversationId
+    );
+    const labelMap = {
+      open: "reopened",
+      pending: "marked as awaiting response",
+      resolved: "marked as resolved",
+      closed: "closed"
+    };
+    const { conversation, message } = await addSupportMessage({
+      conversationId,
+      senderRole: "system",
+      senderName: "SAQO Support",
+      body: `Conversation ${labelMap[status]} by ${actorName}.`
+    });
+    return { conversation, systemMessage: message };
   });
-  return { conversation, systemMessage: message };
 }
 var configuredSecret, SESSION_SECRET, SESSION_LIFETIME_MS, schemaExtensionsEnsured;
 var init_db = __esm({
@@ -2714,10 +2757,6 @@ function getSupabaseBroadcastChannel() {
   return supabaseChannel;
 }
 function getConnectedAdminPresence() {
-  if (isEdgeRuntime()) {
-    const onlineAdminCount2 = adminAcceptingChats ? 1 : 0;
-    return { adminOnline: onlineAdminCount2 > 0, onlineAdminCount: onlineAdminCount2 };
-  }
   const uniqueAdminIds = /* @__PURE__ */ new Set();
   for (const [client, meta] of wsAuthMeta.entries()) {
     if (meta.role === "admin" && meta.expiresAt > Date.now() && client.readyState === 1) {
@@ -2738,6 +2777,11 @@ function getSupportPresence() {
   return connected;
 }
 async function getSupportPresenceAsync() {
+  if (isEdgeRuntime()) {
+    const accepting = await getAdminAcceptingChats();
+    const onlineAdminCount = accepting ? await countActiveSupportAgents() : 0;
+    return { adminOnline: onlineAdminCount > 0, onlineAdminCount };
+  }
   adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
   return getSupportPresence();
 }
@@ -2769,7 +2813,7 @@ function canReadSupport(ws, conversation) {
   if (auth && auth.expiresAt > Date.now()) {
     if (auth.role === "admin" || auth.userId === conversation.userId) return true;
   }
-  return Boolean(conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
+  return Boolean(!conversation.userId && conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
 }
 async function broadcastWsEvent(type, payload) {
   const eventObj = {
@@ -2836,15 +2880,15 @@ async function broadcastWsEvent(type, payload) {
         payload: { showDeliveryStateSelectors: Boolean(data?.showDeliveryStateSelectors) },
         timestamp: eventObj.timestamp
       };
-    } else if (type === "support:presence") {
-      publicEvt = { type: "support:presence", payload, timestamp: eventObj.timestamp };
     } else if (isDelivery) {
       publicEvt = {
         type,
-        payload: { id: data?.id, trackingCode: data?.trackingCode },
+        payload: null,
         timestamp: eventObj.timestamp
       };
-    } else if (type !== "support:typing") {
+    } else if (type === "support:conversation") {
+      publicEvt = { type: "support:refresh", payload: null, timestamp: eventObj.timestamp };
+    } else if (!type.startsWith("support:")) {
       publicEvt = { type: "notifications:refresh", payload: null, timestamp: eventObj.timestamp };
     }
     if (publicEvt) {
@@ -2904,6 +2948,7 @@ async function dispatchWaitingDeliveries() {
   const waiting = await db.prepare(`
     SELECT id FROM delivery_requests
     WHERE status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+      AND (payment_method = 'cash' OR payment_status = 'paid')
     ORDER BY created_at, rowid
   `).all();
   for (const { id } of waiting) await dispatchNextRiderForDelivery(id);
@@ -4032,10 +4077,23 @@ async function insertPaymentTxRow(params) {
   );
   return mapped;
 }
-function reuseFlutterwaveCheckout(tx) {
-  const inFlight = checkoutRequests.get(tx.id);
-  if (inFlight) return inFlight;
-  if (tx.status === "pending" && tx.checkoutUrl || tx.status === "paid") return Promise.resolve(tx);
+async function reuseFlutterwaveCheckout(tx) {
+  const deadline = Date.now() + 4e3;
+  while (true) {
+    const inFlight = checkoutRequests.get(tx.id);
+    if (inFlight) return inFlight;
+    if (tx.status === "pending" && tx.checkoutUrl || tx.status === "paid") return tx;
+    if (tx.status !== "pending") break;
+    const age = Date.now() - Date.parse(tx.updatedAt);
+    if (!Number.isFinite(age) || age >= 3e4) break;
+    if (Date.now() >= deadline) {
+      throw new PaymentVerificationError("Checkout is still being prepared. Retry this payment in a moment.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const row = await db.prepare("SELECT * FROM payment_transactions WHERE id = ?").get(tx.id);
+    if (!row) break;
+    tx = mapPaymentTxRow(row);
+  }
   throw new PaymentVerificationError("This checkout has no usable link. Start a new payment attempt.");
 }
 function publishCheckout(tx, request) {
@@ -4075,32 +4133,37 @@ async function initializeWalletFunding(params) {
   if (!Number.isFinite(amount) || amount < 100) {
     throw new Error("Minimum wallet funding amount is \u20A6100.");
   }
-  if (params.idempotencyKey) {
-    const existing = await db.prepare("SELECT * FROM payment_transactions WHERE idempotency_key = ?").get(params.idempotencyKey);
-    if (existing) {
-      if (existing.user_id !== params.userId || existing.purpose !== "wallet_funding" || existing.amount_ngn !== amount) {
-        throw new PaymentVerificationError("This payment request key belongs to a different operation.");
+  const reservation = await databaseTransaction(async () => {
+    if (params.idempotencyKey) {
+      const existing = await db.prepare("SELECT * FROM payment_transactions WHERE idempotency_key = ?").get(params.idempotencyKey);
+      if (existing) {
+        if (existing.user_id !== params.userId || existing.purpose !== "wallet_funding" || existing.amount_ngn !== amount) {
+          throw new PaymentVerificationError("This payment request key belongs to a different operation.");
+        }
+        return { existing: mapPaymentTxRow(existing) };
       }
-      return reuseFlutterwaveCheckout(mapPaymentTxRow(existing));
     }
-  }
-  const wallet = await ensureWallet(params.userId);
-  const reference = generateReference("WLT");
-  const tx = await insertPaymentTxRow({
-    reference,
-    idempotencyKey: params.idempotencyKey || null,
-    userId: params.userId,
-    customerName: params.customerName,
-    customerEmail: params.customerEmail,
-    customerPhone: params.customerPhone,
-    walletId: wallet.id,
-    purpose: "wallet_funding",
-    paymentMethod: "flutterwave",
-    provider: "flutterwave",
-    amountNgn: amount,
-    status: "pending",
-    metadata: { source: "customer_wallet_funding" }
+    const wallet2 = await ensureWallet(params.userId);
+    const reference2 = generateReference("WLT");
+    const tx2 = await insertPaymentTxRow({
+      reference: reference2,
+      idempotencyKey: params.idempotencyKey || null,
+      userId: params.userId,
+      customerName: params.customerName,
+      customerEmail: params.customerEmail,
+      customerPhone: params.customerPhone,
+      walletId: wallet2.id,
+      purpose: "wallet_funding",
+      paymentMethod: "flutterwave",
+      provider: "flutterwave",
+      amountNgn: amount,
+      status: "pending",
+      metadata: { source: "customer_wallet_funding" }
+    });
+    return { tx: tx2, wallet: wallet2, reference: reference2 };
   });
+  if (reservation.existing) return reuseFlutterwaveCheckout(reservation.existing);
+  const { tx, wallet, reference } = reservation;
   return publishCheckout(tx, {
     txRef: reference,
     amountNgn: amount,
@@ -4585,48 +4648,30 @@ async function processFlutterwaveWebhook(params) {
   const idempotencyKey = `flw:${eventType}:${flwTxId || "none"}:${txRef || "none"}:${dataStatus || "none"}`;
   const now = (/* @__PURE__ */ new Date()).toISOString();
   if (!validSig) {
-    const failedEventId = crypto4.randomUUID();
-    await db.prepare(`
-      INSERT OR IGNORE INTO payment_webhook_events (
-        id, provider, event_type, event_id, tx_ref, flw_tx_id,
-        idempotency_key, signature_valid, status, processing_error,
-        payload, received_at, processed_at
-      ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 0, 'failed', 'Invalid webhook signature', ?, ?, ?)
-    `).run(
-      failedEventId,
-      eventType,
-      flwTxId,
-      txRef,
-      flwTxId,
-      `${idempotencyKey}:invalidsig:${Date.now()}`,
-      JSON.stringify(params.payload || {}),
-      now,
-      now
-    );
     return { accepted: false, status: "failed", message: "Invalid webhook signature." };
   }
+  await db.prepare(`
+    INSERT INTO payment_webhook_events (
+      id, provider, event_type, event_id, tx_ref, flw_tx_id,
+      idempotency_key, signature_valid, status, payload, received_at
+    ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 1, 'received', ?, ?)
+    ON CONFLICT (idempotency_key) DO NOTHING
+  `).run(
+    crypto4.randomUUID(),
+    eventType,
+    flwTxId,
+    txRef,
+    flwTxId,
+    idempotencyKey,
+    JSON.stringify(params.payload || {}),
+    now
+  );
   const existing = await db.prepare("SELECT id, status FROM payment_webhook_events WHERE idempotency_key = ?").get(idempotencyKey);
-  if (existing && (existing.status === "processed" || existing.status === "ignored")) {
+  if (!existing) throw new Error("Webhook event could not be recorded.");
+  if (existing.status === "processed" || existing.status === "ignored") {
     return { accepted: true, duplicate: true, status: "ignored", message: "Duplicate webhook ignored." };
   }
-  const webhookRowId = existing?.id || crypto4.randomUUID();
-  if (!existing) {
-    await db.prepare(`
-      INSERT INTO payment_webhook_events (
-        id, provider, event_type, event_id, tx_ref, flw_tx_id,
-        idempotency_key, signature_valid, status, payload, received_at
-      ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 1, 'received', ?, ?)
-    `).run(
-      webhookRowId,
-      eventType,
-      flwTxId,
-      txRef,
-      flwTxId,
-      idempotencyKey,
-      JSON.stringify(params.payload || {}),
-      now
-    );
-  }
+  const webhookRowId = existing.id;
   try {
     if ((eventType === "charge.completed" || eventType === "charge.failed") && (txRef || flwTxId)) {
       await confirmFlutterwaveTransaction({
@@ -4635,75 +4680,77 @@ async function processFlutterwaveWebhook(params) {
         source: "webhook"
       });
     } else if (eventType === "charge.reversed" && (txRef || flwTxId)) {
-      const txRow = await db.prepare(`
-        SELECT * FROM payment_transactions WHERE provider = 'flutterwave'
-          AND ((? IS NOT NULL AND reference = ?) OR (? IS NULL AND provider_tx_id = ?))
-      `).get(txRef, txRef, txRef, flwTxId);
-      if (txRow?.provider_tx_id && flwTxId && txRow.provider_tx_id !== flwTxId) {
-        throw new PaymentVerificationError("Flutterwave reversal reference does not match.");
-      }
-      if (txRow && txRow.status !== "reversed") {
+      const reversalNote = "Payment reversed / chargeback reported by Flutterwave";
+      const reversal = await databaseTransaction(async () => {
+        const txRow = await db.prepare(
+          txRef ? "SELECT * FROM payment_transactions WHERE provider = 'flutterwave' AND reference = ?" : "SELECT * FROM payment_transactions WHERE provider = 'flutterwave' AND provider_tx_id = ?"
+        ).get(txRef || flwTxId);
+        if (txRow?.provider_tx_id && flwTxId && txRow.provider_tx_id !== flwTxId) {
+          throw new PaymentVerificationError("Flutterwave reversal reference does not match.");
+        }
+        if (!txRow || txRow.status === "reversed") return null;
         const wasPaid = txRow.status === "paid";
         let walletFrozenOnReversal = false;
         let walletDebitedOnReversal = false;
-        const reversalNote = "Payment reversed / chargeback reported by Flutterwave";
-        await databaseTransaction(async () => {
-          await db.prepare(
-            "UPDATE payment_transactions SET status = 'reversed', failure_reason = COALESCE(failure_reason, ?), updated_at = ? WHERE id = ?"
-          ).run(reversalNote, now, txRow.id);
-          if (txRow.delivery_id) {
-            await db.prepare("UPDATE delivery_requests SET payment_status = 'reversed', updated_at = ? WHERE id = ? AND payment_reference = ?").run(
-              now,
-              txRow.delivery_id,
-              txRow.reference
-            );
-          }
-          if (txRow.purpose === "wallet_funding" && wasPaid) {
-            const wallet = await ensureWallet(txRow.user_id);
-            const revAmount = roundCurrency(txRow.amount_ngn);
-            const existingRev = await db.prepare("SELECT id FROM wallet_transactions WHERE idempotency_key = ?").get(`flw-rev:${txRow.reference}`);
-            if (!existingRev && revAmount > 0) {
-              const before = roundCurrency(wallet.balanceNgn);
-              if (before >= revAmount) {
-                const after = roundCurrency(before - revAmount);
-                const revWtId = crypto4.randomUUID();
-                await db.prepare("UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?").run(
-                  after,
-                  now,
-                  wallet.id
-                );
-                await db.prepare(`
-                  INSERT INTO wallet_transactions (
-                    id, wallet_id, user_id, type, category, amount_ngn,
-                    balance_before_ngn, balance_after_ngn, currency,
-                    reference, idempotency_key, payment_transaction_id,
-                    status, description, actor_user_id, actor_role, metadata, created_at
-                  ) VALUES (?, ?, ?, 'debit', 'reversal', ?, ?, ?, 'NGN', ?, ?, ?, 'completed', ?, 'system', 'system', ?, ?)
-                `).run(
-                  revWtId,
-                  wallet.id,
-                  txRow.user_id,
-                  revAmount,
-                  before,
-                  after,
-                  `REV-${txRow.reference}`,
-                  `flw-rev:${txRow.reference}`,
-                  txRow.id,
-                  `Flutterwave chargeback / reversal (${txRow.reference})`,
-                  JSON.stringify({ flwTxId, txRef: txRow.reference }),
-                  now
-                );
-                walletDebitedOnReversal = true;
-              } else {
-                await db.prepare("UPDATE wallets SET status = 'frozen', updated_at = ? WHERE id = ?").run(
-                  now,
-                  wallet.id
-                );
-                walletFrozenOnReversal = true;
-              }
+        await db.prepare(
+          "UPDATE payment_transactions SET status = 'reversed', failure_reason = COALESCE(failure_reason, ?), updated_at = ? WHERE id = ?"
+        ).run(reversalNote, now, txRow.id);
+        if (txRow.delivery_id) {
+          await db.prepare("UPDATE delivery_requests SET payment_status = 'reversed', updated_at = ? WHERE id = ? AND payment_reference = ?").run(
+            now,
+            txRow.delivery_id,
+            txRow.reference
+          );
+        }
+        if (txRow.purpose === "wallet_funding" && wasPaid) {
+          const wallet = await ensureWallet(txRow.user_id);
+          const revAmount = roundCurrency(txRow.amount_ngn);
+          const existingRev = await db.prepare("SELECT id FROM wallet_transactions WHERE idempotency_key = ?").get(`flw-rev:${txRow.reference}`);
+          if (!existingRev && revAmount > 0) {
+            const before = roundCurrency(wallet.balanceNgn);
+            if (before >= revAmount) {
+              const after = roundCurrency(before - revAmount);
+              const revWtId = crypto4.randomUUID();
+              await db.prepare("UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?").run(
+                after,
+                now,
+                wallet.id
+              );
+              await db.prepare(`
+                INSERT INTO wallet_transactions (
+                  id, wallet_id, user_id, type, category, amount_ngn,
+                  balance_before_ngn, balance_after_ngn, currency,
+                  reference, idempotency_key, payment_transaction_id,
+                  status, description, actor_user_id, actor_role, metadata, created_at
+                ) VALUES (?, ?, ?, 'debit', 'reversal', ?, ?, ?, 'NGN', ?, ?, ?, 'completed', ?, 'system', 'system', ?, ?)
+              `).run(
+                revWtId,
+                wallet.id,
+                txRow.user_id,
+                revAmount,
+                before,
+                after,
+                `REV-${txRow.reference}`,
+                `flw-rev:${txRow.reference}`,
+                txRow.id,
+                `Flutterwave chargeback / reversal (${txRow.reference})`,
+                JSON.stringify({ flwTxId, txRef: txRow.reference }),
+                now
+              );
+              walletDebitedOnReversal = true;
+            } else {
+              await db.prepare("UPDATE wallets SET status = 'frozen', updated_at = ? WHERE id = ?").run(
+                now,
+                wallet.id
+              );
+              walletFrozenOnReversal = true;
             }
           }
-        });
+        }
+        return { txRow, walletDebitedOnReversal, walletFrozenOnReversal };
+      });
+      if (reversal) {
+        const { txRow, walletDebitedOnReversal, walletFrozenOnReversal } = reversal;
         const updatedTx = mapPaymentTxRow(
           await db.prepare("SELECT * FROM payment_transactions WHERE id = ?").get(txRow.id)
         );
@@ -6367,7 +6414,7 @@ function registerSaqoRoutes(app, options) {
       res.status(403).json({ error: "Rider accounts are issued directly by SAQO Operations Admin." });
       return;
     }
-    if (!email || !password || !fullName || !phone) {
+    if (typeof email !== "string" || !email.trim() || email.trim().length > 254 || typeof password !== "string" || !password || password.length > 1024 || typeof fullName !== "string" || !fullName.trim() || typeof phone !== "string" || !phone.trim()) {
       res.status(400).json({ error: "Full name, phone number, email, and password are required." });
       return;
     }
@@ -6381,24 +6428,24 @@ function registerSaqoRoutes(app, options) {
       return;
     }
     const targetRole = "client";
-    const existing = await db.prepare("SELECT id FROM profiles WHERE LOWER(email) = LOWER(?)").get(String(email).trim());
-    if (existing) {
+    const profileId = `prof-${crypto6.randomUUID()}`;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const passHash = hashPassword(String(password));
+    const state2 = typeof homeState === "string" && homeState.trim() ? homeState.trim() : "Katsina";
+    const created = await databaseTransaction(async () => {
+      const existing = await db.prepare("SELECT id FROM profiles WHERE LOWER(email) = LOWER(?)").get(email.trim());
+      if (existing) return false;
+      await db.prepare(`
+        INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+      `).run(profileId, email.trim().toLowerCase(), passHash, fullName.trim(), phone.trim(), targetRole, now);
+      await db.prepare("INSERT INTO customers (id, profile_id, default_state) VALUES (?, ?, ?)").run(`cust-${crypto6.randomUUID()}`, profileId, state2);
+      return true;
+    });
+    if (!created) {
       res.status(409).json({ error: "An account with this email already exists." });
       return;
     }
-    const profileId = `prof-${crypto6.randomUUID().slice(0, 8)}`;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const passHash = hashPassword(String(password));
-    const state2 = homeState || "Katsina";
-    await db.prepare(`
-      INSERT INTO profiles (id, email, password_hash, full_name, phone, role, account_status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-    `).run(profileId, String(email).trim().toLowerCase(), passHash, String(fullName).trim(), String(phone).trim(), targetRole, now);
-    await db.prepare(`INSERT INTO customers (id, profile_id, default_state) VALUES (?, ?, ?)`).run(
-      `cust-${crypto6.randomUUID().slice(0, 8)}`,
-      profileId,
-      state2
-    );
     const token = signSessionToken({ userId: profileId, role: targetRole });
     const profile = await getProfileById(profileId);
     res.status(201).json({ token, profile, rider: null });
@@ -8061,9 +8108,9 @@ function registerSaqoRoutes(app, options) {
       message
     } = req.body || {};
     const cleanToken = typeof visitorToken === "string" ? visitorToken.trim() : "";
-    const cleanName = (profile?.fullName || visitorName || "").trim();
+    const cleanName = profile?.fullName || (typeof visitorName === "string" ? visitorName.trim() : "");
     const cleanMsg = typeof message === "string" ? message.trim() : "";
-    if (!cleanToken) {
+    if (!cleanToken || cleanToken.length > 128) {
       res.status(400).json({ error: "Chat session token is required." });
       return;
     }
@@ -8079,9 +8126,9 @@ function registerSaqoRoutes(app, options) {
       visitorToken: cleanToken,
       userId: profile?.id || null,
       visitorName: cleanName,
-      visitorEmail: profile?.email || visitorEmail || null,
-      visitorPhone: profile?.phone || visitorPhone || null,
-      trackingCode: trackingCode || null,
+      visitorEmail: profile?.email || (typeof visitorEmail === "string" ? visitorEmail : null),
+      visitorPhone: profile?.phone || (typeof visitorPhone === "string" ? visitorPhone : null),
+      trackingCode: typeof trackingCode === "string" ? trackingCode : null,
       initialMessage: cleanMsg,
       senderRole: profile ? "client" : "visitor"
     });
@@ -8097,48 +8144,49 @@ function registerSaqoRoutes(app, options) {
   app.get("/api/support/conversations/:id/messages", asyncRoute(async (req, res) => {
     const auth = await tryAuthenticate(req);
     const visitorToken = typeof req.query.visitorToken === "string" ? req.query.visitorToken.trim() : "";
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: "Conversation not found." });
-      return;
-    }
-    const isOwner = auth && (auth.role === "admin" || conv.userId === auth.userId) || visitorToken && conv.visitorToken === visitorToken;
-    if (!isOwner) {
-      res.status(403).json({ error: "Access denied for this conversation." });
-      return;
-    }
-    const updatedConv = auth?.role === "admin" ? conv : await markSupportConversationRead(conv.id, "visitor") || conv;
-    res.json({
-      conversation: updatedConv,
-      messages: await getSupportMessages(conv.id),
-      presence: await getSupportPresenceAsync()
+    const thread = await databaseTransaction(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 };
+      if (!(auth && (auth.role === "admin" || conv.userId === auth.userId)) && !(!conv.userId && visitorToken && conv.visitorToken === visitorToken)) {
+        return { status: 403 };
+      }
+      const conversation = auth?.role === "admin" ? conv : await markSupportConversationRead(conv.id, "visitor") || conv;
+      return { status: 200, conversation, messages: await getSupportMessages(conv.id) };
     });
+    if (thread.status !== 200) {
+      res.status(thread.status).json({ error: thread.status === 404 ? "Conversation not found." : "Access denied for this conversation." });
+      return;
+    }
+    res.json({ conversation: thread.conversation, messages: thread.messages, presence: await getSupportPresenceAsync() });
   }));
   app.post("/api/support/conversations/:id/messages", asyncRoute(async (req, res) => {
     const auth = await tryAuthenticate(req);
     const profile = auth ? await getProfileById(auth.userId) : null;
     const { visitorToken, body } = req.body || {};
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: "Conversation not found." });
-      return;
-    }
-    const isOwner = auth && conv.userId === auth.userId || typeof visitorToken === "string" && visitorToken.trim() === conv.visitorToken;
-    if (!isOwner) {
-      res.status(403).json({ error: "Access denied for this conversation." });
-      return;
-    }
     const cleanBody = typeof body === "string" ? body.trim() : "";
     if (!cleanBody) {
       res.status(400).json({ error: "Message cannot be empty." });
       return;
     }
-    const result = await addSupportMessage({
-      conversationId: conv.id,
-      senderRole: profile ? "client" : "visitor",
-      senderName: profile?.fullName || conv.visitorName,
-      body: cleanBody
+    const outcome = await databaseTransaction(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 };
+      if (!(auth && conv.userId === auth.userId) && !(!conv.userId && typeof visitorToken === "string" && visitorToken.trim() === conv.visitorToken)) {
+        return { status: 403 };
+      }
+      const result2 = await addSupportMessage({
+        conversationId: conv.id,
+        senderRole: profile ? "client" : "visitor",
+        senderName: profile?.fullName || conv.visitorName,
+        body: cleanBody
+      });
+      return { status: 201, result: result2 };
     });
+    if (outcome.status !== 201) {
+      res.status(outcome.status).json({ error: outcome.status === 404 ? "Conversation not found." : "Access denied for this conversation." });
+      return;
+    }
+    const { result } = outcome;
     await broadcastWsEvent("support:message", result.message);
     await broadcastWsEvent("support:conversation", result.conversation);
     res.status(201).json({
@@ -8149,17 +8197,17 @@ function registerSaqoRoutes(app, options) {
   app.post("/api/support/conversations/:id/read", asyncRoute(async (req, res) => {
     const auth = await tryAuthenticate(req);
     const visitorToken = typeof req.body?.visitorToken === "string" ? req.body.visitorToken.trim() : "";
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: "Conversation not found." });
+    const outcome = await databaseTransaction(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 };
+      if (!(auth && conv.userId === auth.userId) && !(!conv.userId && visitorToken && visitorToken === conv.visitorToken)) return { status: 403 };
+      return { status: 200, updated: await markSupportConversationRead(conv.id, "visitor") };
+    });
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.status === 404 ? "Conversation not found." : "Access denied." });
       return;
     }
-    const isOwner = auth && conv.userId === auth.userId || visitorToken && visitorToken === conv.visitorToken;
-    if (!isOwner) {
-      res.status(403).json({ error: "Access denied." });
-      return;
-    }
-    const updated = await markSupportConversationRead(conv.id, "visitor");
+    const { updated } = outcome;
     if (updated) {
       await broadcastWsEvent("support:conversation", updated);
     }
@@ -8173,21 +8221,24 @@ function registerSaqoRoutes(app, options) {
       res.status(400).json({ error: "Invalid status." });
       return;
     }
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
-      res.status(404).json({ error: "Conversation not found." });
+    const outcome = await databaseTransaction(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return { status: 404 };
+      if (!(auth && conv.userId === auth.userId) && !(!conv.userId && typeof visitorToken === "string" && visitorToken.trim() === conv.visitorToken)) {
+        return { status: 403 };
+      }
+      const updated2 = await updateSupportConversationStatus(
+        conv.id,
+        status,
+        profile?.fullName || conv.visitorName
+      );
+      return { status: 200, updated: updated2 };
+    });
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.status === 404 ? "Conversation not found." : "Access denied." });
       return;
     }
-    const isOwner = auth && conv.userId === auth.userId || typeof visitorToken === "string" && visitorToken.trim() === conv.visitorToken;
-    if (!isOwner) {
-      res.status(403).json({ error: "Access denied." });
-      return;
-    }
-    const updated = await updateSupportConversationStatus(
-      conv.id,
-      status,
-      profile?.fullName || conv.visitorName
-    );
+    const { updated } = outcome;
     if (updated) {
       await broadcastWsEvent("support:message", updated.systemMessage);
       await broadcastWsEvent("support:conversation", updated.conversation);
@@ -8207,22 +8258,33 @@ function registerSaqoRoutes(app, options) {
     });
   }));
   app.post("/api/admin/support/presence", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
-    const available = Boolean(req.body?.available);
+    const available = req.body?.available;
+    if (typeof available !== "boolean") {
+      res.status(400).json({ error: "Availability must be true or false." });
+      return;
+    }
+    if (available) await refreshSupportAgentHeartbeat(req.auth.userId);
     const presence = await setAdminChatAvailability(available);
     res.json({ presence, adminAcceptingChats: await isAdminChatAvailableFlagAsync() });
   }));
+  app.post("/api/admin/support/heartbeat", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+    await refreshSupportAgentHeartbeat(req.auth.userId);
+    res.json({ presence: await getSupportPresenceAsync() });
+  }));
   app.get("/api/admin/support/conversations/:id/messages", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
-    const conv = await getSupportConversationById(req.params.id);
-    if (!conv) {
+    const thread = await databaseTransaction(async () => {
+      const conv = await getSupportConversationById(req.params.id);
+      if (!conv) return null;
+      const markedRead = conv.unreadByAdmin > 0;
+      const conversation = markedRead ? await markSupportConversationRead(conv.id, "admin") || conv : conv;
+      return { conversation, messages: await getSupportMessages(conv.id), markedRead };
+    });
+    if (!thread) {
       res.status(404).json({ error: "Conversation not found." });
       return;
     }
-    const updatedConv = await markSupportConversationRead(conv.id, "admin") || conv;
-    await broadcastWsEvent("support:conversation", updatedConv);
-    res.json({
-      conversation: updatedConv,
-      messages: await getSupportMessages(conv.id)
-    });
+    if (thread.markedRead) await broadcastWsEvent("support:conversation", thread.conversation);
+    res.json({ conversation: thread.conversation, messages: thread.messages });
   }));
   app.post("/api/admin/support/conversations/:id/messages", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
     const adminProfile = await getProfileById(req.auth.userId);
@@ -8286,7 +8348,7 @@ function registerSaqoRoutes(app, options) {
     const key = process.env.SAQO_CRON_SECRET?.trim() || process.env.SAQO_SESSION_SECRET?.trim() || process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
     const expected = key ? crypto6.createHmac("sha256", key).update("saqo-dispatch-tick").digest("hex") : "";
     const provided = (req.get("X-Saqo-Cron-Secret") || "").trim();
-    if (!expected || !provided || provided.length !== expected.length || !crypto6.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
+    if (!expected || !/^[a-f0-9]{64}$/.test(provided) || !crypto6.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
       res.status(403).json({ error: "Invalid cron authorization." });
       return;
     }
@@ -8382,9 +8444,9 @@ Deno.serve(async (request) => {
     const app = await getApp();
     return await app.handle(request, stripPrefix);
   } catch (err) {
-    console.error("Edge function error:", err);
+    console.error("Edge function initialization or request failed:", err instanceof Error ? err.name : "Unknown error");
     return Response.json(
-      { error: err instanceof Error ? err.message : "SAQO API initialization error." },
+      { error: "SAQO API could not process the request." },
       { status: 500 }
     );
   }

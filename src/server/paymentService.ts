@@ -1231,10 +1231,24 @@ async function insertPaymentTxRow(params: {
 
 const checkoutRequests = new Map<string, Promise<PaymentTransaction>>();
 
-export function reuseFlutterwaveCheckout(tx: PaymentTransaction): Promise<PaymentTransaction> {
-  const inFlight = checkoutRequests.get(tx.id);
-  if (inFlight) return inFlight;
-  if ((tx.status === 'pending' && tx.checkoutUrl) || tx.status === 'paid') return Promise.resolve(tx);
+export async function reuseFlutterwaveCheckout(tx: PaymentTransaction): Promise<PaymentTransaction> {
+  // A request on another Edge worker cannot see the in-memory promise.
+  const deadline = Date.now() + 4000;
+  while (true) {
+    const inFlight = checkoutRequests.get(tx.id);
+    if (inFlight) return inFlight;
+    if ((tx.status === 'pending' && tx.checkoutUrl) || tx.status === 'paid') return tx;
+    if (tx.status !== 'pending') break;
+    const age = Date.now() - Date.parse(tx.updatedAt);
+    if (!Number.isFinite(age) || age >= 30000) break;
+    if (Date.now() >= deadline) {
+      throw new PaymentVerificationError('Checkout is still being prepared. Retry this payment in a moment.');
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    const row = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id);
+    if (!row) break;
+    tx = mapPaymentTxRow(row);
+  }
   throw new PaymentVerificationError('This checkout has no usable link. Start a new payment attempt.');
 }
 
@@ -1289,35 +1303,38 @@ export async function initializeWalletFunding(params: {
     throw new Error('Minimum wallet funding amount is ₦100.');
   }
 
-  if (params.idempotencyKey) {
-    const existing = await db
-      .prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
-      .get(params.idempotencyKey) as any;
-    if (existing) {
-      if (existing.user_id !== params.userId || existing.purpose !== 'wallet_funding' || existing.amount_ngn !== amount) {
-        throw new PaymentVerificationError('This payment request key belongs to a different operation.');
+  const reservation = await withImmediateTransaction(async () => {
+    if (params.idempotencyKey) {
+      const existing = await db.prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
+        .get(params.idempotencyKey);
+      if (existing) {
+        if (existing.user_id !== params.userId || existing.purpose !== 'wallet_funding' || existing.amount_ngn !== amount) {
+          throw new PaymentVerificationError('This payment request key belongs to a different operation.');
+        }
+        return { existing: mapPaymentTxRow(existing) } as const;
       }
-      return reuseFlutterwaveCheckout(mapPaymentTxRow(existing));
     }
-  }
-
-  const wallet = await ensureWallet(params.userId);
-  const reference = generateReference('WLT');
-  const tx = await insertPaymentTxRow({
-    reference,
-    idempotencyKey: params.idempotencyKey || null,
-    userId: params.userId,
-    customerName: params.customerName,
-    customerEmail: params.customerEmail,
-    customerPhone: params.customerPhone,
-    walletId: wallet.id,
-    purpose: 'wallet_funding',
-    paymentMethod: 'flutterwave',
-    provider: 'flutterwave',
-    amountNgn: amount,
-    status: 'pending',
-    metadata: { source: 'customer_wallet_funding' },
+    const wallet = await ensureWallet(params.userId);
+    const reference = generateReference('WLT');
+    const tx = await insertPaymentTxRow({
+      reference,
+      idempotencyKey: params.idempotencyKey || null,
+      userId: params.userId,
+      customerName: params.customerName,
+      customerEmail: params.customerEmail,
+      customerPhone: params.customerPhone,
+      walletId: wallet.id,
+      purpose: 'wallet_funding',
+      paymentMethod: 'flutterwave',
+      provider: 'flutterwave',
+      amountNgn: amount,
+      status: 'pending',
+      metadata: { source: 'customer_wallet_funding' },
+    });
+    return { tx, wallet, reference } as const;
   });
+  if (reservation.existing) return reuseFlutterwaveCheckout(reservation.existing);
+  const { tx, wallet, reference } = reservation;
 
   return publishCheckout(tx, {
     txRef: reference,
@@ -1929,52 +1946,24 @@ export async function processFlutterwaveWebhook(params: {
   const now = new Date().toISOString();
 
   if (!validSig) {
-    const failedEventId = crypto.randomUUID();
-    await db.prepare(`
-      INSERT OR IGNORE INTO payment_webhook_events (
-        id, provider, event_type, event_id, tx_ref, flw_tx_id,
-        idempotency_key, signature_valid, status, processing_error,
-        payload, received_at, processed_at
-      ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 0, 'failed', 'Invalid webhook signature', ?, ?, ?)
-    `).run(
-      failedEventId,
-      eventType,
-      flwTxId,
-      txRef,
-      flwTxId,
-      `${idempotencyKey}:invalidsig:${Date.now()}`,
-      JSON.stringify(params.payload || {}),
-      now,
-      now
-    );
     return { accepted: false, status: 'failed', message: 'Invalid webhook signature.' };
   }
 
-  const existing = await db
-    .prepare('SELECT id, status FROM payment_webhook_events WHERE idempotency_key = ?')
-    .get(idempotencyKey) as any;
-  if (existing && (existing.status === 'processed' || existing.status === 'ignored')) {
+  await db.prepare(`
+    INSERT INTO payment_webhook_events (
+      id, provider, event_type, event_id, tx_ref, flw_tx_id,
+      idempotency_key, signature_valid, status, payload, received_at
+    ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 1, 'received', ?, ?)
+    ON CONFLICT (idempotency_key) DO NOTHING
+  `).run(crypto.randomUUID(), eventType, flwTxId, txRef, flwTxId, idempotencyKey,
+    JSON.stringify(params.payload || {}), now);
+  const existing = await db.prepare('SELECT id, status FROM payment_webhook_events WHERE idempotency_key = ?')
+    .get(idempotencyKey);
+  if (!existing) throw new Error('Webhook event could not be recorded.');
+  if (existing.status === 'processed' || existing.status === 'ignored') {
     return { accepted: true, duplicate: true, status: 'ignored', message: 'Duplicate webhook ignored.' };
   }
-
-  const webhookRowId = existing?.id || crypto.randomUUID();
-  if (!existing) {
-    await db.prepare(`
-      INSERT INTO payment_webhook_events (
-        id, provider, event_type, event_id, tx_ref, flw_tx_id,
-        idempotency_key, signature_valid, status, payload, received_at
-      ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 1, 'received', ?, ?)
-    `).run(
-      webhookRowId,
-      eventType,
-      flwTxId,
-      txRef,
-      flwTxId,
-      idempotencyKey,
-      JSON.stringify(params.payload || {}),
-      now
-    );
-  }
+  const webhookRowId = existing.id as string;
 
   try {
     if ((eventType === 'charge.completed' || eventType === 'charge.failed') && (txRef || flwTxId)) {
@@ -1984,82 +1973,83 @@ export async function processFlutterwaveWebhook(params: {
         source: 'webhook',
       });
     } else if (eventType === 'charge.reversed' && (txRef || flwTxId)) {
-      const txRow = await db.prepare(`
-        SELECT * FROM payment_transactions WHERE provider = 'flutterwave'
-          AND ((? IS NOT NULL AND reference = ?) OR (? IS NULL AND provider_tx_id = ?))
-      `).get(txRef, txRef, txRef, flwTxId) as any;
-      if (txRow?.provider_tx_id && flwTxId && txRow.provider_tx_id !== flwTxId) {
-        throw new PaymentVerificationError('Flutterwave reversal reference does not match.');
-      }
-      if (txRow && txRow.status !== 'reversed') {
+      const reversalNote = 'Payment reversed / chargeback reported by Flutterwave';
+      const reversal = await withImmediateTransaction(async () => {
+        const txRow = await db.prepare(txRef
+          ? "SELECT * FROM payment_transactions WHERE provider = 'flutterwave' AND reference = ?"
+          : "SELECT * FROM payment_transactions WHERE provider = 'flutterwave' AND provider_tx_id = ?"
+        ).get(txRef || flwTxId);
+        if (txRow?.provider_tx_id && flwTxId && txRow.provider_tx_id !== flwTxId) {
+          throw new PaymentVerificationError('Flutterwave reversal reference does not match.');
+        }
+        if (!txRow || txRow.status === 'reversed') return null;
         const wasPaid = txRow.status === 'paid';
         let walletFrozenOnReversal = false;
         let walletDebitedOnReversal = false;
-        const reversalNote = 'Payment reversed / chargeback reported by Flutterwave';
+        await db.prepare(
+          "UPDATE payment_transactions SET status = 'reversed', failure_reason = COALESCE(failure_reason, ?), updated_at = ? WHERE id = ?"
+        ).run(reversalNote, now, txRow.id);
 
-        await withImmediateTransaction(async () => {
-          await db.prepare(
-            "UPDATE payment_transactions SET status = 'reversed', failure_reason = COALESCE(failure_reason, ?), updated_at = ? WHERE id = ?"
-          ).run(reversalNote, now, txRow.id);
+        if (txRow.delivery_id) {
+          await db.prepare("UPDATE delivery_requests SET payment_status = 'reversed', updated_at = ? WHERE id = ? AND payment_reference = ?").run(
+            now,
+            txRow.delivery_id,
+            txRow.reference
+          );
+        }
 
-          if (txRow.delivery_id) {
-            await db.prepare("UPDATE delivery_requests SET payment_status = 'reversed', updated_at = ? WHERE id = ? AND payment_reference = ?").run(
-              now,
-              txRow.delivery_id,
-              txRow.reference
-            );
-          }
+        if (txRow.purpose === 'wallet_funding' && wasPaid) {
+          const wallet = await ensureWallet(txRow.user_id);
+          const revAmount = roundCurrency(txRow.amount_ngn);
+          const existingRev = await db
+            .prepare('SELECT id FROM wallet_transactions WHERE idempotency_key = ?')
+            .get(`flw-rev:${txRow.reference}`) as { id: string } | undefined;
 
-          if (txRow.purpose === 'wallet_funding' && wasPaid) {
-            const wallet = await ensureWallet(txRow.user_id);
-            const revAmount = roundCurrency(txRow.amount_ngn);
-            const existingRev = await db
-              .prepare('SELECT id FROM wallet_transactions WHERE idempotency_key = ?')
-              .get(`flw-rev:${txRow.reference}`) as { id: string } | undefined;
-
-            if (!existingRev && revAmount > 0) {
-              const before = roundCurrency(wallet.balanceNgn);
-              if (before >= revAmount) {
-                const after = roundCurrency(before - revAmount);
-                const revWtId = crypto.randomUUID();
-                await db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
-                  after,
-                  now,
-                  wallet.id
-                );
-                await db.prepare(`
-                  INSERT INTO wallet_transactions (
-                    id, wallet_id, user_id, type, category, amount_ngn,
-                    balance_before_ngn, balance_after_ngn, currency,
-                    reference, idempotency_key, payment_transaction_id,
-                    status, description, actor_user_id, actor_role, metadata, created_at
-                  ) VALUES (?, ?, ?, 'debit', 'reversal', ?, ?, ?, 'NGN', ?, ?, ?, 'completed', ?, 'system', 'system', ?, ?)
-                `).run(
-                  revWtId,
-                  wallet.id,
-                  txRow.user_id,
-                  revAmount,
-                  before,
-                  after,
-                  `REV-${txRow.reference}`,
-                  `flw-rev:${txRow.reference}`,
-                  txRow.id,
-                  `Flutterwave chargeback / reversal (${txRow.reference})`,
-                  JSON.stringify({ flwTxId, txRef: txRow.reference }),
-                  now
-                );
-                walletDebitedOnReversal = true;
-              } else {
-                await db.prepare("UPDATE wallets SET status = 'frozen', updated_at = ? WHERE id = ?").run(
-                  now,
-                  wallet.id
-                );
-                walletFrozenOnReversal = true;
-              }
+          if (!existingRev && revAmount > 0) {
+            const before = roundCurrency(wallet.balanceNgn);
+            if (before >= revAmount) {
+              const after = roundCurrency(before - revAmount);
+              const revWtId = crypto.randomUUID();
+              await db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
+                after,
+                now,
+                wallet.id
+              );
+              await db.prepare(`
+                INSERT INTO wallet_transactions (
+                  id, wallet_id, user_id, type, category, amount_ngn,
+                  balance_before_ngn, balance_after_ngn, currency,
+                  reference, idempotency_key, payment_transaction_id,
+                  status, description, actor_user_id, actor_role, metadata, created_at
+                ) VALUES (?, ?, ?, 'debit', 'reversal', ?, ?, ?, 'NGN', ?, ?, ?, 'completed', ?, 'system', 'system', ?, ?)
+              `).run(
+                revWtId,
+                wallet.id,
+                txRow.user_id,
+                revAmount,
+                before,
+                after,
+                `REV-${txRow.reference}`,
+                `flw-rev:${txRow.reference}`,
+                txRow.id,
+                `Flutterwave chargeback / reversal (${txRow.reference})`,
+                JSON.stringify({ flwTxId, txRef: txRow.reference }),
+                now
+              );
+              walletDebitedOnReversal = true;
+            } else {
+              await db.prepare("UPDATE wallets SET status = 'frozen', updated_at = ? WHERE id = ?").run(
+                now,
+                wallet.id
+              );
+              walletFrozenOnReversal = true;
             }
           }
-        });
-
+        }
+        return { txRow, walletDebitedOnReversal, walletFrozenOnReversal };
+      });
+      if (reversal) {
+        const { txRow, walletDebitedOnReversal, walletFrozenOnReversal } = reversal;
         const updatedTx = mapPaymentTxRow(
           await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(txRow.id)
         );

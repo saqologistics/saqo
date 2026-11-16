@@ -36,9 +36,9 @@ Deno.serve(async (request: Request) => {
     const app = await getApp();
     return await app.handle(request, stripPrefix);
   } catch (err) {
-    console.error('Edge function error:', err);
+    console.error('Edge function initialization or request failed:', err instanceof Error ? err.name : 'Unknown error');
     return Response.json(
-      { error: err instanceof Error ? err.message : 'SAQO API initialization error.' },
+      { error: 'SAQO API could not process the request.' },
       { status: 500 }
     );
   }

@@ -1,5 +1,5 @@
 import type { publicTrackingDelivery, publicTrackingHistory } from '../server/db';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowRight,
   BadgeCheck,
@@ -86,6 +86,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [trackError, setTrackError] = useState<string | null>(null);
   const [trackLoading, setTrackLoading] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
+  const trackingSearch = useRef(0);
+  const trackingRefresh = useRef<{ search: number; nextAt: number } | null>(null);
 
   const [otpInput, setOtpInput] = useState('');
   const [otpMessage, setOtpMessage] = useState<string | null>(null);
@@ -143,28 +145,33 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   }, [pickupState, pickupAddress, pickupCoords, destinationState, destinationAddress, destinationCoords]);
 
   const handleTrackSearch = async (codeToSearch?: string) => {
+    const search = ++trackingSearch.current;
     const code = (codeToSearch ?? trackCode).trim();
     if (!code) {
       setTrackError('Enter your SAQO tracking code to locate a parcel.');
+      setTrackLoading(false);
       return;
     }
     setTrackLoading(true);
     setTrackError(null);
     setOtpMessage(null);
     setOtpError(null);
+    setOtpInput('');
     try {
       const res = await apiRequest<{
         delivery: ReturnType<typeof publicTrackingDelivery>;
         history: Awaited<ReturnType<typeof publicTrackingHistory>>;
       }>(`/api/track/${encodeURIComponent(code)}`);
+      if (search !== trackingSearch.current) return;
       setTrackedDelivery(res.delivery);
       setTrackedHistory(res.history);
     } catch (err: any) {
+      if (search !== trackingSearch.current) return;
       setTrackedDelivery(null);
       setTrackedHistory([]);
       setTrackError(err.message || 'Parcel not found.');
     } finally {
-      setTrackLoading(false);
+      if (search === trackingSearch.current) setTrackLoading(false);
     }
   };
 
@@ -176,16 +183,21 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   // Live real-time tracking updates for the currently tracked parcel
   const { connected, sendEvent } = useRealtime((evt) => {
-    if (!trackedDelivery) return;
+    if (!trackedDelivery || trackLoading) return;
     if (evt.type === 'delivery:updated') {
+      if (otpSubmitting) return;
       const updated = evt.payload as ReturnType<typeof publicTrackingDelivery>;
-      if (updated?.id === trackedDelivery.id) {
-        if (updated.status) setTrackedDelivery(updated);
+      if (!updated || updated.id === trackedDelivery.id) {
+        const search = trackingSearch.current;
+        const lastRefresh = trackingRefresh.current;
+        if (lastRefresh?.search === search && lastRefresh.nextAt > Date.now()) return;
+        trackingRefresh.current = { search, nextAt: Date.now() + 1000 };
         apiRequest<{
           delivery: ReturnType<typeof publicTrackingDelivery>;
           history: Awaited<ReturnType<typeof publicTrackingHistory>>;
         }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}`)
           .then((res) => {
+            if (search !== trackingSearch.current) return;
             setTrackedDelivery(res.delivery);
             setTrackedHistory(res.history);
           })
@@ -222,6 +234,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       return;
     }
     setOtpSubmitting(true);
+    const search = trackingSearch.current;
     setOtpError(null);
     setOtpMessage(null);
     try {
@@ -232,12 +245,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         method: 'POST',
         body: JSON.stringify({ otp: otpInput.trim() }),
       });
+      if (search !== trackingSearch.current) return;
+      trackingSearch.current += 1;
       setTrackedDelivery(res.delivery);
       setTrackedHistory(res.history);
       setOtpMessage('Delivery confirmed. Recipient OTP verified.');
       setOtpInput('');
     } catch (err: any) {
-      setOtpError(err.message || 'OTP verification failed.');
+      if (search === trackingSearch.current) setOtpError(err.message || 'OTP verification failed.');
     } finally {
       setOtpSubmitting(false);
     }

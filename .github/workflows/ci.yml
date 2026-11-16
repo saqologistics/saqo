@@ -22,12 +22,15 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+      - name: Verify generated Supabase Edge bundle
+        run: npm run build:edge && git diff --exit-code -- supabase/functions/saqo-api/index.ts
       - run: node scripts/restartSmoke.mjs
       - name: Verify HTTPS and WebSocket through Caddy
         shell: bash
         env:
           SAQO_DOMAIN: localhost
           SAQO_ENV_FILE: .env.ci
+          SAQO_CONTAINER_NODE_ENV: test
         run: |
           printf '%s\n' SAQO_SESSION_SECRET=synthetic-caddy-ci-secret-with-over-32-characters SAQO_ADMIN_EMAIL=admin@saqo.test SAQO_ADMIN_PASSWORD=SmokeTestAdminPassword1 > "$SAQO_ENV_FILE"
           trap 'docker compose down --volumes' EXIT

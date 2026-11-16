@@ -455,6 +455,7 @@ export interface LiveWsEvent {
     | 'settings:updated'
     | 'complaint:updated'
     | 'support:presence'
+    | 'support:refresh'
     | 'support:message'
     | 'support:conversation'
     | 'support:typing'

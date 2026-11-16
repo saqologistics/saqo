@@ -264,6 +264,7 @@ export default function App() {
       {/* Persistent Live Support Chat connected to SAQO Admin across customer-facing pages */}
       {!staticPreview && (screen === 'landing' || (screen === 'dashboard' && profile?.role === 'client')) && (
         <SupportChatWidget
+          key={profile?.id || 'visitor'}
           currentUser={profile}
           whatsappNumber={whatsappNumber}
           openSignal={supportChatSignal}

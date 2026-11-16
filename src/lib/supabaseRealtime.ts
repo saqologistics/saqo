@@ -20,7 +20,7 @@ const PUBLIC_REALTIME_EVENTS = new Set([
   'delivery:created',
   'delivery:updated',
   'settings:updated',
-  'support:presence',
+  'support:refresh',
 ]);
 
 function setSupabaseConnected(next: boolean) {
@@ -32,17 +32,24 @@ function setSupabaseConnected(next: boolean) {
 function ensureChannel() {
   if (!supabase || activeChannel) return;
   try {
-    activeChannel = supabase
+    const channel = supabase
       .channel('saqo-notifications')
       .on('broadcast', { event: 'saqo-event' }, (payload) => {
+        if (activeChannel !== channel) return;
         if (payload?.payload) {
           const evt = payload.payload as LiveWsEvent;
           if (PUBLIC_REALTIME_EVENTS.has(evt.type)) {
-            listeners.forEach((cb) => cb(evt));
+            // Public broadcasts can request a refresh, but cannot supply tracking data.
+            const event = evt.type === 'delivery:created' || evt.type === 'delivery:updated'
+              ? { ...evt, payload: null }
+              : evt;
+            listeners.forEach((cb) => cb(event));
           }
         }
-      })
-      .subscribe((status) => {
+      });
+    activeChannel = channel;
+    channel.subscribe((status) => {
+        if (activeChannel !== channel) return;
         setSupabaseConnected(status === 'SUBSCRIBED');
       });
   } catch {

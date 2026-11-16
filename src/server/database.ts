@@ -71,6 +71,13 @@ export function afterDatabaseCommit(effect: () => void): void {
   if (!deferDatabaseEffect(effect)) effect();
 }
 
+function runCommittedEffects(effects: Transaction['effects']): void {
+  for (const effect of effects) {
+    try { effect(); }
+    catch { console.error('A post-commit database effect failed.'); }
+  }
+}
+
 export async function databaseTransaction<T>(work: () => T | Promise<T>): Promise<T> {
   if (transactionContext.getStore()?.open) return await work();
   if (pool) {
@@ -83,7 +90,7 @@ export async function databaseTransaction<T>(work: () => T | Promise<T>): Promis
       const result = await transactionContext.run(state, work);
       await client.query('COMMIT');
       state.open = false;
-      for (const effect of state.effects) effect();
+      runCommittedEffects(state.effects);
       return result;
     } catch (error) {
       if (state.open) await client.query('ROLLBACK').catch(() => {});
@@ -100,7 +107,7 @@ export async function databaseTransaction<T>(work: () => T | Promise<T>): Promis
       const result = await transactionContext.run(state, work);
       sqlite!.exec('COMMIT');
       state.open = false;
-      for (const effect of state.effects) effect();
+      runCommittedEffects(state.effects);
       return result;
     } catch (error) {
       if (state.open) sqlite!.exec('ROLLBACK');

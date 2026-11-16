@@ -22,6 +22,67 @@ await initDatabase();
 const app = new WebApp();
 registerSaqoRoutes(app);
 
+test('Concurrent registration returns a conflict and creates one complete customer', async () => {
+  const email = `race-${crypto.randomUUID()}@saqo.test`;
+  const register = (address: string) => app.handle(new Request('https://example.test/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: address, password: 'test-password', fullName: 'Test Customer', phone: '08011112222' }),
+  }));
+  const replies = await Promise.all([register(email), register(email.toUpperCase())]);
+  assert.deepEqual(replies.map((reply) => reply.status).sort(), [201, 409]);
+  const result = await db.prepare(`
+    SELECT COUNT(*) AS total FROM profiles JOIN customers ON customers.profile_id = profiles.id WHERE email = ?
+  `).get(email);
+  assert.equal(result?.total, 1);
+});
+
+test('A linked support conversation is inaccessible using its old guest token', async () => {
+  const call = (route: string, body?: object, bearer?: string, method = body ? 'POST' : 'GET') =>
+    app.handle(new Request(`https://example.test${route}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    }));
+  const register = async () => {
+    const response = await call('/api/auth/register', {
+      email: `support-${crypto.randomUUID()}@saqo.test`,
+      password: 'test-password', fullName: 'Test Customer', phone: '08011112222',
+    });
+    assert.equal(response.status, 201);
+    return (await response.json()).token as string;
+  };
+  const token = await register();
+  const otherUser = await register();
+  const visitorToken = crypto.randomUUID();
+  const base = '/api/support/conversations';
+  const created = await call(base, { visitorToken, visitorName: 'Guest', message: 'First message' });
+  assert.equal(created.status, 201);
+  const id = (await created.json()).conversation.id;
+  const thread = `${base}/${id}`;
+  assert.equal((await call(`${thread}/messages?visitorToken=${visitorToken}`)).status, 200);
+  const claimed = await call(`${base}?visitorToken=${visitorToken}`, undefined, token);
+  assert.equal((await claimed.json()).conversations[0].id, id);
+  for (const bearer of [undefined, otherUser]) {
+    const list = await call(`${base}?visitorToken=${visitorToken}`, undefined, bearer);
+    assert.deepEqual((await list.json()).conversations, []);
+    assert.equal((await call(`${thread}/messages?visitorToken=${visitorToken}`, undefined, bearer)).status, 403);
+    assert.equal((await call(`${thread}/messages`, { visitorToken, body: 'Unauthorized' }, bearer)).status, 403);
+    assert.equal((await call(`${thread}/read`, { visitorToken }, bearer)).status, 403);
+    assert.equal((await call(`${thread}/status`, { visitorToken, status: 'resolved' }, bearer, 'PATCH')).status, 403);
+  }
+  assert.equal((await call(`${thread}/messages`, { body: 'Owner reply' }, token)).status, 201);
+});
+
+test('Invalid encoded route parameters produce a JSON 400', async () => {
+  const response = await app.handle(new Request('https://example.test/api/track/%E0%A4%A'));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: 'Invalid URL parameter.' });
+});
+
 test('WebApp serves /api/health, CORS preflight, and rejects unauthorized origins', async () => {
   const health = await app.handle(
     new Request('https://example.supabase.co/functions/v1/saqo-api/api/health', {
@@ -67,14 +128,16 @@ test('WebApp enforces JSON error handling and internal cron HMAC secret', async 
   );
   assert.equal(badJson.status, 400);
 
-  const deniedTick = await app.handle(
-    new Request('https://example.supabase.co/saqo-api/api/internal/dispatch-tick', {
-      method: 'POST',
-      headers: { 'X-Saqo-Cron-Secret': 'wrong' },
-    }),
-    '/saqo-api'
-  );
-  assert.equal(deniedTick.status, 403);
+  for (const invalid of ['wrong', 'é'.repeat(64)]) {
+    const deniedTick = await app.handle(
+      new Request('https://example.supabase.co/saqo-api/api/internal/dispatch-tick', {
+        method: 'POST',
+        headers: { 'X-Saqo-Cron-Secret': invalid },
+      }),
+      '/saqo-api'
+    );
+    assert.equal(deniedTick.status, 403);
+  }
 
   const expected = crypto
     .createHmac('sha256', process.env.SAQO_SESSION_SECRET!)
@@ -354,6 +417,25 @@ test('Concurrency, race conditions, OTP isolation, wallet atomicity, and DB supp
     adminToken
   );
   assert.equal(setBack.status, 200);
+
+  const originalEdgeRuntime = process.env.SAQO_EDGE_RUNTIME;
+  process.env.SAQO_EDGE_RUNTIME = '1';
+  try {
+    const heartbeat = '/api/admin/support/heartbeat';
+    const heartbeatRequest = { method: 'POST' };
+    assert.equal((await api(heartbeat, heartbeatRequest)).status, 401);
+    await db.prepare('UPDATE support_agent_heartbeats SET expires_at = ?').run('2000-01-01T00:00:00.000Z');
+    assert.deepEqual(await (await api('/api/support/presence')).json(), { adminOnline: false, onlineAdminCount: 0 });
+    const heartbeats = await Promise.all([api(heartbeat, heartbeatRequest, adminToken), api(heartbeat, heartbeatRequest, adminToken)]);
+    for (const reply of heartbeats) {
+      assert.equal(reply.status, 200);
+      assert.deepEqual((await reply.json()).presence, { adminOnline: true, onlineAdminCount: 1 });
+    }
+    assert.deepEqual(await (await api('/api/support/presence')).json(), { adminOnline: true, onlineAdminCount: 1 });
+  } finally {
+    if (originalEdgeRuntime === undefined) delete process.env.SAQO_EDGE_RUNTIME;
+    else process.env.SAQO_EDGE_RUNTIME = originalEdgeRuntime;
+  }
 
   // Create fresh verified rider + client for concurrency tests
   const rcEmail = `race-rider-${crypto.randomUUID().slice(0, 6)}@saqo.ng`;

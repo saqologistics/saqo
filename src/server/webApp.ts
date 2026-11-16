@@ -70,7 +70,7 @@ function compileRoutePattern(pathPattern: string): { regex: RegExp; paramNames: 
 }
 
 function parseFormEncoded(raw: string, maxParams = 150): Record<string, string | string[]> {
-  const result: Record<string, string | string[]> = {};
+  const result: Record<string, string | string[]> = Object.create(null);
   const params = new URLSearchParams(raw);
   let count = 0;
   for (const [key, value] of params.entries()) {
@@ -329,9 +329,14 @@ export class WebApp implements SaqoApp {
         const match = layer.pattern!.exec(pathname);
         if (!match) continue;
         const params: Record<string, string> = {};
-        layer.paramNames.forEach((name, idx) => {
-          params[name] = decodeURIComponent(match[idx + 1] || '');
-        });
+        try {
+          layer.paramNames.forEach((name, idx) => {
+            params[name] = decodeURIComponent(match[idx + 1] || '');
+          });
+        } catch {
+          res.status(400).json({ error: 'Invalid URL parameter.' });
+          break;
+        }
         req.params = params;
       } else if (layer.prefix !== null && layer.prefix !== '') {
         if (pathname !== layer.prefix && !pathname.startsWith(`${layer.prefix}/`)) continue;
