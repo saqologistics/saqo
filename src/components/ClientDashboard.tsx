@@ -136,6 +136,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
   const seenStatusesRef = useRef<Map<string, string>>(new Map());
+  const loadSeqRef = useRef(0);
+  const realtimeTimerRef = useRef<number | null>(null);
+  const lastStatusAlertAtRef = useRef<Map<string, number>>(new Map());
 
   // Wallet & Payment states
   const [wallet, setWallet] = useState<WalletAccount | null>(null);
@@ -219,6 +222,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [justConfirmedId, setJustConfirmedId] = useState<string | null>(null);
 
   const loadData = useCallback(async (checkExpiry = false) => {
+    const seq = ++loadSeqRef.current;
     try {
       const delPath = checkExpiry ? '/api/client/deliveries?checkExpiry=1' : '/api/client/deliveries';
       const [delRes, notifRes, ticketsRes, walletRes, payCfgRes] = await Promise.all([
@@ -232,16 +236,22 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         }>('/api/wallet').catch(() => null),
         apiRequest<PaymentGatewayPublicConfig>('/api/payments/config').catch(() => null),
       ]);
+      if (seq !== loadSeqRef.current) return;
       if (seenStatusesRef.current.size > 0) {
+        const nowMs = Date.now();
         for (const d of delRes.deliveries) {
           const prev = seenStatusesRef.current.get(d.id);
           if (prev && prev !== d.status) {
-            playNotificationSound('status');
-            showPushNotification(
-              `Parcel ${d.trackingCode}: ${formatDeliveryStatusLabel(d.status)}`,
-              `${d.pickupState} → ${d.destinationState}`,
-              `saqo-del-${d.id}`
-            );
+            const lastAlert = lastStatusAlertAtRef.current.get(d.id) || 0;
+            if (nowMs - lastAlert > 5000) {
+              lastStatusAlertAtRef.current.set(d.id, nowMs);
+              playNotificationSound('status');
+              showPushNotification(
+                `Parcel ${d.trackingCode}: ${formatDeliveryStatusLabel(d.status)}`,
+                `${d.pickupState} → ${d.destinationState}`,
+                `saqo-del-${d.id}`
+              );
+            }
           }
         }
       }
@@ -257,19 +267,40 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       if (payCfgRes) {
         setPaymentConfig(payCfgRes);
       }
-      if (!selectedDeliveryId && delRes.deliveries.length > 0) {
+      if (delRes.deliveries.length > 0) {
         const firstActive =
           delRes.deliveries.find((d) => !['delivered', 'cancelled'].includes(d.status)) ||
           delRes.deliveries[0];
-        setSelectedDeliveryId(firstActive.id);
+        setSelectedDeliveryId((prev) => prev || firstActive.id);
       }
       setError(null);
     } catch (err: any) {
+      if (seq !== loadSeqRef.current) return;
       setError(err.message || 'Failed to load deliveries.');
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) {
+        setLoading(false);
+      }
     }
-  }, [selectedDeliveryId]);
+  }, []);
+
+  const scheduleRealtimeRefresh = useCallback((checkExpiry = true) => {
+    if (realtimeTimerRef.current !== null) {
+      window.clearTimeout(realtimeTimerRef.current);
+    }
+    realtimeTimerRef.current = window.setTimeout(() => {
+      realtimeTimerRef.current = null;
+      void loadData(checkExpiry);
+    }, 180);
+  }, [loadData]);
+
+  useEffect(() => {
+    return () => {
+      if (realtimeTimerRef.current !== null) {
+        window.clearTimeout(realtimeTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (showDeliveryStateSelectors) return;
@@ -370,7 +401,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
   useRealtime((evt) => {
     if (evt.type === 'notifications:refresh' || evt.type === 'connected') {
-      loadData(true);
+      scheduleRealtimeRefresh(true);
       return;
     }
     if (evt.type === 'notification:created') {
@@ -380,8 +411,14 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           prev.some((n) => n.id === notif.id) ? prev : [notif, ...prev]
         );
         setLiveToast(notif);
-        playNotificationSound('status');
-        showPushNotification(notif.title, notif.message, `saqo-notif-${notif.id}`);
+        const nowMs = Date.now();
+        const delKey = notif.deliveryId || '';
+        const lastAlert = delKey ? lastStatusAlertAtRef.current.get(delKey) || 0 : 0;
+        if (!delKey || nowMs - lastAlert > 5000) {
+          if (delKey) lastStatusAlertAtRef.current.set(delKey, nowMs);
+          playNotificationSound('status');
+          showPushNotification(notif.title, notif.message, `saqo-notif-${notif.id}`);
+        }
       }
     }
     if (
@@ -395,7 +432,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       evt.type === 'cash_collection:updated' ||
       evt.type === 'gateway:updated'
     ) {
-      loadData(true);
+      scheduleRealtimeRefresh(true);
     }
   });
 

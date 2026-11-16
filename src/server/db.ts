@@ -244,7 +244,8 @@ function initSqliteDatabase(): void {
       inter_state_surcharge_ngn REAL NOT NULL,
       rider_commission_percent REAL NOT NULL,
       whatsapp_support_number TEXT NOT NULL,
-      show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0
+      show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0,
+      admin_accepting_chats INTEGER NOT NULL DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS whatsapp_sessions (
@@ -482,6 +483,9 @@ function initSqliteDatabase(): void {
   if (!settingsCols.some((column) => column.name === 'show_delivery_state_selectors')) {
     db.exec('ALTER TABLE platform_settings ADD COLUMN show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0');
   }
+  if (!settingsCols.some((column) => column.name === 'admin_accepting_chats')) {
+    db.exec('ALTER TABLE platform_settings ADD COLUMN admin_accepting_chats INTEGER NOT NULL DEFAULT 1');
+  }
   const deliveryCols = db.prepare('PRAGMA table_info(delivery_requests)').all() as Array<{ name: string }>;
   const colNames = new Set(deliveryCols.map((c) => c.name));
   if (!colNames.has('payment_method')) {
@@ -584,7 +588,19 @@ async function ensurePostgresSchemaExtensions(): Promise<void> {
   await db.prepare('ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rider_rating_comment TEXT').run();
   await db.prepare('ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rated_at TEXT').run();
   await db.prepare('ALTER TABLE riders ALTER COLUMN is_online SET DEFAULT 1').run();
+  await db.prepare('ALTER TABLE platform_settings ADD COLUMN IF NOT EXISTS admin_accepting_chats INTEGER NOT NULL DEFAULT 1').run();
   schemaExtensionsEnsured = true;
+}
+
+export async function getAdminAcceptingChats(): Promise<boolean> {
+  const row = (await db.prepare('SELECT admin_accepting_chats FROM platform_settings WHERE id = 1').get()) as
+    | { admin_accepting_chats?: number }
+    | undefined;
+  return row ? Number(row.admin_accepting_chats ?? 1) !== 0 : true;
+}
+
+export async function setAdminAcceptingChatsDb(available: boolean): Promise<void> {
+  await db.prepare('UPDATE platform_settings SET admin_accepting_chats = ? WHERE id = 1').run(available ? 1 : 0);
 }
 
 export async function initDatabase() {

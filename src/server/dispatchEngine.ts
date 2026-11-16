@@ -7,6 +7,7 @@ import type { DeliveryRequest, LiveWsEvent, SupportPresence, UserRole } from '..
 import {
   createNotification,
   db,
+  getAdminAcceptingChats,
   persistDispatchChange,
   getAllRiders,
   getDeliveryById,
@@ -15,6 +16,7 @@ import {
   getProfileById,
   getSupportConversationById,
   listDeliveries,
+  setAdminAcceptingChatsDb,
 } from './db';
 
 const wsClients = new Set<WebSocket>();
@@ -80,13 +82,18 @@ export function getSupportPresence(): SupportPresence {
   return connected;
 }
 
+export async function getSupportPresenceAsync(): Promise<SupportPresence> {
+  adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
+  return getSupportPresence();
+}
+
 function cancelOfflineGrace(): void {
   if (adminOfflineGraceTimer) clearTimeout(adminOfflineGraceTimer);
   adminOfflineGraceTimer = null;
 }
 
 async function broadcastPresenceIfChanged(): Promise<SupportPresence> {
-  const presence = getSupportPresence();
+  const presence = await getSupportPresenceAsync();
   if (
     !lastBroadcastPresence ||
     lastBroadcastPresence.adminOnline !== presence.adminOnline ||
@@ -100,8 +107,14 @@ async function broadcastPresenceIfChanged(): Promise<SupportPresence> {
 
 export async function setAdminChatAvailability(available: boolean): Promise<SupportPresence> {
   adminAcceptingChats = available;
+  await setAdminAcceptingChatsDb(available);
   cancelOfflineGrace();
   return await broadcastPresenceIfChanged();
+}
+
+export async function isAdminChatAvailableFlagAsync(): Promise<boolean> {
+  adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
+  return adminAcceptingChats;
 }
 
 export function isAdminChatAvailableFlag(): boolean {
@@ -405,79 +418,87 @@ export async function dispatchNextRiderForDelivery(deliveryId: string): Promise<
   riderId?: string;
   riderName?: string;
 }> {
-  const delivery = await getDeliveryById(deliveryId);
-  if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
-    return { offered: false };
-  }
-
-  const settings = await getPlatformSettings();
-  const riders = await getAllRiders();
-  const allDeliveries = await listDeliveries();
-
-  const previousAttempts = await db
-    .prepare(
-      `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
-    )
-    .all(deliveryId) as Array<{ rider_id: string }>;
-  const excludedRiderIds = previousAttempts.map((a) => a.rider_id);
-
-  const candidates = riders.map((rider) => ({
-    rider,
-    activeDeliveries: allDeliveries.filter(
-      (d) =>
-        d.assignedRiderId === rider.riderId &&
-        activeStatuses.includes(d.status)
-    ),
-  }));
-
-  const ranked = rankEligibleRiders({
-    delivery,
-    candidates,
-    settings,
-    excludedRiderIds,
-  });
-
-  if (ranked.length === 0) {
-    if (delivery.status === 'no_rider_available') return { offered: false };
-    const now = new Date().toISOString();
-    await db.prepare(`UPDATE delivery_requests SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ? WHERE id = ?`).run(
-      now,
-      deliveryId
-    );
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
-    `).run(
-      `hist-${crypto.randomUUID().slice(0, 8)}`,
-      deliveryId,
-      'Queued until an eligible rider has capacity.',
-      now
-    );
-
-    const custRow = await db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId) as {
-      profile_id: string;
-    } | undefined;
-    if (custRow) {
-      const notif = await createNotification(
-        custRow.profile_id,
-        'No rider available right now',
-        `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
-        deliveryId
-      );
-      await broadcastWsEvent('notification:created', notif);
+  const committed = await persistDispatchChange(async () => {
+    const delivery = await getDeliveryById(deliveryId);
+    if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
+      return null;
     }
 
-    const updated = await getDeliveryById(deliveryId);
-    await broadcastWsEvent('delivery:updated', updated);
-    return { offered: false };
-  }
+    const settings = await getPlatformSettings();
+    const riders = await getAllRiders();
+    const allDeliveries = await listDeliveries();
 
-  const topCandidate = ranked[0];
-  const assignmentId = `asg-${crypto.randomUUID().slice(0, 8)}`;
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1000);
+    const previousAttempts = await db
+      .prepare(
+        `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
+      )
+      .all(deliveryId) as Array<{ rider_id: string }>;
+    const excludedRiderIds = previousAttempts.map((a) => a.rider_id);
 
-  await persistDispatchChange(async () => {
+    const candidates = riders.map((rider) => ({
+      rider,
+      activeDeliveries: allDeliveries.filter(
+        (d) =>
+          d.assignedRiderId === rider.riderId &&
+          activeStatuses.includes(d.status)
+      ),
+    }));
+
+    const ranked = rankEligibleRiders({
+      delivery,
+      candidates,
+      settings,
+      excludedRiderIds,
+    });
+
+    if (ranked.length === 0) {
+      if (delivery.status === 'no_rider_available') return { kind: 'noop' as const };
+      const nowIso = new Date().toISOString();
+      const locked = await db.prepare(`
+        UPDATE delivery_requests
+        SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+      `).run(nowIso, deliveryId);
+      if (locked.changes === 0) return { kind: 'noop' as const };
+
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
+      `).run(
+        `hist-${crypto.randomUUID().slice(0, 8)}`,
+        deliveryId,
+        'Queued until an eligible rider has capacity.',
+        nowIso
+      );
+
+      const custRow = await db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId) as {
+        profile_id: string;
+      } | undefined;
+      const custNotif = custRow
+        ? await createNotification(
+            custRow.profile_id,
+            'No rider available right now',
+            `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
+            deliveryId
+          )
+        : null;
+      const updated = await getDeliveryById(deliveryId);
+      return { kind: 'no_rider' as const, custNotif, updated };
+    }
+
+    const topCandidate = ranked[0];
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const locked = await db.prepare(`
+      UPDATE delivery_requests
+      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
+      WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+    `).run(topCandidate.rider.riderId, nowIso, deliveryId);
+    if (locked.changes === 0) return { kind: 'noop' as const };
+
+    const assignmentId = `asg-${crypto.randomUUID().slice(0, 8)}`;
+    const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1000);
+
     await db.prepare(`
       INSERT INTO delivery_assignments (
         id, delivery_id, rider_id, status, score, distance_to_pickup_km,
@@ -490,15 +511,9 @@ export async function dispatchNextRiderForDelivery(deliveryId: string): Promise<
       topCandidate.compositeScore,
       topCandidate.distanceToPickupKm,
       topCandidate.routeCompatibilityScore,
-      now.toISOString(),
+      nowIso,
       expiresAt.toISOString()
     );
-
-    await db.prepare(`
-      UPDATE delivery_requests
-      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
-      WHERE id = ?
-    `).run(topCandidate.rider.riderId, now.toISOString(), deliveryId);
 
     await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
@@ -509,54 +524,73 @@ export async function dispatchNextRiderForDelivery(deliveryId: string): Promise<
       `Smart dispatch offered parcel to ${topCandidate.rider.fullName} (${topCandidate.distanceToPickupKm} km away, route fit ${Math.round(
         topCandidate.routeCompatibilityScore * 100
       )}%).`,
-      now.toISOString()
+      nowIso
     );
-  });
 
-  const riderNotif = await createNotification(
-    topCandidate.rider.id,
-    'New Delivery Request Available',
-    `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} → ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
-    deliveryId
-  );
-  await broadcastWsEvent('notification:created', riderNotif);
-
-  const custRow = await db
-    .prepare('SELECT profile_id FROM customers WHERE id = ?')
-    .get(delivery.customerId) as { profile_id: string } | undefined;
-  if (custRow) {
-    const custNotif = await createNotification(
-      custRow.profile_id,
-      'Rider Assigned',
-      `${topCandidate.rider.fullName} (${topCandidate.rider.vehicleType}) has been matched to parcel ${delivery.trackingCode}.`,
+    const riderNotif = await createNotification(
+      topCandidate.rider.id,
+      'New Delivery Request Available',
+      `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} → ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
       deliveryId
     );
-    await broadcastWsEvent('notification:created', custNotif);
-  }
+    const custRow = await db
+      .prepare('SELECT profile_id FROM customers WHERE id = ?')
+      .get(delivery.customerId) as { profile_id: string } | undefined;
+    const custNotif = custRow
+      ? await createNotification(
+          custRow.profile_id,
+          'Rider Assigned',
+          `${topCandidate.rider.fullName} (${topCandidate.rider.vehicleType}) has been matched to parcel ${delivery.trackingCode}.`,
+          deliveryId
+        )
+      : null;
 
-  const updatedDelivery = await getDeliveryById(deliveryId);
-  await broadcastWsEvent('delivery:updated', updatedDelivery);
-  await broadcastWsEvent('assignment:offered', {
-    id: assignmentId,
-    deliveryId,
-    trackingCode: delivery.trackingCode,
-    riderId: topCandidate.rider.riderId,
-    riderProfileId: topCandidate.rider.id,
-    riderName: topCandidate.rider.fullName,
-    status: 'offered',
-    score: topCandidate.compositeScore,
-    distanceToPickupKm: topCandidate.distanceToPickupKm,
-    routeCompatibilityScore: topCandidate.routeCompatibilityScore,
-    offeredAt: now.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    delivery: updatedDelivery && { ...updatedDelivery, deliveryOtp: undefined },
+    const updatedDelivery = await getDeliveryById(deliveryId);
+    return {
+      kind: 'offered' as const,
+      assignmentId,
+      delivery,
+      topCandidate,
+      nowIso,
+      expiresAtIso: expiresAt.toISOString(),
+      riderNotif,
+      custNotif,
+      updatedDelivery,
+    };
   });
 
-  scheduleOfferExpiry(assignmentId, expiresAt.toISOString());
+  if (!committed || committed.kind === 'noop') return { offered: false };
+
+  if (committed.kind === 'no_rider') {
+    if (committed.custNotif) await broadcastWsEvent('notification:created', committed.custNotif);
+    await broadcastWsEvent('delivery:updated', committed.updated);
+    return { offered: false };
+  }
+
+  await broadcastWsEvent('notification:created', committed.riderNotif);
+  if (committed.custNotif) await broadcastWsEvent('notification:created', committed.custNotif);
+  await broadcastWsEvent('delivery:updated', committed.updatedDelivery);
+  await broadcastWsEvent('assignment:offered', {
+    id: committed.assignmentId,
+    deliveryId,
+    trackingCode: committed.delivery.trackingCode,
+    riderId: committed.topCandidate.rider.riderId,
+    riderProfileId: committed.topCandidate.rider.id,
+    riderName: committed.topCandidate.rider.fullName,
+    status: 'offered',
+    score: committed.topCandidate.compositeScore,
+    distanceToPickupKm: committed.topCandidate.distanceToPickupKm,
+    routeCompatibilityScore: committed.topCandidate.routeCompatibilityScore,
+    offeredAt: committed.nowIso,
+    expiresAt: committed.expiresAtIso,
+    delivery: committed.updatedDelivery && { ...committed.updatedDelivery, deliveryOtp: undefined },
+  });
+
+  scheduleOfferExpiry(committed.assignmentId, committed.expiresAtIso);
 
   return {
     offered: true,
-    riderId: topCandidate.rider.riderId,
-    riderName: topCandidate.rider.fullName,
+    riderId: committed.topCandidate.rider.riderId,
+    riderName: committed.topCandidate.rider.fullName,
   };
 }

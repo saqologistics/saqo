@@ -109,8 +109,13 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   const seenOfferIdsRef = useRef<Set<string>>(new Set());
   const triggeredExpiryIdsRef = useRef<Set<string>>(new Set());
   const autoOnlineAppliedRef = useRef(false);
+  const loadSeqRef = useRef(0);
+  const realtimeTimerRef = useRef<number | null>(null);
+  const hydratedRiderIdRef = useRef<string | null>(null);
+  const prevTabRef = useRef(tab);
 
   const loadDashboard = useCallback(async (checkExpiry = false) => {
+    const seq = ++loadSeqRef.current;
     try {
       const path = checkExpiry ? '/api/rider/dashboard?checkExpiry=1' : '/api/rider/dashboard';
       const res = await apiRequest<{
@@ -120,6 +125,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
         settings: PlatformSettings;
         notifications?: NotificationItem[];
       }>(path);
+      if (seq !== loadSeqRef.current) return;
       setRider(res.rider);
       setAssignments(res.assignments);
       setDeliveries(res.deliveries);
@@ -129,10 +135,31 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
       }
       setError(null);
     } catch (err: any) {
+      if (seq !== loadSeqRef.current) return;
       setError(err.message || 'Failed to load rider workspace.');
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) {
+        setLoading(false);
+      }
     }
+  }, []);
+
+  const scheduleRealtimeRefresh = useCallback((checkExpiry = false) => {
+    if (realtimeTimerRef.current !== null) {
+      window.clearTimeout(realtimeTimerRef.current);
+    }
+    realtimeTimerRef.current = window.setTimeout(() => {
+      realtimeTimerRef.current = null;
+      void loadDashboard(checkExpiry);
+    }, 180);
+  }, [loadDashboard]);
+
+  useEffect(() => {
+    return () => {
+      if (realtimeTimerRef.current !== null) {
+        window.clearTimeout(realtimeTimerRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -152,7 +179,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
 
   useRealtime((evt) => {
     if (evt.type === 'notifications:refresh' || evt.type === 'connected') {
-      loadDashboard();
+      scheduleRealtimeRefresh();
       return;
     }
     if (evt.type === 'notification:created') {
@@ -172,7 +199,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
       evt.type === 'settings:updated' ||
       evt.type === 'notification:created'
     ) {
-      loadDashboard();
+      scheduleRealtimeRefresh();
     }
   });
 
@@ -225,8 +252,20 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
     }
   };
 
+  const hasAssignedActiveDelivery = deliveries.some(
+    (d) =>
+      d.assignedRiderId === rider?.riderId &&
+      !['delivered', 'cancelled', 'assigned'].includes(d.status)
+  );
+  const shouldShareGps = Boolean(
+    sharingGps &&
+      rider &&
+      rider.verificationStatus === 'verified' &&
+      (rider.isOnline || hasAssignedActiveDelivery)
+  );
+
   useEffect(() => {
-    if (!sharingGps) return;
+    if (!shouldShareGps) return;
     let lastUpdate = 0;
     const request = new AbortController();
     const watcher = navigator.geolocation.watchPosition(
@@ -261,7 +300,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
       request.abort();
       navigator.geolocation.clearWatch(watcher);
     };
-  }, [sharingGps]);
+  }, [shouldShareGps]);
 
   const handleRespondOffer = async (assignmentId: string, action: 'accept' | 'reject') => {
     setBusyAssignmentId(assignmentId);
@@ -377,15 +416,20 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
   const completedDeliveries = deliveries.filter((d) => d.status === 'delivered');
   const unreadCount = notifications.filter((n) => !n.isRead).length;
 
-  // Sync edit form values cleanly when rider loads
+  // Sync edit form values on initial load / rider switch / entering profile tab without clobbering edits on GPS ticks
   useEffect(() => {
+    const enteredProfileTab = tab === 'profile' && prevTabRef.current !== 'profile';
+    prevTabRef.current = tab;
     if (!rider) return;
+    const riderChanged = hydratedRiderIdRef.current !== rider.riderId;
+    if (!riderChanged && !enteredProfileTab) return;
+    hydratedRiderIdRef.current = rider.riderId;
     setEditFullName(rider.fullName);
     setEditPhone(rider.phone);
     setEditHomeState(rider.homeState);
     setEditVehicleType(rider.vehicleType);
     setEditPlateNumber(rider.plateNumber);
-  }, [rider]);
+  }, [rider, tab]);
 
   // Verified riders default to Online automatically unless manually turned off
   useEffect(() => {

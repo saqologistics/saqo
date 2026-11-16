@@ -745,34 +745,39 @@ export async function debitWalletAtomic(params: {
   });
 
   if (!outcome.alreadyProcessed) {
-    await notifyUser(
-      params.userId,
-      'Wallet Debited',
-      `₦${amount.toLocaleString()} debited (${params.description || params.reference}). Remaining balance: ₦${outcome.wallet.balanceNgn.toLocaleString()}.`,
-      params.deliveryId || null
-    );
-    await broadcastWsEvent('wallet:updated', {
-      userId: params.userId,
-      wallet: outcome.wallet,
-      transaction: outcome.transaction,
-    });
-    syncAsync((sb) =>
-      Promise.resolve(
-        sb.rpc('saqo_debit_wallet', {
-          p_user_id: params.userId,
-          p_amount_ngn: amount,
-          p_reference: params.reference,
-          p_idempotency_key: params.idempotencyKey || null,
-          p_category: params.category || 'delivery_payment',
-          p_description: params.description || 'Delivery payment',
-          p_delivery_id: params.deliveryId || null,
-          p_payment_transaction_id: params.paymentTransactionId || null,
-          p_actor_user_id: params.actorUserId || params.userId,
-          p_actor_role: params.actorRole || 'client',
-          p_metadata: params.metadata || {},
-        })
-      )
-    );
+    const publish = async () => {
+      await notifyUser(
+        params.userId,
+        'Wallet Debited',
+        `₦${amount.toLocaleString()} debited (${params.description || params.reference}). Remaining balance: ₦${outcome.wallet.balanceNgn.toLocaleString()}.`,
+        params.deliveryId || null
+      );
+      await broadcastWsEvent('wallet:updated', {
+        userId: params.userId,
+        wallet: outcome.wallet,
+        transaction: outcome.transaction,
+      });
+      syncAsync((sb) =>
+        Promise.resolve(
+          sb.rpc('saqo_debit_wallet', {
+            p_user_id: params.userId,
+            p_amount_ngn: amount,
+            p_reference: params.reference,
+            p_idempotency_key: params.idempotencyKey || null,
+            p_category: params.category || 'delivery_payment',
+            p_description: params.description || 'Delivery payment',
+            p_delivery_id: params.deliveryId || null,
+            p_payment_transaction_id: params.paymentTransactionId || null,
+            p_actor_user_id: params.actorUserId || params.userId,
+            p_actor_role: params.actorRole || 'client',
+            p_metadata: params.metadata || {},
+          })
+        )
+      );
+    };
+    if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+      await publish();
+    }
   }
 
   return outcome;
@@ -3005,55 +3010,56 @@ export async function payDeliveryWithWallet(params: {
   customerPhone: string;
   idempotencyKey?: string | null;
 }): Promise<{ delivery: NonNullable<Awaited<ReturnType<typeof getDeliveryById>>>; wallet: WalletAccount; paymentTransaction: PaymentTransaction }> {
-  const delivery = await getDeliveryById(params.deliveryId);
-  if (!delivery) throw new Error('Delivery not found.');
-  const customerRow = await db
-    .prepare('SELECT id FROM customers WHERE profile_id = ?')
-    .get(params.userId) as { id: string } | undefined;
-  if (!customerRow || delivery.customerId !== customerRow.id) {
-    throw new Error('You are not authorized to pay for this delivery.');
-  }
-  if (delivery.status === 'cancelled') {
-    throw new Error('Cannot pay for a cancelled delivery.');
-  }
-  await requireNoPendingFlutterwaveCheckout(delivery.id);
-  if (delivery.paymentStatus === 'paid') {
-    throw new Error('This delivery is already paid.');
-  }
-  if (delivery.paymentStatus === 'collected_by_rider') {
-    throw new Error('Cash for this delivery has already been collected by the rider.');
-  }
-
-  const existingTx = await db
-    .prepare(
-      "SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' AND status <> 'paid' AND provider <> 'flutterwave' ORDER BY created_at DESC LIMIT 1"
-    )
-    .get(delivery.id) as any;
-
-  const reference = generateReference('PAY');
-  const paymentTxId = existingTx?.id || crypto.randomUUID();
   const now = new Date().toISOString();
 
-  const debit = await debitWalletAtomic({
-    userId: params.userId,
-    amountNgn: delivery.deliveryFeeNgn,
-    reference: `WLT-${reference}`,
-    idempotencyKey: params.idempotencyKey ? `pay-del:${params.idempotencyKey}` : `pay-del:${delivery.id}`,
-    category: 'delivery_payment',
-    description: `Wallet payment for delivery ${delivery.trackingCode}`,
-    deliveryId: delivery.id,
-    paymentTransactionId: paymentTxId,
-    actorUserId: params.userId,
-    actorRole: 'client',
-    metadata: { trackingCode: delivery.trackingCode },
-  });
+  const { delivery, debit, tx, existingTx } = await withImmediateTransaction(async () => {
+    const currentDelivery = await getDeliveryById(params.deliveryId);
+    if (!currentDelivery) throw new Error('Delivery not found.');
+    const customerRow = await db
+      .prepare('SELECT id FROM customers WHERE profile_id = ?')
+      .get(params.userId) as { id: string } | undefined;
+    if (!customerRow || currentDelivery.customerId !== customerRow.id) {
+      throw new Error('You are not authorized to pay for this delivery.');
+    }
+    if (currentDelivery.status === 'cancelled') {
+      throw new Error('Cannot pay for a cancelled delivery.');
+    }
+    await requireNoPendingFlutterwaveCheckout(currentDelivery.id);
+    if (currentDelivery.paymentStatus === 'paid') {
+      throw new Error('This delivery is already paid.');
+    }
+    if (currentDelivery.paymentStatus === 'collected_by_rider') {
+      throw new Error('Cash for this delivery has already been collected by the rider.');
+    }
 
-  const tx = await withImmediateTransaction(async () => {
+    const foundExistingTx = await db
+      .prepare(
+        "SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' AND status <> 'paid' AND provider <> 'flutterwave' ORDER BY created_at DESC LIMIT 1"
+      )
+      .get(currentDelivery.id) as any;
+
+    const reference = generateReference('PAY');
+    const paymentTxId = foundExistingTx?.id || crypto.randomUUID();
+
+    const debitOutcome = await debitWalletAtomic({
+      userId: params.userId,
+      amountNgn: currentDelivery.deliveryFeeNgn,
+      reference: `WLT-${reference}`,
+      idempotencyKey: params.idempotencyKey ? `pay-del:${params.idempotencyKey}` : `pay-del:${currentDelivery.id}`,
+      category: 'delivery_payment',
+      description: `Wallet payment for delivery ${currentDelivery.trackingCode}`,
+      deliveryId: currentDelivery.id,
+      paymentTransactionId: paymentTxId,
+      actorUserId: params.userId,
+      actorRole: 'client',
+      metadata: { trackingCode: currentDelivery.trackingCode },
+    });
+
     let settledTx: PaymentTransaction;
-    if (existingTx) {
+    if (foundExistingTx) {
       let existingMeta: Record<string, unknown> = {};
       try {
-        existingMeta = existingTx.metadata ? JSON.parse(existingTx.metadata) : {};
+        existingMeta = foundExistingTx.metadata ? JSON.parse(foundExistingTx.metadata) : {};
       } catch {
         existingMeta = {};
       }
@@ -3071,12 +3077,12 @@ export async function payDeliveryWithWallet(params: {
       `).run(
         now,
         params.userId,
-        JSON.stringify({ ...existingMeta, walletTransactionId: debit.transaction.id }),
+        JSON.stringify({ ...existingMeta, walletTransactionId: debitOutcome.transaction.id }),
         now,
-        existingTx.id
+        foundExistingTx.id
       );
       settledTx = mapPaymentTxRow(
-        await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(existingTx.id)
+        await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(foundExistingTx.id)
       );
     } else {
       settledTx = await insertPaymentTxRow({
@@ -3087,35 +3093,43 @@ export async function payDeliveryWithWallet(params: {
         customerName: params.customerName,
         customerEmail: params.customerEmail,
         customerPhone: params.customerPhone,
-        walletId: debit.wallet.id,
-        deliveryId: delivery.id,
-        trackingCode: delivery.trackingCode,
+        walletId: debitOutcome.wallet.id,
+        deliveryId: currentDelivery.id,
+        trackingCode: currentDelivery.trackingCode,
         purpose: 'delivery_payment',
         paymentMethod: 'wallet',
         provider: 'internal',
-        amountNgn: delivery.deliveryFeeNgn,
+        amountNgn: currentDelivery.deliveryFeeNgn,
         status: 'paid',
         verifiedAt: now,
         verifiedBy: params.userId,
-        metadata: { walletTransactionId: debit.transaction.id },
+        metadata: { walletTransactionId: debitOutcome.transaction.id },
       });
     }
 
-    await db.prepare(
-      "UPDATE delivery_requests SET payment_method = 'wallet', payment_status = 'paid', payment_reference = ?, updated_at = ? WHERE id = ?"
-    ).run(settledTx.reference, now, delivery.id);
+    const deliveryUpdate = await db.prepare(
+      "UPDATE delivery_requests SET payment_method = 'wallet', payment_status = 'paid', payment_reference = ?, updated_at = ? WHERE id = ? AND payment_status NOT IN ('paid', 'collected_by_rider') AND status <> 'cancelled'"
+    ).run(settledTx.reference, now, currentDelivery.id);
+    if (deliveryUpdate.changes === 0) {
+      throw new Error('This delivery is no longer eligible for wallet payment.');
+    }
 
     await db.prepare(
       "DELETE FROM cash_collections WHERE delivery_id = ? AND status IN ('pending', 'pending_verification', 'disputed')"
-    ).run(delivery.id);
+    ).run(currentDelivery.id);
 
-    if (delivery.status === 'delivered') {
+    if (currentDelivery.status === 'delivered') {
       await db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
-        delivery.id
+        currentDelivery.id
       );
     }
 
-    return settledTx;
+    return {
+      delivery: currentDelivery,
+      debit: debitOutcome,
+      tx: settledTx,
+      existingTx: foundExistingTx,
+    };
   });
 
   const updatedDelivery = (await getDeliveryById(delivery.id))!;

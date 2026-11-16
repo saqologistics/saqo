@@ -13,6 +13,8 @@ process.env.APP_URL = 'https://saqo.vercel.app';
 process.env.SAQO_FRONTEND_ORIGIN = 'https://saqo.vercel.app,https://www.saqo.ng';
 
 const { db, initDatabase } = await import('./db');
+const { dispatchNextRiderForDelivery } = await import('./dispatchEngine');
+const { creditWalletAtomic } = await import('./paymentService');
 const { WebApp } = await import('./webApp');
 const { registerSaqoRoutes } = await import('./appRoutes');
 
@@ -306,6 +308,284 @@ test('End-to-end dispatch, default online riders, auto-reassignment, OTP popup e
   };
   assert.equal(secondDashAfter.rider.riderId, secondRiderId);
   assert.equal(secondDashAfter.rider.rating, 4);
+});
+
+test('Concurrency, race conditions, OTP isolation, wallet atomicity, and DB support presence', async () => {
+  const api = async (pathUrl: string, options: RequestInit = {}, token?: string) => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string> | undefined),
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return app.handle(
+      new Request(`https://example.supabase.co/saqo-api${pathUrl}`, { ...options, headers }),
+      '/saqo-api'
+    );
+  };
+
+  const adminLogin = await api('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'admin@saqo.ng', password: process.env.SAQO_ADMIN_PASSWORD || 'saqo1234' }),
+  });
+  assert.equal(adminLogin.status, 200);
+  const { token: adminToken } = (await adminLogin.json()) as { token: string };
+
+  // Check admin support presence persistence in DB
+  const setAway = await api(
+    '/api/admin/support/presence',
+    { method: 'POST', body: JSON.stringify({ available: false }) },
+    adminToken
+  );
+  assert.equal(setAway.status, 200);
+  const awayRow = (await db.prepare('SELECT admin_accepting_chats FROM platform_settings WHERE id = 1').get()) as {
+    admin_accepting_chats: number;
+  };
+  assert.equal(awayRow.admin_accepting_chats, 0);
+  const pubPresence = (await (await api('/api/support/presence')).json()) as { adminOnline: boolean };
+  assert.equal(pubPresence.adminOnline, false);
+  const adminConvsAway = (await (await api('/api/admin/support/conversations', {}, adminToken)).json()) as {
+    adminAcceptingChats: boolean;
+  };
+  assert.equal(adminConvsAway.adminAcceptingChats, false);
+
+  const setBack = await api(
+    '/api/admin/support/presence',
+    { method: 'POST', body: JSON.stringify({ available: true }) },
+    adminToken
+  );
+  assert.equal(setBack.status, 200);
+
+  // Create fresh verified rider + client for concurrency tests
+  const rcEmail = `race-rider-${crypto.randomUUID().slice(0, 6)}@saqo.ng`;
+  const rcRes = await api(
+    '/api/admin/riders',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        fullName: 'Race Rider',
+        email: rcEmail,
+        phone: '+2348050001001',
+        password: 'password123',
+        homeState: 'Katsina',
+        vehicleType: 'Motorcycle',
+        plateNumber: `KTS-${crypto.randomUUID().slice(0, 4).toUpperCase()}`,
+        verificationStatus: 'verified',
+      }),
+    },
+    adminToken
+  );
+  assert.equal(rcRes.status, 201);
+  const { rider: rcRider } = (await rcRes.json()) as { rider: { riderId: string } };
+  const rcToken = ((await (await api('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: rcEmail, password: 'password123' }),
+  })).json()) as { token: string }).token;
+
+  const cliEmail = `race-client-${crypto.randomUUID().slice(0, 6)}@saqo.ng`;
+  const cliReg = await api('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      fullName: 'Race Client',
+      email: cliEmail,
+      phone: '+2348050002002',
+      password: 'password123',
+    }),
+  });
+  assert.equal(cliReg.status, 201);
+  const { token: cliToken, profile: cliProfile } = (await cliReg.json()) as {
+    token: string;
+    profile: { id: string };
+  };
+
+  // Credit client wallet enough for 2 deliveries so only delivery payment guard can stop double debit
+  await creditWalletAtomic({
+    userId: cliProfile.id,
+    amountNgn: 50000,
+    reference: `TST-FUND-${crypto.randomUUID().slice(0, 8)}`,
+    category: 'admin_adjustment',
+    description: 'Test funding',
+    actorUserId: cliProfile.id,
+    actorRole: 'admin',
+  });
+
+  // 1. Concurrent wallet payment with distinct idempotency keys must only debit once
+  const cashDelRes = await api(
+    '/api/deliveries',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        pickupState: 'Katsina',
+        pickupAddress: 'Kofar Kaura, Katsina',
+        pickupLat: 12.979,
+        pickupLng: 7.619,
+        destinationState: 'Katsina',
+        destinationAddress: 'GRA Roundabout, Katsina',
+        destinationLat: 12.9908,
+        destinationLng: 7.6018,
+        recipientName: 'Wallet Test Receiver',
+        recipientPhone: '+2348081112233',
+        parcelCategory: 'Documents',
+        parcelDescription: 'Double spend guard test',
+        weightKg: 1,
+        paymentMethod: 'cash',
+      }),
+    },
+    cliToken
+  );
+  assert.equal(cashDelRes.status, 201);
+  const { delivery: walletTestDel } = (await cashDelRes.json()) as {
+    delivery: { id: string; deliveryFeeNgn: number; trackingCode: string; deliveryOtp: string };
+  };
+
+  // 1a. Concurrent dispatchNextRiderForDelivery cannot double-offer same delivery
+  await db.prepare('UPDATE delivery_requests SET status = ?, assigned_rider_id = NULL WHERE id = ?').run(
+    'pending_dispatch',
+    walletTestDel.id
+  );
+  await db.prepare("DELETE FROM delivery_assignments WHERE delivery_id = ?").run(walletTestDel.id);
+  await Promise.all([
+    dispatchNextRiderForDelivery(walletTestDel.id),
+    dispatchNextRiderForDelivery(walletTestDel.id),
+    dispatchNextRiderForDelivery(walletTestDel.id),
+  ]);
+  const offeredRows = (await db
+    .prepare("SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'")
+    .all(walletTestDel.id)) as Array<{ id: string }>;
+  assert.equal(offeredRows.length, 1, 'Concurrent dispatches must create only 1 offered assignment');
+
+  const [pay1, pay2] = await Promise.all([
+    api(
+      `/api/deliveries/${walletTestDel.id}/pay`,
+      { method: 'POST', body: JSON.stringify({ paymentMethod: 'wallet', idempotencyKey: `key-a-${crypto.randomUUID()}` }) },
+      cliToken
+    ),
+    api(
+      `/api/deliveries/${walletTestDel.id}/pay`,
+      { method: 'POST', body: JSON.stringify({ paymentMethod: 'wallet', idempotencyKey: `key-b-${crypto.randomUUID()}` }) },
+      cliToken
+    ),
+  ]);
+  const payStatuses = [pay1.status, pay2.status].sort();
+  assert.deepEqual(payStatuses, [200, 400], 'Concurrent pay-wallet with distinct keys must succeed once and reject once');
+  const walletRow = (await db.prepare('SELECT balance_ngn FROM wallets WHERE user_id = ?').get(cliProfile.id)) as {
+    balance_ngn: number;
+  };
+  assert.equal(walletRow.balance_ngn, 50000 - walletTestDel.deliveryFeeNgn, 'Wallet must be debited exactly once');
+
+  // 2. Assign to race rider cleanly and test double completion guard (rider PATCH vs public OTP confirm)
+  const forceAssign = await api(
+    `/api/admin/deliveries/${walletTestDel.id}/assign`,
+    { method: 'POST', body: JSON.stringify({ riderId: rcRider.riderId }) },
+    adminToken
+  );
+  assert.equal(forceAssign.status, 200);
+  for (const status of ['heading_to_pickup', 'parcel_picked_up', 'in_transit', 'arrived_at_destination']) {
+    const sRes = await api(
+      `/api/rider/deliveries/${walletTestDel.id}/status`,
+      { method: 'PATCH', body: JSON.stringify({ status }) },
+      rcToken
+    );
+    assert.equal(sRes.status, 200);
+  }
+
+  // Public OTP brute-force lockout (6 wrong guesses from attacker IP) must NOT lock out authenticated rider
+  for (let i = 0; i < 6; i++) {
+    const wrongPub = await api(`/api/track/${walletTestDel.trackingCode}/confirm-otp`, {
+      method: 'POST',
+      headers: { 'x-forwarded-for': '203.0.113.9' },
+      body: JSON.stringify({ otp: walletTestDel.deliveryOtp === '0000' ? '1111' : '0000' }),
+    });
+    assert.ok([400, 429].includes(wrongPub.status));
+  }
+  const lockedPub = await api(`/api/track/${walletTestDel.trackingCode}/confirm-otp`, {
+    method: 'POST',
+    headers: { 'x-forwarded-for': '203.0.113.9' },
+    body: JSON.stringify({ otp: walletTestDel.deliveryOtp }),
+  });
+  assert.equal(lockedPub.status, 429, 'Public brute-forcer IP bucket should be locked');
+
+  // Race rider completion (even sharing the locked IP) against a clean recipient public confirmation!
+  const beforeRiderRow = (await db
+    .prepare('SELECT completed_deliveries_count, total_earnings_ngn FROM riders WHERE id = ?')
+    .get(rcRider.riderId)) as { completed_deliveries_count: number; total_earnings_ngn: number };
+  const payRec = (await db
+    .prepare('SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?')
+    .get(walletTestDel.id)) as { rider_payout_ngn: number };
+
+  const [compRider, compPublic] = await Promise.all([
+    api(
+      `/api/rider/deliveries/${walletTestDel.id}/status`,
+      {
+        method: 'PATCH',
+        headers: { 'x-forwarded-for': '203.0.113.9' },
+        body: JSON.stringify({ status: 'delivered', otp: walletTestDel.deliveryOtp }),
+      },
+      rcToken
+    ),
+    api(`/api/track/${walletTestDel.trackingCode}/confirm-otp`, {
+      method: 'POST',
+      headers: { 'x-forwarded-for': '198.51.100.4' },
+      body: JSON.stringify({ otp: walletTestDel.deliveryOtp }),
+    }),
+  ]);
+  const compStatuses = [compRider.status, compPublic.status].sort();
+  assert.deepEqual(compStatuses, [200, 400], 'Concurrent rider + public completion must complete once and reject duplicate');
+
+  const afterRiderRow = (await db
+    .prepare('SELECT completed_deliveries_count, total_earnings_ngn FROM riders WHERE id = ?')
+    .get(rcRider.riderId)) as { completed_deliveries_count: number; total_earnings_ngn: number };
+  assert.equal(afterRiderRow.completed_deliveries_count, beforeRiderRow.completed_deliveries_count + 1);
+  assert.equal(afterRiderRow.total_earnings_ngn, beforeRiderRow.total_earnings_ngn + payRec.rider_payout_ngn);
+
+  // 3. Test concurrent rider PATCH + cancel or concurrent accept vs cancel
+  const raceDelRes = await api(
+    '/api/deliveries',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        pickupState: 'Katsina',
+        pickupAddress: 'Batagarawa Road, Katsina',
+        pickupLat: 12.95,
+        pickupLng: 7.60,
+        destinationState: 'Katsina',
+        destinationAddress: 'Central Market, Katsina',
+        destinationLat: 12.989,
+        destinationLng: 7.601,
+        recipientName: 'Accept vs Cancel Receiver',
+        recipientPhone: '+2348089998877',
+        parcelCategory: 'Documents',
+        parcelDescription: 'Race test parcel',
+        weightKg: 1,
+        paymentMethod: 'cash',
+      }),
+    },
+    cliToken
+  );
+  assert.equal(raceDelRes.status, 201);
+  const { delivery: raceDel } = (await raceDelRes.json()) as { delivery: { id: string } };
+  const raceDash = (await (await api('/api/rider/dashboard', {}, rcToken)).json()) as {
+    assignments: Array<{ id: string; deliveryId: string; status: string }>;
+  };
+  const raceOffer = raceDash.assignments.find((a) => a.deliveryId === raceDel.id && a.status === 'offered');
+  assert.ok(raceOffer);
+
+  const [acceptRace, cancelRace] = await Promise.all([
+    api(
+      `/api/rider/assignments/${raceOffer.id}/respond`,
+      { method: 'POST', body: JSON.stringify({ action: 'accept' }) },
+      rcToken
+    ),
+    api(`/api/deliveries/${raceDel.id}/cancel`, { method: 'POST' }, cliToken),
+  ]);
+  const finalRaceDel = (await (await api(`/api/client/deliveries`, {}, cliToken)).json()) as {
+    deliveries: Array<{ id: string; status: string }>;
+  };
+  const matched = finalRaceDel.deliveries.find((d) => d.id === raceDel.id)!;
+  assert.ok(
+    (acceptRace.status === 200 && cancelRace.status === 200 && matched.status === 'cancelled') ||
+      (acceptRace.status !== 200 && cancelRace.status === 200 && matched.status === 'cancelled'),
+    'Accept vs cancel race must resolve deterministically cleanly'
+  );
 });
 
 test.after(() => {

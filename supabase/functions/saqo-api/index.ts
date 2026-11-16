@@ -620,6 +620,7 @@ __export(db_exports, {
   createNotification: () => createNotification,
   createSupportConversation: () => createSupportConversation,
   db: () => db,
+  getAdminAcceptingChats: () => getAdminAcceptingChats,
   getAllComplaints: () => getAllComplaints,
   getAllCustomers: () => getAllCustomers,
   getAllPayments: () => getAllPayments,
@@ -645,6 +646,7 @@ __export(db_exports, {
   publicTrackingDelivery: () => publicTrackingDelivery,
   publicTrackingHistory: () => publicTrackingHistory,
   riderDelivery: () => riderDelivery,
+  setAdminAcceptingChatsDb: () => setAdminAcceptingChatsDb,
   signSessionToken: () => signSessionToken,
   updateSupportConversationStatus: () => updateSupportConversationStatus,
   verifyPassword: () => verifyPassword,
@@ -852,7 +854,8 @@ function initSqliteDatabase() {
       inter_state_surcharge_ngn REAL NOT NULL,
       rider_commission_percent REAL NOT NULL,
       whatsapp_support_number TEXT NOT NULL,
-      show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0
+      show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0,
+      admin_accepting_chats INTEGER NOT NULL DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS whatsapp_sessions (
@@ -1088,6 +1091,9 @@ function initSqliteDatabase() {
   if (!settingsCols.some((column) => column.name === "show_delivery_state_selectors")) {
     db2.exec("ALTER TABLE platform_settings ADD COLUMN show_delivery_state_selectors INTEGER NOT NULL DEFAULT 0");
   }
+  if (!settingsCols.some((column) => column.name === "admin_accepting_chats")) {
+    db2.exec("ALTER TABLE platform_settings ADD COLUMN admin_accepting_chats INTEGER NOT NULL DEFAULT 1");
+  }
   const deliveryCols = db2.prepare("PRAGMA table_info(delivery_requests)").all();
   const colNames = new Set(deliveryCols.map((c) => c.name));
   if (!colNames.has("payment_method")) {
@@ -1178,7 +1184,15 @@ async function ensurePostgresSchemaExtensions() {
   await db.prepare("ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rider_rating_comment TEXT").run();
   await db.prepare("ALTER TABLE delivery_requests ADD COLUMN IF NOT EXISTS rated_at TEXT").run();
   await db.prepare("ALTER TABLE riders ALTER COLUMN is_online SET DEFAULT 1").run();
+  await db.prepare("ALTER TABLE platform_settings ADD COLUMN IF NOT EXISTS admin_accepting_chats INTEGER NOT NULL DEFAULT 1").run();
   schemaExtensionsEnsured = true;
+}
+async function getAdminAcceptingChats() {
+  const row = await db.prepare("SELECT admin_accepting_chats FROM platform_settings WHERE id = 1").get();
+  return row ? Number(row.admin_accepting_chats ?? 1) !== 0 : true;
+}
+async function setAdminAcceptingChatsDb(available) {
+  await db.prepare("UPDATE platform_settings SET admin_accepting_chats = ? WHERE id = 1").run(available ? 1 : 0);
 }
 async function initDatabase() {
   if (sqlite) initSqliteDatabase();
@@ -2723,12 +2737,16 @@ function getSupportPresence() {
   }
   return connected;
 }
+async function getSupportPresenceAsync() {
+  adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
+  return getSupportPresence();
+}
 function cancelOfflineGrace() {
   if (adminOfflineGraceTimer) clearTimeout(adminOfflineGraceTimer);
   adminOfflineGraceTimer = null;
 }
 async function broadcastPresenceIfChanged() {
-  const presence = getSupportPresence();
+  const presence = await getSupportPresenceAsync();
   if (!lastBroadcastPresence || lastBroadcastPresence.adminOnline !== presence.adminOnline || lastBroadcastPresence.onlineAdminCount !== presence.onlineAdminCount) {
     lastBroadcastPresence = presence;
     await broadcastWsEvent("support:presence", presence);
@@ -2737,10 +2755,12 @@ async function broadcastPresenceIfChanged() {
 }
 async function setAdminChatAvailability(available) {
   adminAcceptingChats = available;
+  await setAdminAcceptingChatsDb(available);
   cancelOfflineGrace();
   return await broadcastPresenceIfChanged();
 }
-function isAdminChatAvailableFlag() {
+async function isAdminChatAvailableFlagAsync() {
+  adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
   return adminAcceptingChats;
 }
 function canReadSupport(ws, conversation) {
@@ -2917,64 +2937,69 @@ async function releaseOffer(deliveryId, riderId) {
   `).run((/* @__PURE__ */ new Date()).toISOString(), deliveryId, riderId);
 }
 async function dispatchNextRiderForDelivery(deliveryId) {
-  const delivery = await getDeliveryById(deliveryId);
-  if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
-    return { offered: false };
-  }
-  const settings = await getPlatformSettings();
-  const riders = await getAllRiders();
-  const allDeliveries = await listDeliveries();
-  const previousAttempts = await db.prepare(
-    `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
-  ).all(deliveryId);
-  const excludedRiderIds = previousAttempts.map((a) => a.rider_id);
-  const candidates = riders.map((rider) => ({
-    rider,
-    activeDeliveries: allDeliveries.filter(
-      (d) => d.assignedRiderId === rider.riderId && activeStatuses.includes(d.status)
-    )
-  }));
-  const ranked = rankEligibleRiders({
-    delivery,
-    candidates,
-    settings,
-    excludedRiderIds
-  });
-  if (ranked.length === 0) {
-    if (delivery.status === "no_rider_available") return { offered: false };
-    const now2 = (/* @__PURE__ */ new Date()).toISOString();
-    await db.prepare(`UPDATE delivery_requests SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ? WHERE id = ?`).run(
-      now2,
-      deliveryId
-    );
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
-    `).run(
-      `hist-${crypto3.randomUUID().slice(0, 8)}`,
-      deliveryId,
-      "Queued until an eligible rider has capacity.",
-      now2
-    );
-    const custRow2 = await db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId);
-    if (custRow2) {
-      const notif = await createNotification(
+  const committed = await databaseTransaction(async () => {
+    const delivery = await getDeliveryById(deliveryId);
+    if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
+      return null;
+    }
+    const settings = await getPlatformSettings();
+    const riders = await getAllRiders();
+    const allDeliveries = await listDeliveries();
+    const previousAttempts = await db.prepare(
+      `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
+    ).all(deliveryId);
+    const excludedRiderIds = previousAttempts.map((a) => a.rider_id);
+    const candidates = riders.map((rider) => ({
+      rider,
+      activeDeliveries: allDeliveries.filter(
+        (d) => d.assignedRiderId === rider.riderId && activeStatuses.includes(d.status)
+      )
+    }));
+    const ranked = rankEligibleRiders({
+      delivery,
+      candidates,
+      settings,
+      excludedRiderIds
+    });
+    if (ranked.length === 0) {
+      if (delivery.status === "no_rider_available") return { kind: "noop" };
+      const nowIso2 = (/* @__PURE__ */ new Date()).toISOString();
+      const locked2 = await db.prepare(`
+        UPDATE delivery_requests
+        SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+      `).run(nowIso2, deliveryId);
+      if (locked2.changes === 0) return { kind: "noop" };
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
+      `).run(
+        `hist-${crypto3.randomUUID().slice(0, 8)}`,
+        deliveryId,
+        "Queued until an eligible rider has capacity.",
+        nowIso2
+      );
+      const custRow2 = await db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId);
+      const custNotif2 = custRow2 ? await createNotification(
         custRow2.profile_id,
         "No rider available right now",
         `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
         deliveryId
-      );
-      await broadcastWsEvent("notification:created", notif);
+      ) : null;
+      const updated = await getDeliveryById(deliveryId);
+      return { kind: "no_rider", custNotif: custNotif2, updated };
     }
-    const updated = await getDeliveryById(deliveryId);
-    await broadcastWsEvent("delivery:updated", updated);
-    return { offered: false };
-  }
-  const topCandidate = ranked[0];
-  const assignmentId = `asg-${crypto3.randomUUID().slice(0, 8)}`;
-  const now = /* @__PURE__ */ new Date();
-  const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1e3);
-  await databaseTransaction(async () => {
+    const topCandidate = ranked[0];
+    const now = /* @__PURE__ */ new Date();
+    const nowIso = now.toISOString();
+    const locked = await db.prepare(`
+      UPDATE delivery_requests
+      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
+      WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+    `).run(topCandidate.rider.riderId, nowIso, deliveryId);
+    if (locked.changes === 0) return { kind: "noop" };
+    const assignmentId = `asg-${crypto3.randomUUID().slice(0, 8)}`;
+    const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1e3);
     await db.prepare(`
       INSERT INTO delivery_assignments (
         id, delivery_id, rider_id, status, score, distance_to_pickup_km,
@@ -2987,14 +3012,9 @@ async function dispatchNextRiderForDelivery(deliveryId) {
       topCandidate.compositeScore,
       topCandidate.distanceToPickupKm,
       topCandidate.routeCompatibilityScore,
-      now.toISOString(),
+      nowIso,
       expiresAt.toISOString()
     );
-    await db.prepare(`
-      UPDATE delivery_requests
-      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
-      WHERE id = ?
-    `).run(topCandidate.rider.riderId, now.toISOString(), deliveryId);
     await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'assigned', ?, 'system', ?)
@@ -3004,48 +3024,63 @@ async function dispatchNextRiderForDelivery(deliveryId) {
       `Smart dispatch offered parcel to ${topCandidate.rider.fullName} (${topCandidate.distanceToPickupKm} km away, route fit ${Math.round(
         topCandidate.routeCompatibilityScore * 100
       )}%).`,
-      now.toISOString()
+      nowIso
     );
-  });
-  const riderNotif = await createNotification(
-    topCandidate.rider.id,
-    "New Delivery Request Available",
-    `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} \u2192 ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
-    deliveryId
-  );
-  await broadcastWsEvent("notification:created", riderNotif);
-  const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
-  if (custRow) {
-    const custNotif = await createNotification(
+    const riderNotif = await createNotification(
+      topCandidate.rider.id,
+      "New Delivery Request Available",
+      `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} \u2192 ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
+      deliveryId
+    );
+    const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
+    const custNotif = custRow ? await createNotification(
       custRow.profile_id,
       "Rider Assigned",
       `${topCandidate.rider.fullName} (${topCandidate.rider.vehicleType}) has been matched to parcel ${delivery.trackingCode}.`,
       deliveryId
-    );
-    await broadcastWsEvent("notification:created", custNotif);
-  }
-  const updatedDelivery = await getDeliveryById(deliveryId);
-  await broadcastWsEvent("delivery:updated", updatedDelivery);
-  await broadcastWsEvent("assignment:offered", {
-    id: assignmentId,
-    deliveryId,
-    trackingCode: delivery.trackingCode,
-    riderId: topCandidate.rider.riderId,
-    riderProfileId: topCandidate.rider.id,
-    riderName: topCandidate.rider.fullName,
-    status: "offered",
-    score: topCandidate.compositeScore,
-    distanceToPickupKm: topCandidate.distanceToPickupKm,
-    routeCompatibilityScore: topCandidate.routeCompatibilityScore,
-    offeredAt: now.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    delivery: updatedDelivery && { ...updatedDelivery, deliveryOtp: void 0 }
+    ) : null;
+    const updatedDelivery = await getDeliveryById(deliveryId);
+    return {
+      kind: "offered",
+      assignmentId,
+      delivery,
+      topCandidate,
+      nowIso,
+      expiresAtIso: expiresAt.toISOString(),
+      riderNotif,
+      custNotif,
+      updatedDelivery
+    };
   });
-  scheduleOfferExpiry(assignmentId, expiresAt.toISOString());
+  if (!committed || committed.kind === "noop") return { offered: false };
+  if (committed.kind === "no_rider") {
+    if (committed.custNotif) await broadcastWsEvent("notification:created", committed.custNotif);
+    await broadcastWsEvent("delivery:updated", committed.updated);
+    return { offered: false };
+  }
+  await broadcastWsEvent("notification:created", committed.riderNotif);
+  if (committed.custNotif) await broadcastWsEvent("notification:created", committed.custNotif);
+  await broadcastWsEvent("delivery:updated", committed.updatedDelivery);
+  await broadcastWsEvent("assignment:offered", {
+    id: committed.assignmentId,
+    deliveryId,
+    trackingCode: committed.delivery.trackingCode,
+    riderId: committed.topCandidate.rider.riderId,
+    riderProfileId: committed.topCandidate.rider.id,
+    riderName: committed.topCandidate.rider.fullName,
+    status: "offered",
+    score: committed.topCandidate.compositeScore,
+    distanceToPickupKm: committed.topCandidate.distanceToPickupKm,
+    routeCompatibilityScore: committed.topCandidate.routeCompatibilityScore,
+    offeredAt: committed.nowIso,
+    expiresAt: committed.expiresAtIso,
+    delivery: committed.updatedDelivery && { ...committed.updatedDelivery, deliveryOtp: void 0 }
+  });
+  scheduleOfferExpiry(committed.assignmentId, committed.expiresAtIso);
   return {
     offered: true,
-    riderId: topCandidate.rider.riderId,
-    riderName: topCandidate.rider.fullName
+    riderId: committed.topCandidate.rider.riderId,
+    riderName: committed.topCandidate.rider.fullName
   };
 }
 var wsClients, wsSupportVisitors, wsTracking, wsAuthMeta, adminAcceptingChats, offerTimers, adminOfflineGraceTimer, lastBroadcastPresence, isEdgeRuntime, supabaseClient, supabaseChannel, queuedStatuses, activeStatuses, lastSweepAt;
@@ -3612,34 +3647,39 @@ async function debitWalletAtomic(params) {
     return { wallet: updatedWallet, transaction: insertedTx, alreadyProcessed: false };
   });
   if (!outcome.alreadyProcessed) {
-    await notifyUser(
-      params.userId,
-      "Wallet Debited",
-      `\u20A6${amount.toLocaleString()} debited (${params.description || params.reference}). Remaining balance: \u20A6${outcome.wallet.balanceNgn.toLocaleString()}.`,
-      params.deliveryId || null
-    );
-    await broadcastWsEvent("wallet:updated", {
-      userId: params.userId,
-      wallet: outcome.wallet,
-      transaction: outcome.transaction
-    });
-    syncAsync(
-      (sb) => Promise.resolve(
-        sb.rpc("saqo_debit_wallet", {
-          p_user_id: params.userId,
-          p_amount_ngn: amount,
-          p_reference: params.reference,
-          p_idempotency_key: params.idempotencyKey || null,
-          p_category: params.category || "delivery_payment",
-          p_description: params.description || "Delivery payment",
-          p_delivery_id: params.deliveryId || null,
-          p_payment_transaction_id: params.paymentTransactionId || null,
-          p_actor_user_id: params.actorUserId || params.userId,
-          p_actor_role: params.actorRole || "client",
-          p_metadata: params.metadata || {}
-        })
-      )
-    );
+    const publish = async () => {
+      await notifyUser(
+        params.userId,
+        "Wallet Debited",
+        `\u20A6${amount.toLocaleString()} debited (${params.description || params.reference}). Remaining balance: \u20A6${outcome.wallet.balanceNgn.toLocaleString()}.`,
+        params.deliveryId || null
+      );
+      await broadcastWsEvent("wallet:updated", {
+        userId: params.userId,
+        wallet: outcome.wallet,
+        transaction: outcome.transaction
+      });
+      syncAsync(
+        (sb) => Promise.resolve(
+          sb.rpc("saqo_debit_wallet", {
+            p_user_id: params.userId,
+            p_amount_ngn: amount,
+            p_reference: params.reference,
+            p_idempotency_key: params.idempotencyKey || null,
+            p_category: params.category || "delivery_payment",
+            p_description: params.description || "Delivery payment",
+            p_delivery_id: params.deliveryId || null,
+            p_payment_transaction_id: params.paymentTransactionId || null,
+            p_actor_user_id: params.actorUserId || params.userId,
+            p_actor_role: params.actorRole || "client",
+            p_metadata: params.metadata || {}
+          })
+        )
+      );
+    };
+    if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+      await publish();
+    }
   }
   return outcome;
 }
@@ -5417,47 +5457,47 @@ async function getAdminPaymentsOverview(filters) {
   };
 }
 async function payDeliveryWithWallet(params) {
-  const delivery = await getDeliveryById(params.deliveryId);
-  if (!delivery) throw new Error("Delivery not found.");
-  const customerRow = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(params.userId);
-  if (!customerRow || delivery.customerId !== customerRow.id) {
-    throw new Error("You are not authorized to pay for this delivery.");
-  }
-  if (delivery.status === "cancelled") {
-    throw new Error("Cannot pay for a cancelled delivery.");
-  }
-  await requireNoPendingFlutterwaveCheckout(delivery.id);
-  if (delivery.paymentStatus === "paid") {
-    throw new Error("This delivery is already paid.");
-  }
-  if (delivery.paymentStatus === "collected_by_rider") {
-    throw new Error("Cash for this delivery has already been collected by the rider.");
-  }
-  const existingTx = await db.prepare(
-    "SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' AND status <> 'paid' AND provider <> 'flutterwave' ORDER BY created_at DESC LIMIT 1"
-  ).get(delivery.id);
-  const reference = generateReference("PAY");
-  const paymentTxId = existingTx?.id || crypto4.randomUUID();
   const now = (/* @__PURE__ */ new Date()).toISOString();
-  const debit = await debitWalletAtomic({
-    userId: params.userId,
-    amountNgn: delivery.deliveryFeeNgn,
-    reference: `WLT-${reference}`,
-    idempotencyKey: params.idempotencyKey ? `pay-del:${params.idempotencyKey}` : `pay-del:${delivery.id}`,
-    category: "delivery_payment",
-    description: `Wallet payment for delivery ${delivery.trackingCode}`,
-    deliveryId: delivery.id,
-    paymentTransactionId: paymentTxId,
-    actorUserId: params.userId,
-    actorRole: "client",
-    metadata: { trackingCode: delivery.trackingCode }
-  });
-  const tx = await databaseTransaction(async () => {
+  const { delivery, debit, tx, existingTx } = await databaseTransaction(async () => {
+    const currentDelivery = await getDeliveryById(params.deliveryId);
+    if (!currentDelivery) throw new Error("Delivery not found.");
+    const customerRow = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(params.userId);
+    if (!customerRow || currentDelivery.customerId !== customerRow.id) {
+      throw new Error("You are not authorized to pay for this delivery.");
+    }
+    if (currentDelivery.status === "cancelled") {
+      throw new Error("Cannot pay for a cancelled delivery.");
+    }
+    await requireNoPendingFlutterwaveCheckout(currentDelivery.id);
+    if (currentDelivery.paymentStatus === "paid") {
+      throw new Error("This delivery is already paid.");
+    }
+    if (currentDelivery.paymentStatus === "collected_by_rider") {
+      throw new Error("Cash for this delivery has already been collected by the rider.");
+    }
+    const foundExistingTx = await db.prepare(
+      "SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' AND status <> 'paid' AND provider <> 'flutterwave' ORDER BY created_at DESC LIMIT 1"
+    ).get(currentDelivery.id);
+    const reference = generateReference("PAY");
+    const paymentTxId = foundExistingTx?.id || crypto4.randomUUID();
+    const debitOutcome = await debitWalletAtomic({
+      userId: params.userId,
+      amountNgn: currentDelivery.deliveryFeeNgn,
+      reference: `WLT-${reference}`,
+      idempotencyKey: params.idempotencyKey ? `pay-del:${params.idempotencyKey}` : `pay-del:${currentDelivery.id}`,
+      category: "delivery_payment",
+      description: `Wallet payment for delivery ${currentDelivery.trackingCode}`,
+      deliveryId: currentDelivery.id,
+      paymentTransactionId: paymentTxId,
+      actorUserId: params.userId,
+      actorRole: "client",
+      metadata: { trackingCode: currentDelivery.trackingCode }
+    });
     let settledTx;
-    if (existingTx) {
+    if (foundExistingTx) {
       let existingMeta = {};
       try {
-        existingMeta = existingTx.metadata ? JSON.parse(existingTx.metadata) : {};
+        existingMeta = foundExistingTx.metadata ? JSON.parse(foundExistingTx.metadata) : {};
       } catch {
         existingMeta = {};
       }
@@ -5475,12 +5515,12 @@ async function payDeliveryWithWallet(params) {
       `).run(
         now,
         params.userId,
-        JSON.stringify({ ...existingMeta, walletTransactionId: debit.transaction.id }),
+        JSON.stringify({ ...existingMeta, walletTransactionId: debitOutcome.transaction.id }),
         now,
-        existingTx.id
+        foundExistingTx.id
       );
       settledTx = mapPaymentTxRow(
-        await db.prepare("SELECT * FROM payment_transactions WHERE id = ?").get(existingTx.id)
+        await db.prepare("SELECT * FROM payment_transactions WHERE id = ?").get(foundExistingTx.id)
       );
     } else {
       settledTx = await insertPaymentTxRow({
@@ -5491,31 +5531,39 @@ async function payDeliveryWithWallet(params) {
         customerName: params.customerName,
         customerEmail: params.customerEmail,
         customerPhone: params.customerPhone,
-        walletId: debit.wallet.id,
-        deliveryId: delivery.id,
-        trackingCode: delivery.trackingCode,
+        walletId: debitOutcome.wallet.id,
+        deliveryId: currentDelivery.id,
+        trackingCode: currentDelivery.trackingCode,
         purpose: "delivery_payment",
         paymentMethod: "wallet",
         provider: "internal",
-        amountNgn: delivery.deliveryFeeNgn,
+        amountNgn: currentDelivery.deliveryFeeNgn,
         status: "paid",
         verifiedAt: now,
         verifiedBy: params.userId,
-        metadata: { walletTransactionId: debit.transaction.id }
+        metadata: { walletTransactionId: debitOutcome.transaction.id }
       });
     }
-    await db.prepare(
-      "UPDATE delivery_requests SET payment_method = 'wallet', payment_status = 'paid', payment_reference = ?, updated_at = ? WHERE id = ?"
-    ).run(settledTx.reference, now, delivery.id);
+    const deliveryUpdate = await db.prepare(
+      "UPDATE delivery_requests SET payment_method = 'wallet', payment_status = 'paid', payment_reference = ?, updated_at = ? WHERE id = ? AND payment_status NOT IN ('paid', 'collected_by_rider') AND status <> 'cancelled'"
+    ).run(settledTx.reference, now, currentDelivery.id);
+    if (deliveryUpdate.changes === 0) {
+      throw new Error("This delivery is no longer eligible for wallet payment.");
+    }
     await db.prepare(
       "DELETE FROM cash_collections WHERE delivery_id = ? AND status IN ('pending', 'pending_verification', 'disputed')"
-    ).run(delivery.id);
-    if (delivery.status === "delivered") {
+    ).run(currentDelivery.id);
+    if (currentDelivery.status === "delivered") {
       await db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
-        delivery.id
+        currentDelivery.id
       );
     }
-    return settledTx;
+    return {
+      delivery: currentDelivery,
+      debit: debitOutcome,
+      tx: settledTx,
+      existingTx: foundExistingTx
+    };
   });
   const updatedDelivery = await getDeliveryById(delivery.id);
   await broadcastWsEvent("delivery:updated", updatedDelivery);
@@ -6043,7 +6091,7 @@ function isValidNigeriaCoordPair(lat, lng) {
   const nLng = Number(lng);
   return Number.isFinite(nLat) && Number.isFinite(nLng) && nLat >= 4 && nLat <= 14.5 && nLng >= 2 && nLng <= 15;
 }
-async function verifyHandoffOtp(res, delivery, otp) {
+async function verifyHandoffOtp(res, delivery, otp, scope = { type: "rider", actorId: "legacy" }) {
   const cleanOtp = typeof otp === "string" ? otp.trim() : "";
   if (!/^\d{4}$/.test(cleanOtp)) {
     res.status(400).json({
@@ -6054,13 +6102,20 @@ async function verifyHandoffOtp(res, delivery, otp) {
   }
   const now = Date.now();
   const resetAt = now + 15 * 60 * 1e3;
-  const attempt = await db.prepare(`
-    INSERT INTO delivery_otp_attempts (delivery_id, attempts, reset_at) VALUES (?, 1, ?)
-    ON CONFLICT(delivery_id) DO UPDATE SET
-      attempts = CASE WHEN delivery_otp_attempts.reset_at <= ? THEN 1 ELSE delivery_otp_attempts.attempts + 1 END,
-      reset_at = CASE WHEN delivery_otp_attempts.reset_at <= ? THEN excluded.reset_at ELSE delivery_otp_attempts.reset_at END
-    RETURNING attempts, reset_at
-  `).get(delivery.id, resetAt, now, now);
+  const publicBucket = scope.type === "public" ? `otp:public:${crypto6.createHash("sha256").update(`${delivery.id}\0${scope.ip || "unknown"}`).digest("hex").slice(0, 32)}` : null;
+  const attempt = publicBucket ? await db.prepare(`
+        INSERT INTO login_attempts (bucket, attempts, reset_at) VALUES (?, 1, ?)
+        ON CONFLICT(bucket) DO UPDATE SET
+          attempts = CASE WHEN login_attempts.reset_at <= ? THEN 1 ELSE login_attempts.attempts + 1 END,
+          reset_at = CASE WHEN login_attempts.reset_at <= ? THEN excluded.reset_at ELSE login_attempts.reset_at END
+        RETURNING attempts, reset_at
+      `).get(publicBucket, resetAt, now, now) : await db.prepare(`
+        INSERT INTO delivery_otp_attempts (delivery_id, attempts, reset_at) VALUES (?, 1, ?)
+        ON CONFLICT(delivery_id) DO UPDATE SET
+          attempts = CASE WHEN delivery_otp_attempts.reset_at <= ? THEN 1 ELSE delivery_otp_attempts.attempts + 1 END,
+          reset_at = CASE WHEN delivery_otp_attempts.reset_at <= ? THEN excluded.reset_at ELSE delivery_otp_attempts.reset_at END
+        RETURNING attempts, reset_at
+      `).get(delivery.id, resetAt, now, now);
   if (attempt.attempts > 5) {
     const waitMinutes = Math.max(1, Math.ceil((attempt.reset_at - now) / 6e4));
     res.set("Retry-After", String(Math.ceil((attempt.reset_at - now) / 1e3))).status(429).json({
@@ -6077,6 +6132,11 @@ async function verifyHandoffOtp(res, delivery, otp) {
       remainingAttempts: remaining
     });
     return false;
+  }
+  if (publicBucket) {
+    await db.prepare("DELETE FROM login_attempts WHERE bucket = ?").run(publicBucket);
+  } else {
+    await db.prepare("DELETE FROM delivery_otp_attempts WHERE delivery_id = ?").run(delivery.id);
   }
   return true;
 }
@@ -6336,36 +6396,40 @@ function registerSaqoRoutes(app, options) {
       res.status(400).json({ error: "Please enter a valid phone number (at least 10 digits)." });
       return;
     }
-    await db.prepare("UPDATE profiles SET full_name = ?, phone = ? WHERE id = ?").run(
-      nextName,
-      nextPhone,
-      profile.id
-    );
-    if (profile.role === "client" && typeof defaultState === "string" && defaultState.trim()) {
-      await db.prepare("UPDATE customers SET default_state = ? WHERE profile_id = ?").run(
-        defaultState.trim(),
+    const { updatedProfile, updatedRider } = await databaseTransaction(async () => {
+      await db.prepare("UPDATE profiles SET full_name = ?, phone = ? WHERE id = ?").run(
+        nextName,
+        nextPhone,
         profile.id
       );
-    }
-    if (profile.role === "rider") {
-      const existingRider = await getRiderByProfileId(profile.id);
-      if (existingRider) {
-        const validVehicles = ["Motorcycle", "Van", "Inter-State Sprinter"];
-        const nextVehicle = validVehicles.includes(vehicleType) ? vehicleType : existingRider.vehicleType;
-        const nextState = typeof homeState === "string" && homeState.trim() ? homeState.trim() : existingRider.homeState;
-        const nextPlate = typeof plateNumber === "string" && plateNumber.trim() ? plateNumber.trim().toUpperCase() : existingRider.plateNumber;
-        await db.prepare("UPDATE riders SET vehicle_type = ?, plate_number = ?, home_state = ? WHERE id = ?").run(
-          nextVehicle,
-          nextPlate,
-          nextState,
-          existingRider.riderId
+      if (profile.role === "client" && typeof defaultState === "string" && defaultState.trim()) {
+        await db.prepare("UPDATE customers SET default_state = ? WHERE profile_id = ?").run(
+          defaultState.trim(),
+          profile.id
         );
-        const updatedRider2 = await getRiderByProfileId(profile.id);
-        await broadcastWsEvent("rider:availability", updatedRider2);
       }
+      if (profile.role === "rider") {
+        const existingRider = await getRiderByProfileId(profile.id);
+        if (existingRider) {
+          const validVehicles = ["Motorcycle", "Van", "Inter-State Sprinter"];
+          const nextVehicle = validVehicles.includes(vehicleType) ? vehicleType : existingRider.vehicleType;
+          const nextState = typeof homeState === "string" && homeState.trim() ? homeState.trim() : existingRider.homeState;
+          const nextPlate = typeof plateNumber === "string" && plateNumber.trim() ? plateNumber.trim().toUpperCase() : existingRider.plateNumber;
+          await db.prepare("UPDATE riders SET vehicle_type = ?, plate_number = ?, home_state = ? WHERE id = ?").run(
+            nextVehicle,
+            nextPlate,
+            nextState,
+            existingRider.riderId
+          );
+        }
+      }
+      const freshProfile = await getProfileById(profile.id);
+      const freshRider = freshProfile.role === "rider" ? await getRiderByProfileId(profile.id) : null;
+      return { updatedProfile: freshProfile, updatedRider: freshRider };
+    });
+    if (updatedRider) {
+      await broadcastWsEvent("rider:availability", updatedRider);
     }
-    const updatedProfile = await getProfileById(profile.id);
-    const updatedRider = updatedProfile.role === "rider" ? await getRiderByProfileId(profile.id) : null;
     res.json({ profile: updatedProfile, rider: updatedRider });
   }));
   app.get("/api/track/:trackingCode", asyncRoute(async (req, res) => {
@@ -6380,53 +6444,64 @@ function registerSaqoRoutes(app, options) {
   }));
   app.post("/api/track/:trackingCode/confirm-otp", asyncRoute(async (req, res) => {
     const { otp } = req.body || {};
-    const delivery = await getDeliveryByTrackingCode(req.params.trackingCode);
-    if (!delivery) {
-      res.status(404).json({ error: "Parcel not found." });
-      return;
-    }
-    if (delivery.status === "delivered") {
-      res.status(400).json({ error: "This parcel has already been marked as delivered." });
-      return;
-    }
-    if (delivery.status === "cancelled") {
-      res.status(400).json({ error: "Cancelled deliveries cannot be confirmed." });
-      return;
-    }
-    if (delivery.status !== "arrived_at_destination") {
-      res.status(409).json({ error: "The rider must arrive at the destination before handoff." });
-      return;
-    }
-    if (!await verifyHandoffOtp(res, delivery, otp)) return;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    await db.prepare(`
-      UPDATE delivery_requests
-      SET otp_verified = 1, status = 'delivered', updated_at = ?
-      WHERE id = ?
-    `).run(now, delivery.id);
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'delivered', ?, 'client', ?)
-    `).run(
-      `hist-${crypto6.randomUUID().slice(0, 8)}`,
-      delivery.id,
-      `Parcel receipt confirmed with a verified recipient OTP.`,
-      now
-    );
-    await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
-    if (delivery.assignedRiderId) {
-      const payment = await db.prepare("SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?").get(delivery.id);
+    const clientIp = req.ip || req.socket?.remoteAddress || "unknown";
+    const outcome = await databaseTransaction(async () => {
+      const delivery = await getDeliveryByTrackingCode(req.params.trackingCode);
+      if (!delivery) {
+        return { errorStatus: 404, errorBody: { error: "Parcel not found." } };
+      }
+      if (delivery.status === "delivered") {
+        return { errorStatus: 400, errorBody: { error: "This parcel has already been marked as delivered." } };
+      }
+      if (delivery.status === "cancelled") {
+        return { errorStatus: 400, errorBody: { error: "Cancelled deliveries cannot be confirmed." } };
+      }
+      if (delivery.status !== "arrived_at_destination") {
+        return { errorStatus: 409, errorBody: { error: "The rider must arrive at the destination before handoff." } };
+      }
+      if (!await verifyHandoffOtp(res, delivery, otp, { type: "public", ip: clientIp })) {
+        return { responded: true };
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const transition = await db.prepare(`
+        UPDATE delivery_requests
+        SET otp_verified = 1, status = 'delivered', updated_at = ?
+        WHERE id = ? AND status = 'arrived_at_destination'
+      `).run(now, delivery.id);
+      if (transition.changes === 0) {
+        return { errorStatus: 409, errorBody: { error: "This parcel is no longer awaiting OTP handoff." } };
+      }
       await db.prepare(`
-        UPDATE riders
-        SET completed_deliveries_count = completed_deliveries_count + 1,
-            total_earnings_ngn = total_earnings_ngn + ?
-        WHERE id = ?
-      `).run(payment?.rider_payout_ngn || 0, delivery.assignedRiderId);
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'delivered', ?, 'client', ?)
+      `).run(
+        `hist-${crypto6.randomUUID().slice(0, 8)}`,
+        delivery.id,
+        `Parcel receipt confirmed with a verified recipient OTP.`,
+        now
+      );
+      await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
+      if (delivery.assignedRiderId) {
+        const payment = await db.prepare("SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?").get(delivery.id);
+        await db.prepare(`
+          UPDATE riders
+          SET completed_deliveries_count = completed_deliveries_count + 1,
+              total_earnings_ngn = total_earnings_ngn + ?
+          WHERE id = ?
+        `).run(payment?.rider_payout_ngn || 0, delivery.assignedRiderId);
+      }
+      const updated = await getDeliveryById(delivery.id);
+      const history = await publicTrackingHistory(delivery.id);
+      return { updated, history };
+    });
+    if ("responded" in outcome) return;
+    if ("errorStatus" in outcome && outcome.errorStatus !== void 0) {
+      res.status(outcome.errorStatus).json(outcome.errorBody);
+      return;
     }
-    const updated = await getDeliveryById(delivery.id);
-    await broadcastWsEvent("delivery:updated", updated);
+    await broadcastWsEvent("delivery:updated", outcome.updated);
     await dispatchWaitingDeliveries();
-    res.json({ delivery: publicTrackingDelivery(updated), history: await publicTrackingHistory(delivery.id) });
+    res.json({ delivery: publicTrackingDelivery(outcome.updated), history: outcome.history });
   }));
   app.get("/api/notifications", authenticate, asyncRoute(async (req, res) => {
     res.json({ notifications: await getNotificationsForUser(req.auth.userId) });
@@ -6564,38 +6639,30 @@ function registerSaqoRoutes(app, options) {
       weightKg: parsedWeight,
       settings
     });
-    if (chosenMethod === "wallet") {
-      const wallet = await ensureWallet(req.auth.userId);
-      if (wallet.balanceNgn < quote.deliveryFeeNgn) {
-        res.status(400).json({
-          error: `Insufficient wallet balance. Delivery fee is \u20A6${quote.deliveryFeeNgn.toLocaleString()}, available balance is \u20A6${wallet.balanceNgn.toLocaleString()}. Fund your wallet to proceed.`,
-          code: "INSUFFICIENT_WALLET_BALANCE",
-          requiredAmountNgn: quote.deliveryFeeNgn,
-          availableBalanceNgn: wallet.balanceNgn
-        });
-        return;
-      }
-    }
-    const { deliveryId, trackingCode } = await createBookingRows({
-      customerId: cust.id,
-      pickupState,
-      pickupAddress,
-      pCoords,
-      destinationState,
-      destinationAddress,
-      dCoords,
-      recipientName,
-      recipientPhone,
-      parcelCategory,
-      parcelDescription,
-      weightKg: parsedWeight,
-      paymentMethod: chosenMethod,
-      quote,
-      riderCommissionPercent: settings.riderCommissionPercent
-    });
+    let deliveryId = "";
+    let trackingCode = "";
     let paymentTransaction = null;
-    try {
-      if (chosenMethod === "flutterwave") {
+    if (chosenMethod === "flutterwave") {
+      const booking = await createBookingRows({
+        customerId: cust.id,
+        pickupState,
+        pickupAddress,
+        pCoords,
+        destinationState,
+        destinationAddress,
+        dCoords,
+        recipientName,
+        recipientPhone,
+        parcelCategory,
+        parcelDescription,
+        weightKg: parsedWeight,
+        paymentMethod: chosenMethod,
+        quote,
+        riderCommissionPercent: settings.riderCommissionPercent
+      });
+      deliveryId = booking.deliveryId;
+      trackingCode = booking.trackingCode;
+      try {
         const origin = getRequestOrigin(req);
         paymentTransaction = await initializeDeliveryFlutterwavePayment({
           deliveryId,
@@ -6606,37 +6673,87 @@ function registerSaqoRoutes(app, options) {
           idempotencyKey: cleanIdempotencyKey,
           redirectUrl: `${origin}/?flw_callback=1`
         });
-      } else {
-        const payRes = await createDeliveryPaymentRecords({
-          deliveryId,
-          trackingCode,
-          customerProfileId: req.auth.userId,
-          customerName: customerProfile.fullName,
-          customerEmail: customerProfile.email,
-          customerPhone: customerProfile.phone,
-          amountNgn: quote.deliveryFeeNgn,
-          paymentMethod: chosenMethod,
-          idempotencyKey: cleanIdempotencyKey,
-          transferReference: typeof transferReference === "string" ? transferReference : null,
-          transferProofNote: typeof transferProofNote === "string" ? transferProofNote : null
-        });
-        paymentTransaction = payRes.paymentTransaction;
-        await db.prepare("UPDATE delivery_requests SET payment_reference = ? WHERE id = ?").run(
-          payRes.paymentReference,
-          deliveryId
-        );
-      }
-    } catch (payErr) {
-      if (chosenMethod === "flutterwave" && await db.prepare("SELECT 1 FROM payment_transactions WHERE delivery_id = ?").get(deliveryId)) {
+      } catch (payErr) {
+        if (await db.prepare("SELECT 1 FROM payment_transactions WHERE delivery_id = ?").get(deliveryId)) {
+          sendPaymentError(res, payErr);
+          return;
+        }
+        await db.prepare("DELETE FROM delivery_status_history WHERE delivery_id = ?").run(deliveryId);
+        await db.prepare("DELETE FROM payments WHERE delivery_id = ?").run(deliveryId);
+        await db.prepare("DELETE FROM parcels WHERE delivery_id = ?").run(deliveryId);
+        await db.prepare("DELETE FROM delivery_requests WHERE id = ?").run(deliveryId);
         sendPaymentError(res, payErr);
         return;
       }
-      await db.prepare("DELETE FROM delivery_status_history WHERE delivery_id = ?").run(deliveryId);
-      await db.prepare("DELETE FROM payments WHERE delivery_id = ?").run(deliveryId);
-      await db.prepare("DELETE FROM parcels WHERE delivery_id = ?").run(deliveryId);
-      await db.prepare("DELETE FROM delivery_requests WHERE id = ?").run(deliveryId);
-      sendPaymentError(res, payErr);
-      return;
+    } else {
+      try {
+        const txOutcome = await databaseTransaction(async () => {
+          if (chosenMethod === "wallet") {
+            const wallet = await ensureWallet(req.auth.userId);
+            if (wallet.balanceNgn < quote.deliveryFeeNgn) {
+              return {
+                insufficientWallet: true,
+                availableBalanceNgn: wallet.balanceNgn
+              };
+            }
+          }
+          const booking = await createBookingRows({
+            customerId: cust.id,
+            pickupState,
+            pickupAddress,
+            pCoords,
+            destinationState,
+            destinationAddress,
+            dCoords,
+            recipientName,
+            recipientPhone,
+            parcelCategory,
+            parcelDescription,
+            weightKg: parsedWeight,
+            paymentMethod: chosenMethod,
+            quote,
+            riderCommissionPercent: settings.riderCommissionPercent
+          });
+          const payRes = await createDeliveryPaymentRecords({
+            deliveryId: booking.deliveryId,
+            trackingCode: booking.trackingCode,
+            customerProfileId: req.auth.userId,
+            customerName: customerProfile.fullName,
+            customerEmail: customerProfile.email,
+            customerPhone: customerProfile.phone,
+            amountNgn: quote.deliveryFeeNgn,
+            paymentMethod: chosenMethod,
+            idempotencyKey: cleanIdempotencyKey,
+            transferReference: typeof transferReference === "string" ? transferReference : null,
+            transferProofNote: typeof transferProofNote === "string" ? transferProofNote : null
+          });
+          await db.prepare("UPDATE delivery_requests SET payment_reference = ? WHERE id = ?").run(
+            payRes.paymentReference,
+            booking.deliveryId
+          );
+          return {
+            insufficientWallet: false,
+            deliveryId: booking.deliveryId,
+            trackingCode: booking.trackingCode,
+            paymentTransaction: payRes.paymentTransaction
+          };
+        });
+        if (txOutcome.insufficientWallet) {
+          res.status(400).json({
+            error: `Insufficient wallet balance. Delivery fee is \u20A6${quote.deliveryFeeNgn.toLocaleString()}, available balance is \u20A6${txOutcome.availableBalanceNgn.toLocaleString()}. Fund your wallet to proceed.`,
+            code: "INSUFFICIENT_WALLET_BALANCE",
+            requiredAmountNgn: quote.deliveryFeeNgn,
+            availableBalanceNgn: txOutcome.availableBalanceNgn
+          });
+          return;
+        }
+        deliveryId = txOutcome.deliveryId;
+        trackingCode = txOutcome.trackingCode;
+        paymentTransaction = txOutcome.paymentTransaction;
+      } catch (payErr) {
+        sendPaymentError(res, payErr);
+        return;
+      }
     }
     const created = await getDeliveryById(deliveryId);
     await broadcastWsEvent("delivery:created", created);
@@ -6653,88 +6770,98 @@ function registerSaqoRoutes(app, options) {
     });
   }));
   app.post("/api/deliveries/:id/retry-dispatch", authenticate, requireRole("client", "admin"), asyncRoute(async (req, res) => {
-    const delivery = await getDeliveryById(req.params.id);
-    if (!delivery) {
-      res.status(404).json({ error: "Delivery not found." });
-      return;
-    }
-    if (req.auth.role === "client") {
-      const cust = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(req.auth.userId);
-      if (!cust || delivery.customerId !== cust.id) {
-        res.status(403).json({ error: "You can only manage your own parcel requests." });
-        return;
+    const check = await databaseTransaction(async () => {
+      const delivery = await getDeliveryById(req.params.id);
+      if (!delivery) {
+        return { errorStatus: 404, errorBody: { error: "Delivery not found." } };
       }
-    }
-    if (!["pending_dispatch", "no_rider_available"].includes(delivery.status) || delivery.assignedRiderId) {
-      res.status(409).json({ error: "Only waiting parcels can be retried." });
+      if (req.auth.role === "client") {
+        const cust = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(req.auth.userId);
+        if (!cust || delivery.customerId !== cust.id) {
+          return { errorStatus: 403, errorBody: { error: "You can only manage your own parcel requests." } };
+        }
+      }
+      if (!["pending_dispatch", "no_rider_available"].includes(delivery.status) || delivery.assignedRiderId) {
+        return { errorStatus: 409, errorBody: { error: "Only waiting parcels can be retried." } };
+      }
+      await db.prepare(
+        `DELETE FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out')`
+      ).run(delivery.id);
+      return { deliveryId: delivery.id };
+    });
+    if ("errorStatus" in check && check.errorStatus !== void 0) {
+      res.status(check.errorStatus).json(check.errorBody);
       return;
     }
-    await db.prepare(
-      `DELETE FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out')`
-    ).run(delivery.id);
-    const dispatchResult = await dispatchNextRiderForDelivery(delivery.id);
-    const updated = await getDeliveryById(delivery.id);
+    const dispatchResult = await dispatchNextRiderForDelivery(check.deliveryId);
+    const updated = await getDeliveryById(check.deliveryId);
     res.json({ delivery: updated, dispatchResult });
   }));
   app.post("/api/deliveries/:id/cancel", authenticate, requireRole("client", "admin"), asyncRoute(async (req, res) => {
-    const delivery = await getDeliveryById(req.params.id);
-    if (!delivery) {
-      res.status(404).json({ error: "Delivery not found." });
-      return;
-    }
-    if (req.auth.role === "client") {
-      const cust = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(req.auth.userId);
-      if (!cust || delivery.customerId !== cust.id) {
-        res.status(403).json({ error: "You can only cancel your own parcel requests." });
-        return;
-      }
-    }
-    if (["delivered", "cancelled"].includes(delivery.status)) {
-      res.status(400).json({ error: "Cannot cancel a completed or already cancelled delivery." });
-      return;
-    }
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const offeredAssignments = await db.prepare(`SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'`).all(delivery.id);
-    for (const asg of offeredAssignments) {
+    const outcome = await databaseTransaction(async () => {
+      const delivery = await getDeliveryById(req.params.id);
+      if (!delivery) {
+        return { errorStatus: 404, errorBody: { error: "Delivery not found." } };
+      }
+      if (req.auth.role === "client") {
+        const cust = await db.prepare("SELECT id FROM customers WHERE profile_id = ?").get(req.auth.userId);
+        if (!cust || delivery.customerId !== cust.id) {
+          return { errorStatus: 403, errorBody: { error: "You can only cancel your own parcel requests." } };
+        }
+      }
+      if (["delivered", "cancelled"].includes(delivery.status)) {
+        return { errorStatus: 400, errorBody: { error: "Cannot cancel a completed or already cancelled delivery." } };
+      }
+      const offeredAssignments = await db.prepare(`SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'`).all(delivery.id);
+      const cancelUpdate = await db.prepare(
+        `UPDATE delivery_requests SET status = 'cancelled', updated_at = ? WHERE id = ? AND status NOT IN ('delivered', 'cancelled')`
+      ).run(now, delivery.id);
+      if (cancelUpdate.changes === 0) {
+        return { errorStatus: 400, errorBody: { error: "Cannot cancel a completed or already cancelled delivery." } };
+      }
+      await db.prepare(
+        `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
+      ).run(now, delivery.id);
+      if (delivery.paymentMethod === "wallet" && delivery.paymentStatus === "paid") {
+        try {
+          await processAdminRefund({
+            deliveryId: delivery.id,
+            amountNgn: delivery.deliveryFeeNgn,
+            destination: "wallet",
+            reason: `Automatic wallet refund on delivery cancellation (${delivery.trackingCode})`,
+            adminId: req.auth.userId
+          });
+        } catch {
+        }
+      } else if (delivery.paymentStatus !== "paid" && delivery.paymentStatus !== "collected_by_rider") {
+        await cancelDeliveryPayments(delivery.id, {
+          reason: req.auth.role === "admin" ? `Delivery cancelled by operations (${delivery.trackingCode})` : `Delivery cancelled by sender (${delivery.trackingCode})`
+        });
+      }
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'cancelled', ?, ?, ?)
+      `).run(
+        `hist-${crypto6.randomUUID().slice(0, 8)}`,
+        delivery.id,
+        req.auth.role === "admin" ? "Delivery cancelled by SAQO Operations." : "Delivery cancelled by sender.",
+        req.auth.role,
+        now
+      );
+      const updated = await getDeliveryById(delivery.id);
+      return { offeredAssignments, updated };
+    });
+    if ("errorStatus" in outcome && outcome.errorStatus !== void 0) {
+      res.status(outcome.errorStatus).json(outcome.errorBody);
+      return;
+    }
+    for (const asg of outcome.offeredAssignments) {
       clearOfferTimer(asg.id);
     }
-    await db.prepare(
-      `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
-    ).run(now, delivery.id);
-    await db.prepare(`UPDATE delivery_requests SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(
-      now,
-      delivery.id
-    );
-    if (delivery.paymentMethod === "wallet" && delivery.paymentStatus === "paid") {
-      try {
-        await processAdminRefund({
-          deliveryId: delivery.id,
-          amountNgn: delivery.deliveryFeeNgn,
-          destination: "wallet",
-          reason: `Automatic wallet refund on delivery cancellation (${delivery.trackingCode})`,
-          adminId: req.auth.userId
-        });
-      } catch {
-      }
-    } else if (delivery.paymentStatus !== "paid" && delivery.paymentStatus !== "collected_by_rider") {
-      await cancelDeliveryPayments(delivery.id, {
-        reason: req.auth.role === "admin" ? `Delivery cancelled by operations (${delivery.trackingCode})` : `Delivery cancelled by sender (${delivery.trackingCode})`
-      });
-    }
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'cancelled', ?, ?, ?)
-    `).run(
-      `hist-${crypto6.randomUUID().slice(0, 8)}`,
-      delivery.id,
-      req.auth.role === "admin" ? "Delivery cancelled by SAQO Operations." : "Delivery cancelled by sender.",
-      req.auth.role,
-      now
-    );
-    const updated = await getDeliveryById(delivery.id);
-    await broadcastWsEvent("delivery:updated", updated);
+    await broadcastWsEvent("delivery:updated", outcome.updated);
     await dispatchWaitingDeliveries();
-    res.json({ delivery: updated });
+    res.json({ delivery: outcome.updated });
   }));
   app.get("/api/wallet", authenticate, requireRole("client"), asyncRoute(async (req, res) => {
     try {
@@ -7030,104 +7157,123 @@ function registerSaqoRoutes(app, options) {
       lng: updated.currentLng,
       lastLocationAt: now
     });
-    await dispatchWaitingDeliveries();
+    if (updated.isOnline && updated.verificationStatus === "verified") {
+      await dispatchWaitingDeliveries();
+    }
     res.json({ rider: updated });
   }));
   app.post("/api/rider/assignments/:id/respond", authenticate, requireRole("rider"), asyncRoute(async (req, res) => {
-    const rider = await getRiderByProfileId(req.auth.userId);
-    if (!rider) {
-      res.status(404).json({ error: "Rider not found." });
-      return;
-    }
-    const assignment = await db.prepare("SELECT * FROM delivery_assignments WHERE id = ? AND rider_id = ?").get(req.params.id, rider.riderId);
-    if (!assignment) {
-      res.status(404).json({ error: "Assignment offer not found." });
-      return;
-    }
-    if (assignment.status !== "offered") {
-      res.status(400).json({ error: `Offer is already ${assignment.status}.` });
-      return;
-    }
-    const delivery = await getDeliveryById(assignment.delivery_id);
-    if (Date.parse(assignment.expires_at) <= Date.now() || delivery?.status !== "assigned" || delivery.assignedRiderId !== rider.riderId) {
-      await expireTimedOutOffers(true).catch(() => {
-      });
-      res.status(409).json({ error: "This offer has expired and has been reassigned to the next available rider." });
-      return;
-    }
     const action = req.body?.action;
     if (action !== "accept" && action !== "reject") {
       res.status(400).json({ error: "Choose accept or reject." });
       return;
     }
-    if (action === "accept" && (!rider.isOnline || rider.verificationStatus !== "verified")) {
-      res.status(403).json({
-        error: "Your rider verification tick must be active to accept deliveries."
-      });
-      return;
-    }
-    clearOfferTimer(assignment.id);
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    if (action === "accept") {
-      await db.prepare(
-        `UPDATE delivery_assignments SET status = 'accepted', responded_at = ? WHERE id = ?`
-      ).run(now, assignment.id);
-      await db.prepare(
-        `UPDATE delivery_requests SET status = 'accepted', assigned_rider_id = ?, updated_at = ? WHERE id = ?`
-      ).run(rider.riderId, now, assignment.delivery_id);
-      await db.prepare(`
-        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-        VALUES (?, ?, 'accepted', ?, 'rider', ?)
-      `).run(
-        `hist-${crypto6.randomUUID().slice(0, 8)}`,
-        assignment.delivery_id,
-        `${rider.fullName} accepted the delivery request.`,
-        now
-      );
-      const updated = await getDeliveryById(assignment.delivery_id);
-      const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(updated.customerId);
-      if (custRow) {
-        const notif = await createNotification(
+    const outcome = await databaseTransaction(async () => {
+      const rider = await getRiderByProfileId(req.auth.userId);
+      if (!rider) {
+        return { errorStatus: 404, errorBody: { error: "Rider not found." } };
+      }
+      const assignment = await db.prepare("SELECT * FROM delivery_assignments WHERE id = ? AND rider_id = ?").get(req.params.id, rider.riderId);
+      if (!assignment) {
+        return { errorStatus: 404, errorBody: { error: "Assignment offer not found." } };
+      }
+      if (assignment.status !== "offered") {
+        return { errorStatus: 400, errorBody: { error: `Offer is already ${assignment.status}.` } };
+      }
+      const delivery = await getDeliveryById(assignment.delivery_id);
+      if (Date.parse(assignment.expires_at) <= Date.now() || delivery?.status !== "assigned" || delivery.assignedRiderId !== rider.riderId) {
+        return { expired: true };
+      }
+      if (action === "accept") {
+        if (!rider.isOnline || rider.verificationStatus !== "verified") {
+          return {
+            errorStatus: 403,
+            errorBody: { error: "Your rider verification tick must be active to accept deliveries." }
+          };
+        }
+        const settings = await getPlatformSettings();
+        if (Math.max(0, rider.activeParcelsCount - 1) >= settings.maxActiveParcelsPerRider) {
+          return {
+            errorStatus: 409,
+            errorBody: { error: "You have reached the maximum active parcel limit." }
+          };
+        }
+        const delUpd = await db.prepare(
+          `UPDATE delivery_requests SET status = 'accepted', assigned_rider_id = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND assigned_rider_id = ?`
+        ).run(rider.riderId, now, assignment.delivery_id, rider.riderId);
+        if (delUpd.changes === 0) {
+          return { expired: true };
+        }
+        await db.prepare(
+          `UPDATE delivery_assignments SET status = 'accepted', responded_at = ? WHERE id = ? AND status = 'offered'`
+        ).run(now, assignment.id);
+        await db.prepare(`
+          INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+          VALUES (?, ?, 'accepted', ?, 'rider', ?)
+        `).run(
+          `hist-${crypto6.randomUUID().slice(0, 8)}`,
+          assignment.delivery_id,
+          `${rider.fullName} accepted the delivery request.`,
+          now
+        );
+        const updated = await getDeliveryById(assignment.delivery_id);
+        const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(updated.customerId);
+        const notif = custRow ? await createNotification(
           custRow.profile_id,
           "Rider Assigned",
           `${rider.fullName} (${rider.vehicleType}) accepted parcel ${updated.trackingCode} and is heading for pickup.`,
           updated.id
-        );
-        await broadcastWsEvent("notification:created", notif);
+        ) : null;
+        return { accepted: true, assignmentId: assignment.id, updated, notif };
       }
-      await broadcastWsEvent("assignment:updated", { id: assignment.id, status: "accepted" });
-      await broadcastWsEvent("delivery:updated", updated);
-      res.json({ ok: true, delivery: riderDelivery(updated) });
+      const asgUpd = await db.prepare(
+        `UPDATE delivery_assignments SET status = 'rejected', responded_at = ? WHERE id = ? AND status = 'offered'`
+      ).run(now, assignment.id);
+      if (asgUpd.changes === 0) {
+        return { expired: true };
+      }
+      await db.prepare(`
+        UPDATE delivery_requests
+        SET assigned_rider_id = NULL, status = 'pending_dispatch', updated_at = ?
+        WHERE id = ? AND assigned_rider_id = ? AND status = 'assigned'
+      `).run(now, assignment.delivery_id, rider.riderId);
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'pending_dispatch', ?, 'rider', ?)
+      `).run(
+        `hist-${crypto6.randomUUID().slice(0, 8)}`,
+        assignment.delivery_id,
+        `${rider.fullName} declined the offer. Re-running smart dispatch for next rider.`,
+        now
+      );
+      const released = await getDeliveryById(assignment.delivery_id);
+      return { accepted: false, assignmentId: assignment.id, deliveryId: assignment.delivery_id, released };
+    });
+    if ("expired" in outcome) {
+      await expireTimedOutOffers(true).catch(() => {
+      });
+      res.status(409).json({ error: "This offer has expired and has been reassigned to the next available rider." });
       return;
     }
-    await db.prepare(
-      `UPDATE delivery_assignments SET status = 'rejected', responded_at = ? WHERE id = ?`
-    ).run(now, assignment.id);
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'pending_dispatch', ?, 'rider', ?)
-    `).run(
-      `hist-${crypto6.randomUUID().slice(0, 8)}`,
-      assignment.delivery_id,
-      `${rider.fullName} declined the offer. Re-running smart dispatch for next rider.`,
-      now
-    );
-    await broadcastWsEvent("assignment:updated", { id: assignment.id, status: "rejected" });
-    await releaseOffer(assignment.delivery_id, rider.riderId);
+    if ("errorStatus" in outcome && outcome.errorStatus !== void 0) {
+      res.status(outcome.errorStatus).json(outcome.errorBody);
+      return;
+    }
+    clearOfferTimer(outcome.assignmentId);
+    if (outcome.accepted) {
+      if (outcome.notif) await broadcastWsEvent("notification:created", outcome.notif);
+      await broadcastWsEvent("assignment:updated", { id: outcome.assignmentId, status: "accepted" });
+      await broadcastWsEvent("delivery:updated", outcome.updated);
+      res.json({ ok: true, delivery: riderDelivery(outcome.updated) });
+      return;
+    }
+    await broadcastWsEvent("assignment:updated", { id: outcome.assignmentId, status: "rejected" });
+    await broadcastWsEvent("delivery:updated", outcome.released);
     await dispatchWaitingDeliveries();
-    res.json({ ok: true, nextDispatch: { offered: (await getDeliveryById(assignment.delivery_id))?.status === "assigned" } });
+    res.json({ ok: true, nextDispatch: { offered: (await getDeliveryById(outcome.deliveryId))?.status === "assigned" } });
   }));
   app.patch("/api/rider/deliveries/:id/status", authenticate, requireRole("rider"), asyncRoute(async (req, res) => {
-    const rider = await getRiderByProfileId(req.auth.userId);
-    const delivery = await getDeliveryById(req.params.id);
-    if (!rider || !delivery || delivery.assignedRiderId !== rider.riderId) {
-      res.status(404).json({ error: "Assigned delivery not found." });
-      return;
-    }
-    if (["delivered", "cancelled"].includes(delivery.status)) {
-      res.status(400).json({ error: "This parcel is already finalized and cannot be updated." });
-      return;
-    }
     const transitions = {
       accepted: "heading_to_pickup",
       heading_to_pickup: "parcel_picked_up",
@@ -7136,60 +7282,76 @@ function registerSaqoRoutes(app, options) {
       arrived_at_destination: "delivered"
     };
     const nextStatus = req.body?.status;
-    if (!nextStatus || transitions[delivery.status] !== nextStatus) {
-      res.status(400).json({ error: "Invalid delivery status transition." });
+    const outcome = await databaseTransaction(async () => {
+      const rider = await getRiderByProfileId(req.auth.userId);
+      const delivery = await getDeliveryById(req.params.id);
+      if (!rider || !delivery || delivery.assignedRiderId !== rider.riderId) {
+        return { errorStatus: 404, errorBody: { error: "Assigned delivery not found." } };
+      }
+      if (["delivered", "cancelled"].includes(delivery.status)) {
+        return { errorStatus: 400, errorBody: { error: "This parcel is already finalized and cannot be updated." } };
+      }
+      if (!nextStatus || transitions[delivery.status] !== nextStatus) {
+        return { errorStatus: 400, errorBody: { error: "Invalid delivery status transition." } };
+      }
+      if (nextStatus === "delivered" && !await verifyHandoffOtp(res, delivery, req.body?.otp, { type: "rider", actorId: rider.riderId })) {
+        return { responded: true };
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const note = req.body?.note || (nextStatus === "delivered" ? `Parcel delivered and verified with a verified recipient OTP.` : `Rider updated parcel status to ${nextStatus.replace(/_/g, " ")}.`);
+      const transition = nextStatus === "delivered" ? await db.prepare(
+        "UPDATE delivery_requests SET status = ?, otp_verified = 1, updated_at = ? WHERE id = ? AND status = ? AND assigned_rider_id = ?"
+      ).run(nextStatus, now, delivery.id, delivery.status, rider.riderId) : await db.prepare(
+        "UPDATE delivery_requests SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND assigned_rider_id = ?"
+      ).run(nextStatus, now, delivery.id, delivery.status, rider.riderId);
+      if (transition.changes === 0) {
+        return { errorStatus: 409, errorBody: { error: "Delivery status changed concurrently. Refresh and retry." } };
+      }
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, ?, ?, 'rider', ?)
+      `).run(`hist-${crypto6.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
+      if (nextStatus === "delivered") {
+        await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
+        const payment = await db.prepare("SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?").get(delivery.id);
+        await db.prepare(`
+          UPDATE riders
+          SET completed_deliveries_count = completed_deliveries_count + 1,
+              total_earnings_ngn = total_earnings_ngn + ?
+          WHERE id = ?
+        `).run(payment?.rider_payout_ngn || 0, rider.riderId);
+      }
+      const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
+      let notif = null;
+      if (custRow) {
+        let notifTitle = `${delivery.trackingCode}: ${nextStatus.replace(/_/g, " ")}`;
+        if (nextStatus === "parcel_picked_up") {
+          notifTitle = "Parcel Picked Up";
+        } else if (nextStatus === "in_transit" || nextStatus === "arrived_at_destination") {
+          notifTitle = "Out for Delivery";
+        } else if (nextStatus === "delivered") {
+          notifTitle = "Parcel Delivered";
+        }
+        notif = await createNotification(
+          custRow.profile_id,
+          notifTitle,
+          `${delivery.trackingCode}: ${note}`,
+          delivery.id
+        );
+      }
+      const updated = await getDeliveryById(delivery.id);
+      const history = await getDeliveryHistory(delivery.id);
+      return { updated, history, notif };
+    });
+    if ("responded" in outcome) return;
+    if ("errorStatus" in outcome && outcome.errorStatus !== void 0) {
+      res.status(outcome.errorStatus).json(outcome.errorBody);
       return;
     }
-    if (nextStatus === "delivered" && !await verifyHandoffOtp(res, delivery, req.body?.otp)) return;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const note = req.body?.note || (nextStatus === "delivered" ? `Parcel delivered and verified with a verified recipient OTP.` : `Rider updated parcel status to ${nextStatus.replace(/_/g, " ")}.`);
-    if (nextStatus === "delivered") {
-      await db.prepare(
-        "UPDATE delivery_requests SET status = ?, otp_verified = 1, updated_at = ? WHERE id = ?"
-      ).run(nextStatus, now, delivery.id);
-    } else {
-      await db.prepare("UPDATE delivery_requests SET status = ?, updated_at = ? WHERE id = ?").run(
-        nextStatus,
-        now,
-        delivery.id
-      );
-    }
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, ?, ?, 'rider', ?)
-    `).run(`hist-${crypto6.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
-    if (nextStatus === "delivered") {
-      await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
-      const payment = await db.prepare("SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?").get(delivery.id);
-      await db.prepare(`
-        UPDATE riders
-        SET completed_deliveries_count = completed_deliveries_count + 1,
-            total_earnings_ngn = total_earnings_ngn + ?
-        WHERE id = ?
-      `).run(payment?.rider_payout_ngn || 0, rider.riderId);
-    }
-    const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
-    if (custRow) {
-      let notifTitle = `${delivery.trackingCode}: ${nextStatus.replace(/_/g, " ")}`;
-      if (nextStatus === "parcel_picked_up") {
-        notifTitle = "Parcel Picked Up";
-      } else if (nextStatus === "in_transit" || nextStatus === "arrived_at_destination") {
-        notifTitle = "Out for Delivery";
-      } else if (nextStatus === "delivered") {
-        notifTitle = "Parcel Delivered";
-      }
-      const notif = await createNotification(
-        custRow.profile_id,
-        notifTitle,
-        `${delivery.trackingCode}: ${note}`,
-        delivery.id
-      );
-      await broadcastWsEvent("notification:created", notif);
-    }
-    const updated = await getDeliveryById(delivery.id);
-    await broadcastWsEvent("delivery:updated", updated);
+    if (outcome.notif) await broadcastWsEvent("notification:created", outcome.notif);
+    await broadcastWsEvent("delivery:updated", outcome.updated);
     if (nextStatus === "delivered") await dispatchWaitingDeliveries();
-    res.json({ delivery: riderDelivery(updated), history: await getDeliveryHistory(delivery.id) });
+    res.json({ delivery: riderDelivery(outcome.updated), history: outcome.history });
   }));
   app.post("/api/rider/deliveries/:id/collect-cash", authenticate, requireRole("rider"), asyncRoute(async (req, res) => {
     try {
@@ -7232,81 +7394,86 @@ function registerSaqoRoutes(app, options) {
   }));
   app.post("/api/admin/deliveries/:id/assign", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
     const { riderId } = req.body || {};
-    const delivery = await getDeliveryById(req.params.id);
-    if (!delivery) {
-      res.status(404).json({ error: "Delivery not found." });
-      return;
-    }
-    const rider = (await getAllRiders()).find((r) => r.riderId === riderId);
-    if (!rider) {
-      res.status(404).json({ error: "Rider not found." });
-      return;
-    }
-    if (rider.accountStatus === "suspended" || rider.verificationStatus !== "verified") {
-      res.status(400).json({ error: "Cannot assign a suspended or unverified rider." });
-      return;
-    }
-    if (!["pending_dispatch", "no_rider_available", "assigned"].includes(delivery.status) || !canDispatch(delivery)) {
-      res.status(409).json({ error: "Only dispatchable parcels awaiting rider acceptance can be assigned." });
-      return;
-    }
-    const alreadyReserved = delivery.assignedRiderId === rider.riderId ? 1 : 0;
-    if (rider.activeParcelsCount - alreadyReserved >= (await getPlatformSettings()).maxActiveParcelsPerRider) {
-      res.status(409).json({ error: "This rider has reached the active parcel limit." });
-      return;
-    }
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    await db.prepare(
-      `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
-    ).run(now, delivery.id);
-    await db.prepare(`
-      INSERT INTO delivery_assignments (
-        id, delivery_id, rider_id, status, score, distance_to_pickup_km,
-        route_compatibility_score, offered_at, expires_at, responded_at
-      ) VALUES (?, ?, ?, 'accepted', 0, 0, 1.0, ?, ?, ?)
-    `).run(`asg-${crypto6.randomUUID().slice(0, 8)}`, delivery.id, rider.riderId, now, now, now);
-    await db.prepare(`
-      UPDATE delivery_requests
-      SET assigned_rider_id = ?, status = 'accepted', updated_at = ?
-      WHERE id = ?
-    `).run(rider.riderId, now, delivery.id);
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'accepted', ?, 'admin', ?)
-    `).run(
-      `hist-${crypto6.randomUUID().slice(0, 8)}`,
-      delivery.id,
-      `Admin manually assigned delivery to ${rider.fullName}.`,
-      now
-    );
-    const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
-    if (custRow) {
-      const cNotif = await createNotification(
+    const outcome = await databaseTransaction(async () => {
+      const delivery = await getDeliveryById(req.params.id);
+      if (!delivery) {
+        return { errorStatus: 404, errorBody: { error: "Delivery not found." } };
+      }
+      const rider = (await getAllRiders()).find((r) => r.riderId === riderId);
+      if (!rider) {
+        return { errorStatus: 404, errorBody: { error: "Rider not found." } };
+      }
+      if (rider.accountStatus === "suspended" || rider.verificationStatus !== "verified") {
+        return { errorStatus: 400, errorBody: { error: "Cannot assign a suspended or unverified rider." } };
+      }
+      if (!["pending_dispatch", "no_rider_available", "assigned"].includes(delivery.status) || !canDispatch(delivery)) {
+        return {
+          errorStatus: 409,
+          errorBody: { error: "Only dispatchable parcels awaiting rider acceptance can be assigned." }
+        };
+      }
+      const alreadyReserved = delivery.assignedRiderId === rider.riderId ? 1 : 0;
+      if (rider.activeParcelsCount - alreadyReserved >= (await getPlatformSettings()).maxActiveParcelsPerRider) {
+        return { errorStatus: 409, errorBody: { error: "This rider has reached the active parcel limit." } };
+      }
+      const delUpd = await db.prepare(`
+        UPDATE delivery_requests
+        SET assigned_rider_id = ?, status = 'accepted', updated_at = ?
+        WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available', 'assigned')
+      `).run(rider.riderId, now, delivery.id);
+      if (delUpd.changes === 0) {
+        return {
+          errorStatus: 409,
+          errorBody: { error: "Parcel state changed concurrently. Refresh and retry." }
+        };
+      }
+      const replacedOffers = await db.prepare(
+        `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered' RETURNING id`
+      ).all(now, delivery.id);
+      await db.prepare(`
+        INSERT INTO delivery_assignments (
+          id, delivery_id, rider_id, status, score, distance_to_pickup_km,
+          route_compatibility_score, offered_at, expires_at, responded_at
+        ) VALUES (?, ?, ?, 'accepted', 0, 0, 1.0, ?, ?, ?)
+      `).run(`asg-${crypto6.randomUUID().slice(0, 8)}`, delivery.id, rider.riderId, now, now, now);
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'accepted', ?, 'admin', ?)
+      `).run(
+        `hist-${crypto6.randomUUID().slice(0, 8)}`,
+        delivery.id,
+        `Admin manually assigned delivery to ${rider.fullName}.`,
+        now
+      );
+      const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
+      const cNotif = custRow ? await createNotification(
         custRow.profile_id,
         "Rider Assigned",
         `${rider.fullName} (${rider.vehicleType}) has been assigned to parcel ${delivery.trackingCode}.`,
         delivery.id
+      ) : null;
+      const rNotif = await createNotification(
+        rider.id,
+        "New Delivery Request Available",
+        `Admin assigned ${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} \u2192 ${delivery.destinationAddress}, ${delivery.destinationState}.`,
+        delivery.id
       );
-      await broadcastWsEvent("notification:created", cNotif);
-    }
-    const rNotif = await createNotification(
-      rider.id,
-      "New Delivery Request Available",
-      `Admin assigned ${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} \u2192 ${delivery.destinationAddress}, ${delivery.destinationState}.`,
-      delivery.id
-    );
-    await broadcastWsEvent("notification:created", rNotif);
-    const updated = await getDeliveryById(delivery.id);
-    await broadcastWsEvent("delivery:updated", updated);
-    await dispatchWaitingDeliveries();
-    res.json({ delivery: updated });
-  }));
-  app.patch("/api/admin/deliveries/:id/status", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
-    const delivery = await getDeliveryById(req.params.id);
-    if (!delivery) {
-      res.status(404).json({ error: "Delivery not found." });
+      const updated = await getDeliveryById(delivery.id);
+      return { replacedOffers, cNotif, rNotif, updated };
+    });
+    if ("errorStatus" in outcome && outcome.errorStatus !== void 0) {
+      res.status(outcome.errorStatus).json(outcome.errorBody);
       return;
     }
+    for (const offer of outcome.replacedOffers) clearOfferTimer(offer.id);
+    if (outcome.cNotif) await broadcastWsEvent("notification:created", outcome.cNotif);
+    await broadcastWsEvent("notification:created", outcome.rNotif);
+    await broadcastWsEvent("delivery:updated", outcome.updated);
+    await dispatchWaitingDeliveries();
+    res.json({ delivery: outcome.updated });
+  }));
+  app.patch("/api/admin/deliveries/:id/status", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
     const allowed = [
       "pending_dispatch",
       "no_rider_available",
@@ -7324,86 +7491,98 @@ function registerSaqoRoutes(app, options) {
       res.status(400).json({ error: "Invalid delivery status." });
       return;
     }
-    if (["delivered", "cancelled"].includes(delivery.status)) {
-      res.status(409).json({ error: "A finalized parcel cannot be moved to another status." });
-      return;
-    }
     const requeue = nextStatus === "pending_dispatch" || nextStatus === "no_rider_available";
-    if (nextStatus === "assigned" || !requeue && nextStatus !== "cancelled" && !delivery.assignedRiderId) {
-      res.status(409).json({ error: "Use rider assignment before advancing the parcel." });
-      return;
-    }
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const note = typeof req.body?.note === "string" && req.body.note.trim() ? req.body.note.trim() : `SAQO Operations updated status to ${nextStatus.replace(/_/g, " ")}.`;
-    const wasDelivered = delivery.status === "delivered";
-    await db.prepare(`UPDATE delivery_requests
-      SET status = ?, updated_at = ?, assigned_rider_id = CASE WHEN ? = 1 THEN NULL ELSE assigned_rider_id END
-      WHERE id = ?`).run(
-      nextStatus,
-      now,
-      requeue ? 1 : 0,
-      delivery.id
-    );
-    if (requeue || nextStatus !== "cancelled") {
-      const replaced = await db.prepare(`
-        UPDATE delivery_assignments SET status = ?, responded_at = ?
-        WHERE delivery_id = ? AND (status = 'offered' OR (? = 1 AND status = 'accepted'))
-        RETURNING id
-      `).all(requeue ? "reassigned" : "accepted", now, delivery.id, requeue ? 1 : 0);
-      for (const assignment of replaced) clearOfferTimer(assignment.id);
-    }
-    await db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, ?, ?, 'admin', ?)
-    `).run(`hist-${crypto6.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
-    if (nextStatus === "delivered" && !wasDelivered) {
-      await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
-      if (delivery.assignedRiderId) {
-        const payment = await db.prepare("SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?").get(delivery.id);
-        await db.prepare(`
-          UPDATE riders
-          SET completed_deliveries_count = completed_deliveries_count + 1,
-              total_earnings_ngn = total_earnings_ngn + ?
-          WHERE id = ?
-        `).run(payment?.rider_payout_ngn || 0, delivery.assignedRiderId);
+    const outcome = await databaseTransaction(async () => {
+      const delivery = await getDeliveryById(req.params.id);
+      if (!delivery) {
+        return { errorStatus: 404, errorBody: { error: "Delivery not found." } };
       }
-    } else if (nextStatus === "cancelled") {
-      const offered = await db.prepare(`SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'`).all(delivery.id);
-      offered.forEach((asg) => clearOfferTimer(asg.id));
-      await db.prepare(
-        `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
-      ).run(now, delivery.id);
-      if (delivery.paymentMethod === "wallet" && delivery.paymentStatus === "paid") {
-        try {
-          await processAdminRefund({
-            deliveryId: delivery.id,
-            amountNgn: delivery.deliveryFeeNgn,
-            destination: "wallet",
-            reason: `Automatic wallet refund on admin delivery cancellation (${delivery.trackingCode})`,
-            adminId: req.auth.userId
-          });
-        } catch {
+      if (["delivered", "cancelled"].includes(delivery.status)) {
+        return { errorStatus: 409, errorBody: { error: "A finalized parcel cannot be moved to another status." } };
+      }
+      if (nextStatus === "assigned" || !requeue && nextStatus !== "cancelled" && !delivery.assignedRiderId) {
+        return { errorStatus: 409, errorBody: { error: "Use rider assignment before advancing the parcel." } };
+      }
+      const note = typeof req.body?.note === "string" && req.body.note.trim() ? req.body.note.trim() : `SAQO Operations updated status to ${nextStatus.replace(/_/g, " ")}.`;
+      const statusUpdate = await db.prepare(`UPDATE delivery_requests
+        SET status = ?, updated_at = ?, assigned_rider_id = CASE WHEN ? = 1 THEN NULL ELSE assigned_rider_id END
+        WHERE id = ? AND status = ? AND status NOT IN ('delivered', 'cancelled')`).run(
+        nextStatus,
+        now,
+        requeue ? 1 : 0,
+        delivery.id,
+        delivery.status
+      );
+      if (statusUpdate.changes === 0) {
+        return { errorStatus: 409, errorBody: { error: "Delivery status changed concurrently. Refresh and retry." } };
+      }
+      let clearedAssignmentIds = [];
+      if (requeue || nextStatus !== "cancelled") {
+        const replaced = await db.prepare(`
+          UPDATE delivery_assignments SET status = ?, responded_at = ?
+          WHERE delivery_id = ? AND (status = 'offered' OR (? = 1 AND status = 'accepted'))
+          RETURNING id
+        `).all(requeue ? "reassigned" : "accepted", now, delivery.id, requeue ? 1 : 0);
+        clearedAssignmentIds = replaced.map((a) => a.id);
+      }
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, ?, ?, 'admin', ?)
+      `).run(`hist-${crypto6.randomUUID().slice(0, 8)}`, delivery.id, nextStatus, note, now);
+      if (nextStatus === "delivered") {
+        await db.prepare(`UPDATE payments SET status = 'settled' WHERE delivery_id = ?`).run(delivery.id);
+        if (delivery.assignedRiderId) {
+          const payment = await db.prepare("SELECT rider_payout_ngn FROM payments WHERE delivery_id = ?").get(delivery.id);
+          await db.prepare(`
+            UPDATE riders
+            SET completed_deliveries_count = completed_deliveries_count + 1,
+                total_earnings_ngn = total_earnings_ngn + ?
+            WHERE id = ?
+          `).run(payment?.rider_payout_ngn || 0, delivery.assignedRiderId);
         }
-      } else if (delivery.paymentStatus !== "paid" && delivery.paymentStatus !== "collected_by_rider") {
-        await cancelDeliveryPayments(delivery.id, {
-          reason: `Delivery cancelled by operations (${delivery.trackingCode})`
-        });
+      } else if (nextStatus === "cancelled") {
+        const offered = await db.prepare(`SELECT id FROM delivery_assignments WHERE delivery_id = ? AND status = 'offered'`).all(delivery.id);
+        clearedAssignmentIds = clearedAssignmentIds.concat(offered.map((a) => a.id));
+        await db.prepare(
+          `UPDATE delivery_assignments SET status = 'reassigned', responded_at = ? WHERE delivery_id = ? AND status = 'offered'`
+        ).run(now, delivery.id);
+        if (delivery.paymentMethod === "wallet" && delivery.paymentStatus === "paid") {
+          try {
+            await processAdminRefund({
+              deliveryId: delivery.id,
+              amountNgn: delivery.deliveryFeeNgn,
+              destination: "wallet",
+              reason: `Automatic wallet refund on admin delivery cancellation (${delivery.trackingCode})`,
+              adminId: req.auth.userId
+            });
+          } catch {
+          }
+        } else if (delivery.paymentStatus !== "paid" && delivery.paymentStatus !== "collected_by_rider") {
+          await cancelDeliveryPayments(delivery.id, {
+            reason: `Delivery cancelled by operations (${delivery.trackingCode})`
+          });
+        }
       }
-    }
-    const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
-    if (custRow) {
-      const notif = await createNotification(
+      const custRow = await db.prepare("SELECT profile_id FROM customers WHERE id = ?").get(delivery.customerId);
+      const notif = custRow ? await createNotification(
         custRow.profile_id,
         `${delivery.trackingCode}: Status Updated`,
         note,
         delivery.id
-      );
-      await broadcastWsEvent("notification:created", notif);
+      ) : null;
+      const updated = { ...await getDeliveryById(delivery.id), history: await getDeliveryHistory(delivery.id) };
+      return { clearedAssignmentIds, notif, updated };
+    });
+    if ("errorStatus" in outcome && outcome.errorStatus !== void 0) {
+      res.status(outcome.errorStatus).json(outcome.errorBody);
+      return;
     }
-    const updated = { ...await getDeliveryById(delivery.id), history: await getDeliveryHistory(delivery.id) };
-    await broadcastWsEvent("delivery:updated", updated);
+    for (const assignmentId of outcome.clearedAssignmentIds) clearOfferTimer(assignmentId);
+    if (outcome.notif) await broadcastWsEvent("notification:created", outcome.notif);
+    await broadcastWsEvent("delivery:updated", outcome.updated);
     if (requeue || nextStatus === "delivered" || nextStatus === "cancelled") await dispatchWaitingDeliveries();
-    res.json({ delivery: updated });
+    res.json({ delivery: outcome.updated });
   }));
   app.post("/api/admin/riders", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
     const {
@@ -7783,21 +7962,21 @@ function registerSaqoRoutes(app, options) {
     await broadcastWsEvent("complaint:updated", { id: req.params.id, status });
     res.json({ complaints: await getAllComplaints() });
   }));
-  app.get("/api/support/presence", (_req, res) => {
-    res.set("Cache-Control", "no-store").json(getSupportPresence());
-  });
+  app.get("/api/support/presence", asyncRoute(async (_req, res) => {
+    res.set("Cache-Control", "no-store").json(await getSupportPresenceAsync());
+  }));
   app.get("/api/support/conversations", asyncRoute(async (req, res) => {
     const auth = await tryAuthenticate(req);
     const visitorToken = typeof req.query.visitorToken === "string" ? req.query.visitorToken.trim() : null;
     if (!auth && !visitorToken) {
-      res.json({ conversations: [], presence: getSupportPresence() });
+      res.json({ conversations: [], presence: await getSupportPresenceAsync() });
       return;
     }
     const conversations = await getSupportConversationsForVisitor({
       visitorToken,
       userId: auth?.userId || null
     });
-    res.json({ conversations, presence: getSupportPresence() });
+    res.json({ conversations, presence: await getSupportPresenceAsync() });
   }));
   app.post("/api/support/conversations", asyncRoute(async (req, res) => {
     const auth = await tryAuthenticate(req);
@@ -7841,7 +8020,7 @@ function registerSaqoRoutes(app, options) {
       conversation: created.conversation,
       message: created.message,
       messages: [created.message],
-      presence: getSupportPresence()
+      presence: await getSupportPresenceAsync()
     });
   }));
   app.get("/api/support/conversations/:id/messages", asyncRoute(async (req, res) => {
@@ -7861,7 +8040,7 @@ function registerSaqoRoutes(app, options) {
     res.json({
       conversation: updatedConv,
       messages: await getSupportMessages(conv.id),
-      presence: getSupportPresence()
+      presence: await getSupportPresenceAsync()
     });
   }));
   app.post("/api/support/conversations/:id/messages", asyncRoute(async (req, res) => {
@@ -7945,17 +8124,21 @@ function registerSaqoRoutes(app, options) {
     res.json(updated);
   }));
   app.get("/api/admin/support/conversations", authenticate, requireRole("admin"), asyncRoute(async (_req, res) => {
-    const accepting = isAdminChatAvailableFlag();
+    const [accepting, presence, conversations] = await Promise.all([
+      isAdminChatAvailableFlagAsync(),
+      getSupportPresenceAsync(),
+      getAllSupportConversations()
+    ]);
     res.json({
-      conversations: await getAllSupportConversations(),
-      presence: getSupportPresence(),
+      conversations,
+      presence,
       adminAcceptingChats: accepting
     });
   }));
   app.post("/api/admin/support/presence", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
     const available = Boolean(req.body?.available);
     const presence = await setAdminChatAvailability(available);
-    res.json({ presence, adminAcceptingChats: isAdminChatAvailableFlag() });
+    res.json({ presence, adminAcceptingChats: await isAdminChatAvailableFlagAsync() });
   }));
   app.get("/api/admin/support/conversations/:id/messages", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
     const conv = await getSupportConversationById(req.params.id);
