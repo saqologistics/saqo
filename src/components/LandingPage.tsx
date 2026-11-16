@@ -313,9 +313,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               onClick={() => setMobileMenuOpen((v) => !v)}
               aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
               aria-expanded={mobileMenuOpen}
-              className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 transition-colors cursor-pointer"
+              className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 active:scale-90 transition-all duration-200 cursor-pointer"
             >
-              {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+              {mobileMenuOpen ? (
+                <X className="w-5 h-5 transition-transform duration-200 rotate-0" />
+              ) : (
+                <Menu className="w-5 h-5 transition-transform duration-200 rotate-0" />
+              )}
             </button>
           </div>
         </div>

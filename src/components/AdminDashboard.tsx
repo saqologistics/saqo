@@ -988,9 +988,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               onClick={() => setMobileMoreOpen(true)}
               aria-label="Open admin navigation menu"
               aria-expanded={mobileMoreOpen}
-              className="lg:hidden p-2 rounded-xl text-black hover:bg-neutral-100 transition-colors cursor-pointer"
+              className="lg:hidden p-2 rounded-xl text-black hover:bg-neutral-100 active:scale-90 transition-all duration-200 cursor-pointer"
             >
-              <Menu className="w-5 h-5" />
+              <Menu
+                className={`w-5 h-5 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  mobileMoreOpen ? 'rotate-90 scale-90 opacity-60' : 'rotate-0 scale-100 opacity-100'
+                }`}
+              />
             </button>
           </div>
         </header>

@@ -545,7 +545,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
           <button
             type="button"
             onClick={() => setTab('active')}
-            className={`whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`whitespace-nowrap shrink-0 transition-all duration-200 cursor-pointer ${
               tab === 'active' ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight' : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
@@ -554,7 +554,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
           <button
             type="button"
             onClick={() => setTab('history')}
-            className={`whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`whitespace-nowrap shrink-0 transition-all duration-200 cursor-pointer ${
               tab === 'history' ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight' : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
             }`}
           >
@@ -563,7 +563,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
           <button
             type="button"
             onClick={() => setTab('notifications')}
-            className={`whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`whitespace-nowrap shrink-0 transition-all duration-200 cursor-pointer ${
               tab === 'notifications'
                 ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
                 : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
@@ -574,7 +574,7 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
           <button
             type="button"
             onClick={() => setTab('profile')}
-            className={`whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`whitespace-nowrap shrink-0 transition-all duration-200 cursor-pointer ${
               tab === 'profile'
                 ? 'bg-white text-black px-3.5 py-1.5 rounded-full font-display font-extrabold tracking-tight'
                 : 'text-neutral-300 hover:text-white hover:bg-white/10 px-3.5 py-1.5 rounded-full font-display font-bold tracking-tight'
@@ -650,9 +650,13 @@ export const RiderDashboard: React.FC<RiderDashboardProps> = ({
             onClick={() => setMobileMenuOpen(true)}
             aria-label="Open rider navigation menu"
             aria-expanded={mobileMenuOpen}
-            className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 transition-colors cursor-pointer"
+            className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 active:scale-90 transition-all duration-200 cursor-pointer"
           >
-            <Menu className="w-5 h-5" />
+            <Menu
+              className={`w-5 h-5 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                mobileMenuOpen ? 'rotate-90 scale-90 opacity-60' : 'rotate-0 scale-100 opacity-100'
+              }`}
+            />
           </button>
         </div>
       </header>
