@@ -109,6 +109,10 @@ export interface DeliveryRequest {
   assignedRiderVerified?: boolean;
   assignedRiderLat: number | null;
   assignedRiderLng: number | null;
+  assignedRiderRating?: number | null;
+  riderRating?: number | null;
+  riderRatingComment?: string | null;
+  ratedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -451,6 +455,7 @@ export interface LiveWsEvent {
     | 'settings:updated'
     | 'complaint:updated'
     | 'support:presence'
+    | 'support:refresh'
     | 'support:message'
     | 'support:conversation'
     | 'support:typing'

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getStoredToken } from '../lib/api';
-import { staticPreview } from '../lib/deployment';
+import { isSupabaseEdgeApi, realtimeUrl, staticPreview } from '../lib/deployment';
 import { subscribeSupabaseNotifications } from '../lib/supabaseRealtime';
 import type { LiveWsEvent } from '../shared/types';
 
@@ -43,10 +43,17 @@ function ensureSharedConnection() {
   if (staticPreview || typeof window === 'undefined') return;
 
   if (!unsubscribeSupabase) {
-    unsubscribeSupabase = subscribeSupabaseNotifications((evt) => {
-      if (evt.type === 'notifications:refresh' && !sharedConnected) dispatchEvent(evt);
-    });
+    unsubscribeSupabase = subscribeSupabaseNotifications(
+      (evt) => {
+        if (!sharedConnected || isSupabaseEdgeApi) dispatchEvent(evt);
+      },
+      (sbConnected) => {
+        if (isSupabaseEdgeApi) notifyConnection(sbConnected);
+      }
+    );
   }
+
+  if (isSupabaseEdgeApi) return;
 
   if (
     sharedWs &&
@@ -55,9 +62,7 @@ function ensureSharedConnection() {
     return;
   }
 
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/ws`;
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(realtimeUrl());
   sharedWs = ws;
 
   ws.onopen = () => {

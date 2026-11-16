@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { sendOpsAlert } from './opsAlerts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { db, createNotification, getDeliveryById, getProfileById } from './db';
+import { afterDatabaseCommit, deferDatabaseEffect, pool, databaseTransaction as withImmediateTransaction } from './database';
+export { databaseTransaction as withImmediateTransaction } from './database';
 import { broadcastWsEvent, dispatchWaitingDeliveries } from './dispatchEngine';
 import type {
   AdminPaymentsOverview,
@@ -47,6 +49,7 @@ class GatewayRefundRejected extends PaymentVerificationError {}
 
 let cachedSupabase: SupabaseClient | null = null;
 function getSupabaseAdminClient(): SupabaseClient | null {
+  if (pool) return null;
   if (cachedSupabase) return cachedSupabase;
   const url = process.env.VITE_SUPABASE_URL?.trim();
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
@@ -58,20 +61,18 @@ function getSupabaseAdminClient(): SupabaseClient | null {
 }
 
 function syncAsync(task: (sb: SupabaseClient) => Promise<unknown>): void {
-  if (afterCommit) {
-    afterCommit.push(() => syncAsync(task));
-    return;
-  }
-  const sb = getSupabaseAdminClient();
-  if (!sb) return;
-  void task(sb).catch(() => {
-    // Non-fatal mirror to Supabase so offline/unit-test SQLite runs keep working.
+  afterDatabaseCommit(() => {
+    const sb = getSupabaseAdminClient();
+    if (!sb) return;
+    void task(sb).catch(() => {
+      // Non-fatal mirror to Supabase so offline/unit-test SQLite runs keep working.
+    });
   });
 }
 
-function notifyUser(userId: string, title: string, message: string, deliveryId: string | null = null): void {
-  const notif = createNotification(userId, title, message, deliveryId);
-  broadcastWsEvent('notification:created', notif);
+async function notifyUser(userId: string, title: string, message: string, deliveryId: string | null = null): Promise<void> {
+  const notif = await createNotification(userId, title, message, deliveryId);
+  await broadcastWsEvent('notification:created', notif);
 }
 
 function roundCurrency(amount: number): number {
@@ -140,31 +141,6 @@ export function maskSecret(secret: string): string {
 
 function isMaskedPlaceholder(value: string | undefined | null): boolean {
   return Boolean(value && value.includes('••••'));
-}
-
-let afterCommit: Array<() => void> | null = null;
-
-export function withImmediateTransaction<T>(fn: () => T): T {
-  if (afterCommit) return fn();
-  const effects: Array<() => void> = [];
-  afterCommit = effects;
-  let result: T;
-  try {
-    db.exec('BEGIN IMMEDIATE');
-    result = fn();
-    db.exec('COMMIT');
-  } catch (error) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // Ignore rollback failure if already aborted
-    }
-    throw error;
-  } finally {
-    afterCommit = null;
-  }
-  for (const effect of effects) effect();
-  return result;
 }
 
 function parseJsonSafe(raw: string | null | undefined): Record<string, unknown> {
@@ -297,24 +273,24 @@ function mapRefundRow(row: any): RefundRecord {
   };
 }
 
-export function ensureWallet(userId: string): WalletAccount {
-  const existing = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId) as any;
+export async function ensureWallet(userId: string): Promise<WalletAccount> {
+  const existing = await db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId) as any;
   if (existing) return mapWalletRow(existing);
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     INSERT OR IGNORE INTO wallets (id, user_id, balance_ngn, locked_balance_ngn, currency, status, created_at, updated_at)
     VALUES (?, ?, 0, 0, 'NGN', 'active', ?, ?)
   `).run(id, userId, now, now);
 
-  const row = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId) as any;
+  const row = await db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId) as any;
   syncAsync((sb) => Promise.resolve(sb.rpc('saqo_ensure_wallet', { p_user_id: userId })));
   return mapWalletRow(row);
 }
 
-export function getPaymentMethods(): PaymentMethodConfig[] {
-  const rows = db
+export async function getPaymentMethods(): Promise<PaymentMethodConfig[]> {
+  const rows = await db
     .prepare('SELECT * FROM payment_methods ORDER BY sort_order ASC')
     .all() as any[];
   return rows.map((r) => ({
@@ -326,7 +302,7 @@ export function getPaymentMethods(): PaymentMethodConfig[] {
   }));
 }
 
-export function getDecryptedGatewaySecrets(): {
+export async function getDecryptedGatewaySecrets(): Promise<{
   publicKey: string;
   secretKey: string;
   encryptionKey: string;
@@ -334,8 +310,8 @@ export function getDecryptedGatewaySecrets(): {
   mode: 'test' | 'live';
   isEnabled: boolean;
   configured: boolean;
-} {
-  const row = db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
+}> {
+  const row = await db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
   const publicKey = (row?.public_key || process.env.FLUTTERWAVE_PUBLIC_KEY || '').trim();
   const secretKey =
     decryptSecret(row?.secret_key_encrypted || '') ||
@@ -359,10 +335,10 @@ export function getDecryptedGatewaySecrets(): {
   };
 }
 
-export function getGatewayPublicConfig(): PaymentGatewayPublicConfig {
-  const row = db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
-  const secrets = getDecryptedGatewaySecrets();
-  const methods = getPaymentMethods();
+export async function getGatewayPublicConfig(): Promise<PaymentGatewayPublicConfig> {
+  const row = await db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
+  const secrets = await getDecryptedGatewaySecrets();
+  const methods = await getPaymentMethods();
 
   return {
     provider: 'flutterwave',
@@ -381,9 +357,9 @@ export function getGatewayPublicConfig(): PaymentGatewayPublicConfig {
   };
 }
 
-export function getGatewayAdminView(baseOrigin = ''): PaymentGatewayAdminView {
-  const row = db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
-  const secrets = getDecryptedGatewaySecrets();
+export async function getGatewayAdminView(baseOrigin = ''): Promise<PaymentGatewayAdminView> {
+  const row = await db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
+  const secrets = await getDecryptedGatewaySecrets();
   const defaultWebhook = baseOrigin ? `${baseOrigin.replace(/\/$/, '')}/api/webhooks/flutterwave` : '/api/webhooks/flutterwave';
 
   return {
@@ -403,13 +379,13 @@ export function getGatewayAdminView(baseOrigin = ''): PaymentGatewayAdminView {
     bankAccountName: row?.bank_account_name || '',
     bankAccountNumber: row?.bank_account_number || '',
     bankInstructions: row?.bank_instructions || '',
-    methods: getPaymentMethods(),
+    methods: await getPaymentMethods(),
     updatedBy: row?.updated_by || null,
     updatedAt: row?.updated_at || new Date().toISOString(),
   };
 }
 
-export function updateGatewaySettings(
+export async function updateGatewaySettings(
   input: {
     publicKey?: string;
     secretKey?: string;
@@ -426,8 +402,8 @@ export function updateGatewaySettings(
   },
   adminId: string,
   baseOrigin = ''
-): PaymentGatewayAdminView {
-  const current = db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
+): Promise<PaymentGatewayAdminView> {
+  const current = await db.prepare("SELECT * FROM payment_gateway_settings WHERE id = 'default'").get() as any;
   const now = new Date().toISOString();
 
   const nextPublicKey =
@@ -476,8 +452,8 @@ export function updateGatewaySettings(
       ? input.bankInstructions.trim()
       : (current?.bank_instructions || '');
 
-  withImmediateTransaction(() => {
-    db.prepare(`
+  await withImmediateTransaction(async () => {
+    await db.prepare(`
       UPDATE payment_gateway_settings
       SET public_key = ?,
           secret_key_encrypted = ?,
@@ -514,7 +490,7 @@ export function updateGatewaySettings(
         'UPDATE payment_methods SET is_enabled = ?, updated_at = ? WHERE code = ?'
       );
       for (const m of input.methods) {
-        updateMethod.run(m.isEnabled ? 1 : 0, now, m.code);
+        await updateMethod.run(m.isEnabled ? 1 : 0, now, m.code);
       }
     }
   });
@@ -547,11 +523,11 @@ export function updateGatewaySettings(
     }
   });
 
-  broadcastWsEvent('gateway:updated', getGatewayPublicConfig());
-  return getGatewayAdminView(baseOrigin);
+  await broadcastWsEvent('gateway:updated', await getGatewayPublicConfig());
+  return await getGatewayAdminView(baseOrigin);
 }
 
-export function creditWalletAtomic(params: {
+export async function creditWalletAtomic(params: {
   userId: string;
   amountNgn: number;
   reference: string;
@@ -563,32 +539,32 @@ export function creditWalletAtomic(params: {
   actorUserId?: string | null;
   actorRole?: string | null;
   metadata?: Record<string, unknown>;
-}): { wallet: WalletAccount; transaction: WalletTransaction; alreadyProcessed: boolean } {
+}): Promise<{ wallet: WalletAccount; transaction: WalletTransaction; alreadyProcessed: boolean }> {
   const amount = roundCurrency(params.amountNgn);
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new Error('Wallet credit amount must be greater than zero.');
   }
 
-  const outcome = withImmediateTransaction(() => {
+  const outcome = await withImmediateTransaction(async () => {
     if (params.idempotencyKey) {
-      const existingByKey = db
+      const existingByKey = await db
         .prepare('SELECT * FROM wallet_transactions WHERE idempotency_key = ?')
         .get(params.idempotencyKey) as any;
       if (existingByKey) {
-        const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByKey.wallet_id) as any;
+        const w = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByKey.wallet_id) as any;
         return { wallet: mapWalletRow(w), transaction: mapWalletTxRow(existingByKey), alreadyProcessed: true };
       }
     }
 
-    const existingByRef = db
+    const existingByRef = await db
       .prepare('SELECT * FROM wallet_transactions WHERE reference = ?')
       .get(params.reference) as any;
     if (existingByRef) {
-      const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByRef.wallet_id) as any;
+      const w = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByRef.wallet_id) as any;
       return { wallet: mapWalletRow(w), transaction: mapWalletTxRow(existingByRef), alreadyProcessed: true };
     }
 
-    const wallet = ensureWallet(params.userId);
+    const wallet = await ensureWallet(params.userId);
     if (wallet.status !== 'active') {
       throw new Error(`Wallet is ${wallet.status} and cannot be credited.`);
     }
@@ -598,13 +574,13 @@ export function creditWalletAtomic(params: {
     const after = roundCurrency(before + amount);
     const txId = crypto.randomUUID();
 
-    db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
       after,
       now,
       wallet.id
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO wallet_transactions (
         id, wallet_id, user_id, type, category, amount_ngn,
         balance_before_ngn, balance_after_ngn, currency,
@@ -631,22 +607,22 @@ export function creditWalletAtomic(params: {
     );
 
     const updatedWallet = mapWalletRow(
-      db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet.id)
+      await db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet.id)
     );
     const insertedTx = mapWalletTxRow(
-      db.prepare('SELECT * FROM wallet_transactions WHERE id = ?').get(txId)
+      await db.prepare('SELECT * FROM wallet_transactions WHERE id = ?').get(txId)
     );
     return { wallet: updatedWallet, transaction: insertedTx, alreadyProcessed: false };
   });
 
-  const publish = () => {
-    notifyUser(
+  const publish = async () => {
+    await notifyUser(
       params.userId,
       'Wallet Credited',
       `₦${amount.toLocaleString()} credited (${params.reference}). New balance: ₦${outcome.wallet.balanceNgn.toLocaleString()}.`,
       params.deliveryId || null
     );
-    broadcastWsEvent('wallet:updated', {
+    await broadcastWsEvent('wallet:updated', {
       userId: params.userId,
       wallet: outcome.wallet,
       transaction: outcome.transaction,
@@ -670,14 +646,13 @@ export function creditWalletAtomic(params: {
     );
   };
   if (!outcome.alreadyProcessed) {
-    if (afterCommit) afterCommit.push(publish);
-    else publish();
+    if (!deferDatabaseEffect(() => void publish().catch(console.error))) await publish();
   }
 
   return outcome;
 }
 
-export function debitWalletAtomic(params: {
+export async function debitWalletAtomic(params: {
   userId: string;
   amountNgn: number;
   reference: string;
@@ -689,32 +664,32 @@ export function debitWalletAtomic(params: {
   actorUserId?: string | null;
   actorRole?: string | null;
   metadata?: Record<string, unknown>;
-}): { wallet: WalletAccount; transaction: WalletTransaction; alreadyProcessed: boolean } {
+}): Promise<{ wallet: WalletAccount; transaction: WalletTransaction; alreadyProcessed: boolean }> {
   const amount = roundCurrency(params.amountNgn);
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new Error('Wallet debit amount must be greater than zero.');
   }
 
-  const outcome = withImmediateTransaction(() => {
+  const outcome = await withImmediateTransaction(async () => {
     if (params.idempotencyKey) {
-      const existingByKey = db
+      const existingByKey = await db
         .prepare('SELECT * FROM wallet_transactions WHERE idempotency_key = ?')
         .get(params.idempotencyKey) as any;
       if (existingByKey) {
-        const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByKey.wallet_id) as any;
+        const w = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByKey.wallet_id) as any;
         return { wallet: mapWalletRow(w), transaction: mapWalletTxRow(existingByKey), alreadyProcessed: true };
       }
     }
 
-    const existingByRef = db
+    const existingByRef = await db
       .prepare('SELECT * FROM wallet_transactions WHERE reference = ?')
       .get(params.reference) as any;
     if (existingByRef) {
-      const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByRef.wallet_id) as any;
+      const w = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(existingByRef.wallet_id) as any;
       return { wallet: mapWalletRow(w), transaction: mapWalletTxRow(existingByRef), alreadyProcessed: true };
     }
 
-    const wallet = ensureWallet(params.userId);
+    const wallet = await ensureWallet(params.userId);
     if (wallet.status !== 'active') {
       throw new Error(`Wallet is ${wallet.status} and cannot be debited.`);
     }
@@ -728,13 +703,13 @@ export function debitWalletAtomic(params: {
     const after = roundCurrency(before - amount);
     const txId = crypto.randomUUID();
 
-    db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
       after,
       now,
       wallet.id
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO wallet_transactions (
         id, wallet_id, user_id, type, category, amount_ngn,
         balance_before_ngn, balance_after_ngn, currency,
@@ -761,49 +736,54 @@ export function debitWalletAtomic(params: {
     );
 
     const updatedWallet = mapWalletRow(
-      db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet.id)
+      await db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet.id)
     );
     const insertedTx = mapWalletTxRow(
-      db.prepare('SELECT * FROM wallet_transactions WHERE id = ?').get(txId)
+      await db.prepare('SELECT * FROM wallet_transactions WHERE id = ?').get(txId)
     );
     return { wallet: updatedWallet, transaction: insertedTx, alreadyProcessed: false };
   });
 
   if (!outcome.alreadyProcessed) {
-    notifyUser(
-      params.userId,
-      'Wallet Debited',
-      `₦${amount.toLocaleString()} debited (${params.description || params.reference}). Remaining balance: ₦${outcome.wallet.balanceNgn.toLocaleString()}.`,
-      params.deliveryId || null
-    );
-    broadcastWsEvent('wallet:updated', {
-      userId: params.userId,
-      wallet: outcome.wallet,
-      transaction: outcome.transaction,
-    });
-    syncAsync((sb) =>
-      Promise.resolve(
-        sb.rpc('saqo_debit_wallet', {
-          p_user_id: params.userId,
-          p_amount_ngn: amount,
-          p_reference: params.reference,
-          p_idempotency_key: params.idempotencyKey || null,
-          p_category: params.category || 'delivery_payment',
-          p_description: params.description || 'Delivery payment',
-          p_delivery_id: params.deliveryId || null,
-          p_payment_transaction_id: params.paymentTransactionId || null,
-          p_actor_user_id: params.actorUserId || params.userId,
-          p_actor_role: params.actorRole || 'client',
-          p_metadata: params.metadata || {},
-        })
-      )
-    );
+    const publish = async () => {
+      await notifyUser(
+        params.userId,
+        'Wallet Debited',
+        `₦${amount.toLocaleString()} debited (${params.description || params.reference}). Remaining balance: ₦${outcome.wallet.balanceNgn.toLocaleString()}.`,
+        params.deliveryId || null
+      );
+      await broadcastWsEvent('wallet:updated', {
+        userId: params.userId,
+        wallet: outcome.wallet,
+        transaction: outcome.transaction,
+      });
+      syncAsync((sb) =>
+        Promise.resolve(
+          sb.rpc('saqo_debit_wallet', {
+            p_user_id: params.userId,
+            p_amount_ngn: amount,
+            p_reference: params.reference,
+            p_idempotency_key: params.idempotencyKey || null,
+            p_category: params.category || 'delivery_payment',
+            p_description: params.description || 'Delivery payment',
+            p_delivery_id: params.deliveryId || null,
+            p_payment_transaction_id: params.paymentTransactionId || null,
+            p_actor_user_id: params.actorUserId || params.userId,
+            p_actor_role: params.actorRole || 'client',
+            p_metadata: params.metadata || {},
+          })
+        )
+      );
+    };
+    if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+      await publish();
+    }
   }
 
   return outcome;
 }
 
-export function adjustWalletAtomic(params: {
+export async function adjustWalletAtomic(params: {
   walletId: string;
   direction: 'credit' | 'debit';
   amountNgn: number;
@@ -811,7 +791,7 @@ export function adjustWalletAtomic(params: {
   actorId: string;
   actorName: string;
   idempotencyKey?: string | null;
-}): { wallet: WalletAccount; transaction: WalletTransaction; alreadyProcessed: boolean } {
+}): Promise<{ wallet: WalletAccount; transaction: WalletTransaction; alreadyProcessed: boolean }> {
   const cleanReason = (params.reason || '').trim();
   if (cleanReason.length < 3) {
     throw new Error('Mandatory reason (at least 3 characters) is required for wallet adjustments.');
@@ -822,18 +802,18 @@ export function adjustWalletAtomic(params: {
   }
 
   const reference = generateReference('ADJ');
-  const outcome = withImmediateTransaction(() => {
+  const outcome = await withImmediateTransaction(async () => {
     if (params.idempotencyKey) {
-      const existing = db
+      const existing = await db
         .prepare('SELECT * FROM wallet_transactions WHERE idempotency_key = ?')
         .get(params.idempotencyKey) as any;
       if (existing) {
-        const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(existing.wallet_id) as any;
+        const w = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(existing.wallet_id) as any;
         return { wallet: mapWalletRow(w), transaction: mapWalletTxRow(existing), alreadyProcessed: true };
       }
     }
 
-    const row = db.prepare('SELECT * FROM wallets WHERE id = ?').get(params.walletId) as any;
+    const row = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(params.walletId) as any;
     if (!row) {
       throw new Error('Wallet not found.');
     }
@@ -848,13 +828,13 @@ export function adjustWalletAtomic(params: {
     const now = new Date().toISOString();
     const txId = crypto.randomUUID();
 
-    db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
       after,
       now,
       row.id
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO wallet_transactions (
         id, wallet_id, user_id, type, category, amount_ngn,
         balance_before_ngn, balance_after_ngn, currency,
@@ -876,7 +856,7 @@ export function adjustWalletAtomic(params: {
       now
     );
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO wallet_audit_logs (
         id, wallet_id, user_id, action, amount_ngn, direction, reason, actor_id, actor_name, created_at
       ) VALUES (?, ?, ?, 'admin_wallet_adjustment', ?, ?, ?, ?, ?, ?)
@@ -892,21 +872,21 @@ export function adjustWalletAtomic(params: {
       now
     );
 
-    const updatedWallet = mapWalletRow(db.prepare('SELECT * FROM wallets WHERE id = ?').get(row.id));
+    const updatedWallet = mapWalletRow(await db.prepare('SELECT * FROM wallets WHERE id = ?').get(row.id));
     const insertedTx = mapWalletTxRow(
-      db.prepare('SELECT * FROM wallet_transactions WHERE id = ?').get(txId)
+      await db.prepare('SELECT * FROM wallet_transactions WHERE id = ?').get(txId)
     );
     return { wallet: updatedWallet, transaction: insertedTx, alreadyProcessed: false };
   });
 
   if (!outcome.alreadyProcessed) {
     const verb = params.direction === 'credit' ? 'credited with' : 'debited by';
-    notifyUser(
+    await notifyUser(
       outcome.wallet.userId,
       'Wallet Adjusted by Admin',
       `Your wallet was ${verb} ₦${amount.toLocaleString()}. Reason: ${cleanReason}. Balance: ₦${outcome.wallet.balanceNgn.toLocaleString()}.`
     );
-    broadcastWsEvent('wallet:updated', {
+    await broadcastWsEvent('wallet:updated', {
       userId: outcome.wallet.userId,
       wallet: outcome.wallet,
       transaction: outcome.transaction,
@@ -940,7 +920,7 @@ export async function initializeFlutterwaveCheckout(params: {
   description: string;
   meta: Record<string, unknown>;
 }): Promise<{ checkoutUrl: string }> {
-  const secrets = getDecryptedGatewaySecrets();
+  const secrets = await getDecryptedGatewaySecrets();
   if (!secrets.isEnabled || !secrets.secretKey) {
     throw new PaymentConfigError(
       'Flutterwave payment gateway is currently not enabled or configured by an administrator.'
@@ -997,7 +977,7 @@ export async function verifyFlutterwaveWithApi(params: {
   transactionId?: string | null;
   txRef?: string | null;
 }): Promise<FlutterwaveVerifiedData> {
-  const secrets = getDecryptedGatewaySecrets();
+  const secrets = await getDecryptedGatewaySecrets();
   if (!secrets.secretKey) {
     throw new PaymentConfigError('Flutterwave secret key is not configured.');
   }
@@ -1048,7 +1028,7 @@ export async function refundFlutterwaveWithApi(
   flwTxId: string,
   amountNgn: number
 ): Promise<{ providerRefundId: string; completed: boolean }> {
-  const secrets = getDecryptedGatewaySecrets();
+  const secrets = await getDecryptedGatewaySecrets();
   if (!secrets.secretKey) {
     throw new PaymentConfigError('Flutterwave secret key is not configured.');
   }
@@ -1087,7 +1067,7 @@ function isCompletedGatewayRefund(status: unknown): boolean {
 }
 
 export async function refreshFlutterwaveRefund(refundId: string): Promise<'pending' | 'completed' | 'failed'> {
-  const refund = db.prepare(`
+  const refund = await db.prepare(`
     SELECT * FROM refunds WHERE id = ? AND destination = 'flutterwave'
   `).get(refundId) as any;
   if (!refund) throw new PaymentVerificationError('Flutterwave refund not found.');
@@ -1095,7 +1075,7 @@ export async function refreshFlutterwaveRefund(refundId: string): Promise<'pendi
   if (!refund.provider_refund_id) {
     throw new PaymentVerificationError('Flutterwave did not return a refund ID. Check the gateway dashboard before retrying.');
   }
-  const { secretKey } = getDecryptedGatewaySecrets();
+  const { secretKey } = await getDecryptedGatewaySecrets();
   if (!secretKey) throw new PaymentConfigError('Flutterwave secret key is not configured.');
   const response = await fetch(`https://api.flutterwave.com/v3/refunds/${encodeURIComponent(refund.provider_refund_id)}`, {
     headers: { Authorization: `Bearer ${secretKey}` },
@@ -1114,20 +1094,20 @@ export async function refreshFlutterwaveRefund(refundId: string): Promise<'pendi
 
   const now = new Date().toISOString();
   let fullyRefunded = false;
-  const changed = withImmediateTransaction(() => {
-    const result = db.prepare("UPDATE refunds SET status = ?, processed_at = ? WHERE id = ? AND status = 'pending'")
+  const changed = await withImmediateTransaction(async () => {
+    const result = await db.prepare("UPDATE refunds SET status = ?, processed_at = ? WHERE id = ? AND status = 'pending'")
       .run(status, now, refundId);
     if (result.changes && status === 'completed') {
-      fullyRefunded = applyCompletedRefund(refund.payment_transaction_id, now);
+      fullyRefunded = await applyCompletedRefund(refund.payment_transaction_id, now);
     }
     return result.changes;
   });
   if (changed) {
-    notifyUser(refund.user_id, status === 'completed' ? 'Refund Completed' : 'Refund Failed',
+    await notifyUser(refund.user_id, status === 'completed' ? 'Refund Completed' : 'Refund Failed',
       `Flutterwave refund ${refund.reference} is ${status}.`, refund.delivery_id);
-    const tx = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(refund.payment_transaction_id);
-    if (tx) broadcastWsEvent('payment:updated', mapPaymentTxRow(tx));
-    if (refund.delivery_id) broadcastWsEvent('delivery:updated', getDeliveryById(refund.delivery_id));
+    const tx = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(refund.payment_transaction_id);
+    if (tx) await broadcastWsEvent('payment:updated', mapPaymentTxRow(tx));
+    if (refund.delivery_id) await broadcastWsEvent('delivery:updated', await getDeliveryById(refund.delivery_id));
     syncAsync(async (sb) => {
       await sb.from('refunds').update({ status, processed_at: now }).eq('id', refundId);
       if (fullyRefunded && tx) {
@@ -1141,10 +1121,10 @@ export async function refreshFlutterwaveRefund(refundId: string): Promise<'pendi
       }
     });
   }
-  return (db.prepare('SELECT status FROM refunds WHERE id = ?').get(refundId) as { status: typeof status }).status;
+  return (await db.prepare('SELECT status FROM refunds WHERE id = ?').get(refundId) as { status: typeof status }).status;
 }
 
-function insertPaymentTxRow(params: {
+async function insertPaymentTxRow(params: {
   id?: string;
   reference: string;
   idempotencyKey?: string | null;
@@ -1169,11 +1149,11 @@ function insertPaymentTxRow(params: {
   verifiedAt?: string | null;
   verifiedBy?: string | null;
   metadata?: Record<string, unknown>;
-}): PaymentTransaction {
+}): Promise<PaymentTransaction> {
   const id = params.id || crypto.randomUUID();
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO payment_transactions (
       id, reference, idempotency_key, provider_tx_id, provider_tx_ref,
       user_id, customer_name, customer_email, customer_phone,
@@ -1211,7 +1191,7 @@ function insertPaymentTxRow(params: {
     now
   );
 
-  const row = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id);
+  const row = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id);
   const mapped = mapPaymentTxRow(row);
   syncAsync((sb) =>
     Promise.resolve(
@@ -1251,10 +1231,24 @@ function insertPaymentTxRow(params: {
 
 const checkoutRequests = new Map<string, Promise<PaymentTransaction>>();
 
-export function reuseFlutterwaveCheckout(tx: PaymentTransaction): Promise<PaymentTransaction> {
-  const inFlight = checkoutRequests.get(tx.id);
-  if (inFlight) return inFlight;
-  if ((tx.status === 'pending' && tx.checkoutUrl) || tx.status === 'paid') return Promise.resolve(tx);
+export async function reuseFlutterwaveCheckout(tx: PaymentTransaction): Promise<PaymentTransaction> {
+  // A request on another Edge worker cannot see the in-memory promise.
+  const deadline = Date.now() + 4000;
+  while (true) {
+    const inFlight = checkoutRequests.get(tx.id);
+    if (inFlight) return inFlight;
+    if ((tx.status === 'pending' && tx.checkoutUrl) || tx.status === 'paid') return tx;
+    if (tx.status !== 'pending') break;
+    const age = Date.now() - Date.parse(tx.updatedAt);
+    if (!Number.isFinite(age) || age >= 30000) break;
+    if (Date.now() >= deadline) {
+      throw new PaymentVerificationError('Checkout is still being prepared. Retry this payment in a moment.');
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    const row = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id);
+    if (!row) break;
+    tx = mapPaymentTxRow(row);
+  }
   throw new PaymentVerificationError('This checkout has no usable link. Start a new payment attempt.');
 }
 
@@ -1269,7 +1263,7 @@ function publishCheckout(
     } catch (error) {
       const now = new Date().toISOString();
       const reason = error instanceof Error ? error.message : 'Gateway initialization error';
-      db.prepare(`
+      await db.prepare(`
         UPDATE payment_transactions SET status = 'failed', failure_reason = ?, updated_at = ?
         WHERE id = ? AND status = 'pending' AND checkout_url IS NULL
       `).run(reason, now, tx.id);
@@ -1277,11 +1271,11 @@ function publishCheckout(
       throw error;
     }
     const now = new Date().toISOString();
-    db.prepare(`
+    await db.prepare(`
       UPDATE payment_transactions SET checkout_url = ?, updated_at = ? WHERE id = ? AND status = 'pending'
     `).run(checkoutUrl, now, tx.id);
-    const updated = mapPaymentTxRow(db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id));
-    broadcastWsEvent('payment:updated', updated);
+    const updated = mapPaymentTxRow(await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id));
+    await broadcastWsEvent('payment:updated', updated);
     syncAsync(async (sb) => {
       await sb.from('payment_transactions')
         .update({ checkout_url: updated.checkoutUrl, updated_at: now }).eq('reference', tx.reference);
@@ -1309,35 +1303,38 @@ export async function initializeWalletFunding(params: {
     throw new Error('Minimum wallet funding amount is ₦100.');
   }
 
-  if (params.idempotencyKey) {
-    const existing = db
-      .prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
-      .get(params.idempotencyKey) as any;
-    if (existing) {
-      if (existing.user_id !== params.userId || existing.purpose !== 'wallet_funding' || existing.amount_ngn !== amount) {
-        throw new PaymentVerificationError('This payment request key belongs to a different operation.');
+  const reservation = await withImmediateTransaction(async () => {
+    if (params.idempotencyKey) {
+      const existing = await db.prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
+        .get(params.idempotencyKey);
+      if (existing) {
+        if (existing.user_id !== params.userId || existing.purpose !== 'wallet_funding' || existing.amount_ngn !== amount) {
+          throw new PaymentVerificationError('This payment request key belongs to a different operation.');
+        }
+        return { existing: mapPaymentTxRow(existing) } as const;
       }
-      return reuseFlutterwaveCheckout(mapPaymentTxRow(existing));
     }
-  }
-
-  const wallet = ensureWallet(params.userId);
-  const reference = generateReference('WLT');
-  const tx = insertPaymentTxRow({
-    reference,
-    idempotencyKey: params.idempotencyKey || null,
-    userId: params.userId,
-    customerName: params.customerName,
-    customerEmail: params.customerEmail,
-    customerPhone: params.customerPhone,
-    walletId: wallet.id,
-    purpose: 'wallet_funding',
-    paymentMethod: 'flutterwave',
-    provider: 'flutterwave',
-    amountNgn: amount,
-    status: 'pending',
-    metadata: { source: 'customer_wallet_funding' },
+    const wallet = await ensureWallet(params.userId);
+    const reference = generateReference('WLT');
+    const tx = await insertPaymentTxRow({
+      reference,
+      idempotencyKey: params.idempotencyKey || null,
+      userId: params.userId,
+      customerName: params.customerName,
+      customerEmail: params.customerEmail,
+      customerPhone: params.customerPhone,
+      walletId: wallet.id,
+      purpose: 'wallet_funding',
+      paymentMethod: 'flutterwave',
+      provider: 'flutterwave',
+      amountNgn: amount,
+      status: 'pending',
+      metadata: { source: 'customer_wallet_funding' },
+    });
+    return { tx, wallet, reference } as const;
   });
+  if (reservation.existing) return reuseFlutterwaveCheckout(reservation.existing);
+  const { tx, wallet, reference } = reservation;
 
   return publishCheckout(tx, {
     txRef: reference,
@@ -1365,84 +1362,90 @@ export async function initializeDeliveryFlutterwavePayment(params: {
   idempotencyKey?: string | null;
   redirectUrl: string;
 }): Promise<PaymentTransaction> {
-  const delivery = getDeliveryById(params.deliveryId);
-  if (!delivery) {
-    throw new Error('Delivery not found.');
-  }
-  const customer = db.prepare('SELECT id FROM customers WHERE profile_id = ?').get(params.userId) as { id: string } | undefined;
-  if (!customer || delivery.customerId !== customer.id) {
-    throw new PaymentVerificationError('You are not authorized to pay for this delivery.');
-  }
-  if (delivery.status === 'cancelled') {
-    throw new Error('Cannot initialize payment for a cancelled delivery.');
-  }
-  if (delivery.paymentStatus === 'paid') {
-    throw new Error('This delivery has already been paid.');
-  }
-  if (delivery.paymentStatus === 'collected_by_rider') {
-    throw new Error('Cash for this delivery has already been collected by the rider.');
-  }
-
-  if (params.idempotencyKey) {
-    const existing = db
-      .prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
-      .get(params.idempotencyKey) as any;
-    if (existing) {
-      if (existing.user_id !== params.userId || existing.delivery_id !== delivery.id || existing.provider !== 'flutterwave') {
-        throw new PaymentVerificationError('This payment request key belongs to a different operation.');
+  const reservation = await withImmediateTransaction(async () => {
+    const delivery = await getDeliveryById(params.deliveryId);
+    if (!delivery) {
+      throw new Error('Delivery not found.');
+    }
+    const customer = await db.prepare('SELECT id FROM customers WHERE profile_id = ?').get(params.userId) as { id: string } | undefined;
+    if (!customer || delivery.customerId !== customer.id) {
+      throw new PaymentVerificationError('You are not authorized to pay for this delivery.');
+    }
+    if (delivery.status === 'cancelled') {
+      throw new Error('Cannot initialize payment for a cancelled delivery.');
+    }
+    if (delivery.paymentStatus === 'paid') {
+      throw new Error('This delivery has already been paid.');
+    }
+    if (delivery.paymentStatus === 'collected_by_rider') {
+      throw new Error('Cash for this delivery has already been collected by the rider.');
+    }
+  
+    if (params.idempotencyKey) {
+      const existing = await db
+        .prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
+        .get(params.idempotencyKey) as any;
+      if (existing) {
+        if (existing.user_id !== params.userId || existing.delivery_id !== delivery.id || existing.provider !== 'flutterwave') {
+          throw new PaymentVerificationError('This payment request key belongs to a different operation.');
+        }
+        return { existing: mapPaymentTxRow(existing) } as const;
       }
-      return reuseFlutterwaveCheckout(mapPaymentTxRow(existing));
     }
-  }
-
-  const existingPending = db
-    .prepare(
-      "SELECT * FROM payment_transactions WHERE delivery_id = ? AND payment_method = 'flutterwave' AND status = 'pending' ORDER BY created_at DESC LIMIT 1"
-    )
-    .get(delivery.id) as any;
-  if (existingPending) {
-    if (existingPending.checkout_url || checkoutRequests.has(existingPending.id) ||
-      Date.now() - Date.parse(existingPending.updated_at) < 30000) {
-      return reuseFlutterwaveCheckout(mapPaymentTxRow(existingPending));
+  
+    const existingPending = await db
+      .prepare(
+        "SELECT * FROM payment_transactions WHERE delivery_id = ? AND payment_method = 'flutterwave' AND status = 'pending' ORDER BY created_at DESC LIMIT 1"
+      )
+      .get(delivery.id) as any;
+    if (existingPending) {
+      if (existingPending.checkout_url || checkoutRequests.has(existingPending.id) ||
+        Date.now() - Date.parse(existingPending.updated_at) < 30000) {
+        return { existing: mapPaymentTxRow(existingPending) } as const;
+      }
+      await db.prepare(`
+        UPDATE payment_transactions SET status = 'failed', failure_reason = 'Checkout initialization interrupted'
+        WHERE id = ? AND status = 'pending' AND checkout_url IS NULL
+      `).run(existingPending.id);
     }
-    db.prepare(`
-      UPDATE payment_transactions SET status = 'failed', failure_reason = 'Checkout initialization interrupted'
-      WHERE id = ? AND status = 'pending' AND checkout_url IS NULL
-    `).run(existingPending.id);
-  }
-
-  const wallet = ensureWallet(params.userId);
-  const reference = generateReference('PAY');
-  const tx = insertPaymentTxRow({
-    reference,
-    idempotencyKey: params.idempotencyKey || null,
-    userId: params.userId,
-    customerName: params.customerName,
-    customerEmail: params.customerEmail,
-    customerPhone: params.customerPhone,
-    walletId: wallet.id,
-    deliveryId: delivery.id,
-    trackingCode: delivery.trackingCode,
-    purpose: 'delivery_payment',
-    paymentMethod: 'flutterwave',
-    provider: 'flutterwave',
-    amountNgn: delivery.deliveryFeeNgn,
-    status: 'pending',
-    metadata: { trackingCode: delivery.trackingCode },
+  
+    const wallet = await ensureWallet(params.userId);
+    const reference = generateReference('PAY');
+    const tx = await insertPaymentTxRow({
+      reference,
+      idempotencyKey: params.idempotencyKey || null,
+      userId: params.userId,
+      customerName: params.customerName,
+      customerEmail: params.customerEmail,
+      customerPhone: params.customerPhone,
+      walletId: wallet.id,
+      deliveryId: delivery.id,
+      trackingCode: delivery.trackingCode,
+      purpose: 'delivery_payment',
+      paymentMethod: 'flutterwave',
+      provider: 'flutterwave',
+      amountNgn: delivery.deliveryFeeNgn,
+      status: 'pending',
+      metadata: { trackingCode: delivery.trackingCode },
+    });
+  
+    const methodUpdatedAt = new Date().toISOString();
+    await db.prepare(
+      "UPDATE delivery_requests SET payment_method = 'flutterwave', payment_status = 'pending', payment_reference = ?, updated_at = ? WHERE id = ?"
+    ).run(reference, methodUpdatedAt, delivery.id);
+    syncAsync((sb) =>
+      Promise.resolve(
+        sb
+          .from('delivery_requests')
+          .update({ payment_method: 'flutterwave', payment_status: 'pending', payment_reference: reference, updated_at: methodUpdatedAt })
+          .eq('id', delivery.id)
+      )
+    );
+  
+    return { tx, delivery, reference } as const;
   });
-
-  const methodUpdatedAt = new Date().toISOString();
-  db.prepare(
-    "UPDATE delivery_requests SET payment_method = 'flutterwave', payment_status = 'pending', payment_reference = ?, updated_at = ? WHERE id = ?"
-  ).run(reference, methodUpdatedAt, delivery.id);
-  syncAsync((sb) =>
-    Promise.resolve(
-      sb
-        .from('delivery_requests')
-        .update({ payment_method: 'flutterwave', payment_status: 'pending', payment_reference: reference, updated_at: methodUpdatedAt })
-        .eq('id', delivery.id)
-    )
-  );
+  if (reservation.existing) return reuseFlutterwaveCheckout(reservation.existing);
+  const { tx, delivery, reference } = reservation;
 
   return publishCheckout(tx, {
     txRef: reference,
@@ -1462,7 +1465,7 @@ export async function initializeDeliveryFlutterwavePayment(params: {
   });
 }
 
-export function createDeliveryPaymentRecords(params: {
+export async function createDeliveryPaymentRecords(params: {
   deliveryId: string;
   trackingCode: string;
   customerProfileId: string;
@@ -1474,18 +1477,18 @@ export function createDeliveryPaymentRecords(params: {
   idempotencyKey?: string | null;
   transferReference?: string | null;
   transferProofNote?: string | null;
-}): {
+}): Promise<{
   paymentStatus: DeliveryPaymentStatus;
   paymentReference: string;
   paymentTransaction: PaymentTransaction;
-} {
-  const wallet = ensureWallet(params.customerProfileId);
+}> {
+  const wallet = await ensureWallet(params.customerProfileId);
   const reference = generateReference('PAY');
   const now = new Date().toISOString();
 
   if (params.paymentMethod === 'wallet') {
     const paymentTxId = crypto.randomUUID();
-    const debit = debitWalletAtomic({
+    const debit = await debitWalletAtomic({
       userId: params.customerProfileId,
       amountNgn: params.amountNgn,
       reference: `WLT-${reference}`,
@@ -1499,7 +1502,7 @@ export function createDeliveryPaymentRecords(params: {
       metadata: { trackingCode: params.trackingCode },
     });
 
-    const tx = insertPaymentTxRow({
+    const tx = await insertPaymentTxRow({
       id: paymentTxId,
       reference,
       idempotencyKey: params.idempotencyKey || null,
@@ -1527,7 +1530,7 @@ export function createDeliveryPaymentRecords(params: {
     const initialStatus: DeliveryPaymentStatus =
       params.paymentMethod === 'bank_transfer' ? 'pending_verification' : 'pending';
 
-    const tx = insertPaymentTxRow({
+    const tx = await insertPaymentTxRow({
       reference,
       idempotencyKey: params.idempotencyKey || null,
       userId: params.customerProfileId,
@@ -1547,7 +1550,7 @@ export function createDeliveryPaymentRecords(params: {
     });
 
     const ccId = crypto.randomUUID();
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO cash_collections (
         id, delivery_id, tracking_code, payment_transaction_id,
         customer_id, payment_method, expected_amount_ngn, collected_amount_ngn,
@@ -1568,34 +1571,34 @@ export function createDeliveryPaymentRecords(params: {
       now
     );
 
-    syncAsync((sb) =>
-      Promise.resolve(
-        sb.from('cash_collections').upsert({
-          id: ccId,
-          delivery_id: params.deliveryId,
-          tracking_code: params.trackingCode,
-          payment_transaction_id: tx.id,
-          customer_id: params.customerProfileId,
-          payment_method: params.paymentMethod,
-          expected_amount_ngn: roundCurrency(params.amountNgn),
-          collected_amount_ngn: 0,
-          status: initialStatus,
-          transfer_reference: params.transferReference?.trim() || null,
-          transfer_proof_note: params.transferProofNote?.trim() || null,
-          created_at: now,
-          updated_at: now,
-        })
-      )
-    );
-
-    const publish = () => broadcastWsEvent('cash_collection:updated', { deliveryId: params.deliveryId, status: initialStatus });
-    if (afterCommit) afterCommit.push(publish);
-    else publish();
+    const publish = async () => {
+      syncAsync((sb) =>
+        Promise.resolve(
+          sb.from('cash_collections').upsert({
+            id: ccId,
+            delivery_id: params.deliveryId,
+            tracking_code: params.trackingCode,
+            payment_transaction_id: tx.id,
+            customer_id: params.customerProfileId,
+            payment_method: params.paymentMethod,
+            expected_amount_ngn: roundCurrency(params.amountNgn),
+            collected_amount_ngn: 0,
+            status: initialStatus,
+            transfer_reference: params.transferReference?.trim() || null,
+            transfer_proof_note: params.transferProofNote?.trim() || null,
+            created_at: now,
+            updated_at: now,
+          })
+        )
+      );
+      await broadcastWsEvent('cash_collection:updated', { deliveryId: params.deliveryId, status: initialStatus });
+    };
+    if (!deferDatabaseEffect(() => void publish().catch(console.error))) await publish();
     return { paymentStatus: initialStatus, paymentReference: reference, paymentTransaction: tx };
   }
 
   // Flutterwave direct payment starts as pending until verified server-side
-  const tx = insertPaymentTxRow({
+  const tx = await insertPaymentTxRow({
     reference,
     idempotencyKey: params.idempotencyKey || null,
     userId: params.customerProfileId,
@@ -1615,16 +1618,16 @@ export function createDeliveryPaymentRecords(params: {
   return { paymentStatus: 'pending', paymentReference: reference, paymentTransaction: tx };
 }
 
-export function settleVerifiedPaymentTransaction(params: {
+export async function settleVerifiedPaymentTransaction(params: {
   tx: PaymentTransaction;
   flw: FlutterwaveVerifiedData;
   verifiedBy: string;
-}): {
+}): Promise<{
   paymentTransaction: PaymentTransaction;
   wallet?: WalletAccount;
   walletTransaction?: WalletTransaction;
   alreadyProcessed: boolean;
-} {
+}> {
   if (params.tx.provider !== 'flutterwave' || !params.flw.flwTxId || params.flw.txRef !== params.tx.reference) {
     throw new PaymentVerificationError('Transaction reference mismatch during verification.');
   }
@@ -1648,10 +1651,10 @@ export function settleVerifiedPaymentTransaction(params: {
           ? 'reversed'
           : 'failed';
 
-    withImmediateTransaction(() => {
-      const current = db.prepare('SELECT status FROM payment_transactions WHERE id = ?').get(params.tx.id) as any;
+    await withImmediateTransaction(async () => {
+      const current = await db.prepare('SELECT status FROM payment_transactions WHERE id = ?').get(params.tx.id) as any;
       if (current && !['paid', 'refunded', 'reversed'].includes(current.status)) {
-        db.prepare(`
+        await db.prepare(`
           UPDATE payment_transactions
           SET status = ?, provider_tx_id = ?, provider_tx_ref = ?, failure_reason = ?, updated_at = ?
           WHERE id = ?
@@ -1665,7 +1668,7 @@ export function settleVerifiedPaymentTransaction(params: {
         );
 
         if (params.tx.deliveryId && mappedStatus !== 'pending') {
-          db.prepare(`
+          await db.prepare(`
             UPDATE delivery_requests SET payment_status = ?, updated_at = ?
             WHERE id = ? AND payment_reference = ? AND payment_status NOT IN ('paid','refunded','collected_by_rider')
           `).run(mappedStatus, now, params.tx.deliveryId, params.tx.reference);
@@ -1674,15 +1677,15 @@ export function settleVerifiedPaymentTransaction(params: {
     });
 
     const updated = mapPaymentTxRow(
-      db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id)
+      await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id)
     );
     if (updated.status === 'failed' || updated.status === 'reversed') {
       void sendOpsAlert('payment_failure', { reason: updated.status, reference: updated.reference });
     }
-    broadcastWsEvent('payment:updated', updated);
+    await broadcastWsEvent('payment:updated', updated);
     if (params.tx.deliveryId) {
-      const delivery = getDeliveryById(params.tx.deliveryId);
-      if (delivery) broadcastWsEvent('delivery:updated', delivery);
+      const delivery = await getDeliveryById(params.tx.deliveryId);
+      if (delivery) await broadcastWsEvent('delivery:updated', delivery);
     }
     syncAsync(async (sb) => {
       await sb
@@ -1707,22 +1710,22 @@ export function settleVerifiedPaymentTransaction(params: {
 
   let walletResult: { wallet: WalletAccount; transaction: WalletTransaction } | undefined;
   let appliedToDelivery = false;
-  const markedNow = withImmediateTransaction(() => {
-    const current = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id) as any;
+  const markedNow = await withImmediateTransaction(async () => {
+    const current = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id) as any;
     if (!current || ['paid', 'refunded', 'reversed'].includes(current.status)) return false;
 
-    const used = db.prepare(`
+    const used = await db.prepare(`
       SELECT id FROM payment_transactions WHERE provider = 'flutterwave' AND provider_tx_id = ? AND id <> ?
     `).get(params.flw.flwTxId, params.tx.id);
     if (used) throw new PaymentVerificationError('Flutterwave transaction was already recorded.');
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE payment_transactions SET status = 'paid', provider_tx_id = ?, provider_tx_ref = ?,
         verified_at = ?, verified_by = ?, failure_reason = NULL, updated_at = ? WHERE id = ?
     `).run(params.flw.flwTxId, params.flw.txRef, now, params.verifiedBy, now, params.tx.id);
 
     if (params.tx.purpose === 'wallet_funding') {
-      const credit = creditWalletAtomic({
+      const credit = await creditWalletAtomic({
         userId: params.tx.userId,
         amountNgn: params.tx.amountNgn,
         reference: `WLT-${params.tx.reference}`,
@@ -1740,7 +1743,7 @@ export function settleVerifiedPaymentTransaction(params: {
       });
       walletResult = { wallet: credit.wallet, transaction: credit.transaction };
     } else if (params.tx.deliveryId) {
-      const result = db.prepare(`
+      const result = await db.prepare(`
         UPDATE delivery_requests SET payment_status = 'paid', payment_method = 'flutterwave',
           payment_reference = ?, updated_at = ?
         WHERE id = ? AND status <> 'cancelled'
@@ -1749,7 +1752,7 @@ export function settleVerifiedPaymentTransaction(params: {
       `).run(params.tx.reference, now, params.tx.deliveryId, params.tx.reference);
       appliedToDelivery = result.changes === 1;
       if (appliedToDelivery) {
-        db.prepare("DELETE FROM cash_collections WHERE delivery_id = ? AND status IN ('pending','pending_verification','disputed')")
+        await db.prepare("DELETE FROM cash_collections WHERE delivery_id = ? AND status IN ('pending','pending_verification','disputed')")
           .run(params.tx.deliveryId);
       }
     }
@@ -1757,28 +1760,28 @@ export function settleVerifiedPaymentTransaction(params: {
   });
 
   if (!markedNow) {
-    const existing = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id);
+    const existing = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id);
     return { paymentTransaction: mapPaymentTxRow(existing), alreadyProcessed: true };
   }
 
   if (params.tx.purpose === 'delivery_payment' && params.tx.deliveryId) {
-    const delivery = getDeliveryById(params.tx.deliveryId);
+    const delivery = await getDeliveryById(params.tx.deliveryId);
     if (delivery) {
       if (appliedToDelivery && delivery.status === 'delivered') {
-        db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
+        await db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
           delivery.id
         );
       }
       if (!appliedToDelivery) {
-        notifyUser(
+        await notifyUser(
           params.tx.userId,
           'Payment Needs Refund',
           `Your payment of ₦${params.tx.amountNgn.toLocaleString()} for delivery ${delivery.trackingCode} (${params.tx.reference}) was confirmed. Please contact support or wait for admin refund.`,
           delivery.id
         );
-        const admins = db.prepare("SELECT id FROM profiles WHERE role = 'admin'").all() as Array<{ id: string }>;
+        const admins = await db.prepare("SELECT id FROM profiles WHERE role = 'admin'").all() as Array<{ id: string }>;
         for (const adm of admins) {
-          notifyUser(
+          await notifyUser(
             adm.id,
             'Flutterwave Payment Needs Refund',
             `Flutterwave payment ${params.tx.reference} (₦${params.tx.amountNgn.toLocaleString()}) could not be applied to ${delivery.trackingCode}.`,
@@ -1786,15 +1789,15 @@ export function settleVerifiedPaymentTransaction(params: {
           );
         }
       } else {
-        notifyUser(
+        await notifyUser(
           params.tx.userId,
           'Delivery Payment Confirmed',
           `Payment of ₦${params.tx.amountNgn.toLocaleString()} for ${delivery.trackingCode} was confirmed (${params.tx.reference}).`,
           delivery.id
         );
       }
-      broadcastWsEvent('delivery:updated', delivery);
-      if (appliedToDelivery) dispatchWaitingDeliveries();
+      await broadcastWsEvent('delivery:updated', delivery);
+      if (appliedToDelivery) await dispatchWaitingDeliveries();
     }
     if (appliedToDelivery) syncAsync(async (sb) => {
       await sb
@@ -1815,9 +1818,9 @@ export function settleVerifiedPaymentTransaction(params: {
   }
 
   const updatedTx = mapPaymentTxRow(
-    db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id)
+    await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(params.tx.id)
   );
-  broadcastWsEvent('payment:updated', updatedTx);
+  await broadcastWsEvent('payment:updated', updatedTx);
 
   syncAsync((sb) =>
     Promise.resolve(
@@ -1851,10 +1854,10 @@ export async function confirmFlutterwaveTransaction(params: {
 }) {
   let row: any = null;
   if (params.txRef) {
-    row = db.prepare('SELECT * FROM payment_transactions WHERE reference = ?').get(params.txRef.trim());
+    row = await db.prepare('SELECT * FROM payment_transactions WHERE reference = ?').get(params.txRef.trim());
   }
   if (!row && params.transactionId) {
-    row = db
+    row = await db
       .prepare('SELECT * FROM payment_transactions WHERE provider_tx_id = ?')
       .get(String(params.transactionId).trim());
   }
@@ -1868,13 +1871,13 @@ export async function confirmFlutterwaveTransaction(params: {
     throw new PaymentVerificationError('Flutterwave payment reference does not match.');
   }
   if (params.source === 'callback' && params.verifiedByUserId !== tx.userId) {
-    const actor = params.verifiedByUserId && getProfileById(params.verifiedByUserId);
+    const actor = params.verifiedByUserId && await getProfileById(params.verifiedByUserId);
     if (!actor || actor.role !== 'admin') {
       throw new PaymentVerificationError('You cannot verify another user transaction.');
     }
   }
   if (['paid', 'refunded', 'reversed'].includes(tx.status)) {
-    const wallet = ensureWallet(tx.userId);
+    const wallet = await ensureWallet(tx.userId);
     return { paymentTransaction: tx, wallet, alreadyProcessed: true };
   }
 
@@ -1886,18 +1889,18 @@ export async function confirmFlutterwaveTransaction(params: {
     throw new PaymentVerificationError('Flutterwave transaction ID does not match.');
   }
 
-  return settleVerifiedPaymentTransaction({
+  return await settleVerifiedPaymentTransaction({
     tx,
     flw,
     verifiedBy: params.verifiedByUserId || params.source,
   });
 }
 
-export function verifyFlutterwaveWebhookSignature(
+export async function verifyFlutterwaveWebhookSignature(
   headers: Record<string, string | string[] | undefined>,
   rawBody: string
-): boolean {
-  const secrets = getDecryptedGatewaySecrets();
+): Promise<boolean> {
+  const secrets = await getDecryptedGatewaySecrets();
   const configuredHash = secrets.webhookSecretHash;
   if (!configuredHash) return false;
 
@@ -1933,7 +1936,7 @@ export async function processFlutterwaveWebhook(params: {
   rawBody: string;
   payload: any;
 }): Promise<{ accepted: boolean; duplicate?: boolean; status: string; message?: string }> {
-  const validSig = verifyFlutterwaveWebhookSignature(params.headers, params.rawBody);
+  const validSig = await verifyFlutterwaveWebhookSignature(params.headers, params.rawBody);
   const eventType = String(params.payload?.event || 'unknown');
   const data = params.payload?.data || {};
   const txRef = data?.tx_ref ? String(data.tx_ref) : null;
@@ -1943,52 +1946,24 @@ export async function processFlutterwaveWebhook(params: {
   const now = new Date().toISOString();
 
   if (!validSig) {
-    const failedEventId = crypto.randomUUID();
-    db.prepare(`
-      INSERT OR IGNORE INTO payment_webhook_events (
-        id, provider, event_type, event_id, tx_ref, flw_tx_id,
-        idempotency_key, signature_valid, status, processing_error,
-        payload, received_at, processed_at
-      ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 0, 'failed', 'Invalid webhook signature', ?, ?, ?)
-    `).run(
-      failedEventId,
-      eventType,
-      flwTxId,
-      txRef,
-      flwTxId,
-      `${idempotencyKey}:invalidsig:${Date.now()}`,
-      JSON.stringify(params.payload || {}),
-      now,
-      now
-    );
     return { accepted: false, status: 'failed', message: 'Invalid webhook signature.' };
   }
 
-  const existing = db
-    .prepare('SELECT id, status FROM payment_webhook_events WHERE idempotency_key = ?')
-    .get(idempotencyKey) as any;
-  if (existing && (existing.status === 'processed' || existing.status === 'ignored')) {
+  await db.prepare(`
+    INSERT INTO payment_webhook_events (
+      id, provider, event_type, event_id, tx_ref, flw_tx_id,
+      idempotency_key, signature_valid, status, payload, received_at
+    ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 1, 'received', ?, ?)
+    ON CONFLICT (idempotency_key) DO NOTHING
+  `).run(crypto.randomUUID(), eventType, flwTxId, txRef, flwTxId, idempotencyKey,
+    JSON.stringify(params.payload || {}), now);
+  const existing = await db.prepare('SELECT id, status FROM payment_webhook_events WHERE idempotency_key = ?')
+    .get(idempotencyKey);
+  if (!existing) throw new Error('Webhook event could not be recorded.');
+  if (existing.status === 'processed' || existing.status === 'ignored') {
     return { accepted: true, duplicate: true, status: 'ignored', message: 'Duplicate webhook ignored.' };
   }
-
-  const webhookRowId = existing?.id || crypto.randomUUID();
-  if (!existing) {
-    db.prepare(`
-      INSERT INTO payment_webhook_events (
-        id, provider, event_type, event_id, tx_ref, flw_tx_id,
-        idempotency_key, signature_valid, status, payload, received_at
-      ) VALUES (?, 'flutterwave', ?, ?, ?, ?, ?, 1, 'received', ?, ?)
-    `).run(
-      webhookRowId,
-      eventType,
-      flwTxId,
-      txRef,
-      flwTxId,
-      idempotencyKey,
-      JSON.stringify(params.payload || {}),
-      now
-    );
-  }
+  const webhookRowId = existing.id as string;
 
   try {
     if ((eventType === 'charge.completed' || eventType === 'charge.failed') && (txRef || flwTxId)) {
@@ -1998,96 +1973,97 @@ export async function processFlutterwaveWebhook(params: {
         source: 'webhook',
       });
     } else if (eventType === 'charge.reversed' && (txRef || flwTxId)) {
-      const txRow = db.prepare(`
-        SELECT * FROM payment_transactions WHERE provider = 'flutterwave'
-          AND ((? IS NOT NULL AND reference = ?) OR (? IS NULL AND provider_tx_id = ?))
-      `).get(txRef, txRef, txRef, flwTxId) as any;
-      if (txRow?.provider_tx_id && flwTxId && txRow.provider_tx_id !== flwTxId) {
-        throw new PaymentVerificationError('Flutterwave reversal reference does not match.');
-      }
-      if (txRow && txRow.status !== 'reversed') {
+      const reversalNote = 'Payment reversed / chargeback reported by Flutterwave';
+      const reversal = await withImmediateTransaction(async () => {
+        const txRow = await db.prepare(txRef
+          ? "SELECT * FROM payment_transactions WHERE provider = 'flutterwave' AND reference = ?"
+          : "SELECT * FROM payment_transactions WHERE provider = 'flutterwave' AND provider_tx_id = ?"
+        ).get(txRef || flwTxId);
+        if (txRow?.provider_tx_id && flwTxId && txRow.provider_tx_id !== flwTxId) {
+          throw new PaymentVerificationError('Flutterwave reversal reference does not match.');
+        }
+        if (!txRow || txRow.status === 'reversed') return null;
         const wasPaid = txRow.status === 'paid';
         let walletFrozenOnReversal = false;
         let walletDebitedOnReversal = false;
-        const reversalNote = 'Payment reversed / chargeback reported by Flutterwave';
+        await db.prepare(
+          "UPDATE payment_transactions SET status = 'reversed', failure_reason = COALESCE(failure_reason, ?), updated_at = ? WHERE id = ?"
+        ).run(reversalNote, now, txRow.id);
 
-        withImmediateTransaction(() => {
-          db.prepare(
-            "UPDATE payment_transactions SET status = 'reversed', failure_reason = COALESCE(failure_reason, ?), updated_at = ? WHERE id = ?"
-          ).run(reversalNote, now, txRow.id);
+        if (txRow.delivery_id) {
+          await db.prepare("UPDATE delivery_requests SET payment_status = 'reversed', updated_at = ? WHERE id = ? AND payment_reference = ?").run(
+            now,
+            txRow.delivery_id,
+            txRow.reference
+          );
+        }
 
-          if (txRow.delivery_id) {
-            db.prepare("UPDATE delivery_requests SET payment_status = 'reversed', updated_at = ? WHERE id = ? AND payment_reference = ?").run(
-              now,
-              txRow.delivery_id,
-              txRow.reference
-            );
-          }
+        if (txRow.purpose === 'wallet_funding' && wasPaid) {
+          const wallet = await ensureWallet(txRow.user_id);
+          const revAmount = roundCurrency(txRow.amount_ngn);
+          const existingRev = await db
+            .prepare('SELECT id FROM wallet_transactions WHERE idempotency_key = ?')
+            .get(`flw-rev:${txRow.reference}`) as { id: string } | undefined;
 
-          if (txRow.purpose === 'wallet_funding' && wasPaid) {
-            const wallet = ensureWallet(txRow.user_id);
-            const revAmount = roundCurrency(txRow.amount_ngn);
-            const existingRev = db
-              .prepare('SELECT id FROM wallet_transactions WHERE idempotency_key = ?')
-              .get(`flw-rev:${txRow.reference}`) as { id: string } | undefined;
-
-            if (!existingRev && revAmount > 0) {
-              const before = roundCurrency(wallet.balanceNgn);
-              if (before >= revAmount) {
-                const after = roundCurrency(before - revAmount);
-                const revWtId = crypto.randomUUID();
-                db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
-                  after,
-                  now,
-                  wallet.id
-                );
-                db.prepare(`
-                  INSERT INTO wallet_transactions (
-                    id, wallet_id, user_id, type, category, amount_ngn,
-                    balance_before_ngn, balance_after_ngn, currency,
-                    reference, idempotency_key, payment_transaction_id,
-                    status, description, actor_user_id, actor_role, metadata, created_at
-                  ) VALUES (?, ?, ?, 'debit', 'reversal', ?, ?, ?, 'NGN', ?, ?, ?, 'completed', ?, 'system', 'system', ?, ?)
-                `).run(
-                  revWtId,
-                  wallet.id,
-                  txRow.user_id,
-                  revAmount,
-                  before,
-                  after,
-                  `REV-${txRow.reference}`,
-                  `flw-rev:${txRow.reference}`,
-                  txRow.id,
-                  `Flutterwave chargeback / reversal (${txRow.reference})`,
-                  JSON.stringify({ flwTxId, txRef: txRow.reference }),
-                  now
-                );
-                walletDebitedOnReversal = true;
-              } else {
-                db.prepare("UPDATE wallets SET status = 'frozen', updated_at = ? WHERE id = ?").run(
-                  now,
-                  wallet.id
-                );
-                walletFrozenOnReversal = true;
-              }
+          if (!existingRev && revAmount > 0) {
+            const before = roundCurrency(wallet.balanceNgn);
+            if (before >= revAmount) {
+              const after = roundCurrency(before - revAmount);
+              const revWtId = crypto.randomUUID();
+              await db.prepare('UPDATE wallets SET balance_ngn = ?, updated_at = ? WHERE id = ?').run(
+                after,
+                now,
+                wallet.id
+              );
+              await db.prepare(`
+                INSERT INTO wallet_transactions (
+                  id, wallet_id, user_id, type, category, amount_ngn,
+                  balance_before_ngn, balance_after_ngn, currency,
+                  reference, idempotency_key, payment_transaction_id,
+                  status, description, actor_user_id, actor_role, metadata, created_at
+                ) VALUES (?, ?, ?, 'debit', 'reversal', ?, ?, ?, 'NGN', ?, ?, ?, 'completed', ?, 'system', 'system', ?, ?)
+              `).run(
+                revWtId,
+                wallet.id,
+                txRow.user_id,
+                revAmount,
+                before,
+                after,
+                `REV-${txRow.reference}`,
+                `flw-rev:${txRow.reference}`,
+                txRow.id,
+                `Flutterwave chargeback / reversal (${txRow.reference})`,
+                JSON.stringify({ flwTxId, txRef: txRow.reference }),
+                now
+              );
+              walletDebitedOnReversal = true;
+            } else {
+              await db.prepare("UPDATE wallets SET status = 'frozen', updated_at = ? WHERE id = ?").run(
+                now,
+                wallet.id
+              );
+              walletFrozenOnReversal = true;
             }
           }
-        });
-
+        }
+        return { txRow, walletDebitedOnReversal, walletFrozenOnReversal };
+      });
+      if (reversal) {
+        const { txRow, walletDebitedOnReversal, walletFrozenOnReversal } = reversal;
         const updatedTx = mapPaymentTxRow(
-          db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(txRow.id)
+          await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(txRow.id)
         );
-        broadcastWsEvent('payment:updated', updatedTx);
+        await broadcastWsEvent('payment:updated', updatedTx);
         if (txRow.delivery_id) {
-          const updatedDelivery = getDeliveryById(txRow.delivery_id);
-          if (updatedDelivery) broadcastWsEvent('delivery:updated', updatedDelivery);
+          const updatedDelivery = await getDeliveryById(txRow.delivery_id);
+          if (updatedDelivery) await broadcastWsEvent('delivery:updated', updatedDelivery);
         }
 
         if (walletDebitedOnReversal || walletFrozenOnReversal) {
-          const refreshedWallet = ensureWallet(txRow.user_id);
-          broadcastWsEvent('wallet:updated', { userId: txRow.user_id, wallet: refreshedWallet });
+          const refreshedWallet = await ensureWallet(txRow.user_id);
+          await broadcastWsEvent('wallet:updated', { userId: txRow.user_id, wallet: refreshedWallet });
           if (walletDebitedOnReversal) {
-            notifyUser(
+            await notifyUser(
               txRow.user_id,
               'Wallet Funding Reversed',
               `₦${roundCurrency(txRow.amount_ngn).toLocaleString()} from transaction ${txRow.reference} was reversed due to a chargeback. Updated balance: ₦${refreshedWallet.balanceNgn.toLocaleString()}.`
@@ -2110,14 +2086,14 @@ export async function processFlutterwaveWebhook(params: {
               )
             );
           } else {
-            notifyUser(
+            await notifyUser(
               txRow.user_id,
               'Wallet Frozen Due to Chargeback',
               `A funding payment (${txRow.reference}) of ₦${roundCurrency(txRow.amount_ngn).toLocaleString()} was reversed, and your wallet has been temporarily frozen pending support review.`
             );
-            const admins = db.prepare("SELECT id FROM profiles WHERE role = 'admin'").all() as Array<{ id: string }>;
+            const admins = await db.prepare("SELECT id FROM profiles WHERE role = 'admin'").all() as Array<{ id: string }>;
             for (const adm of admins) {
-              notifyUser(
+              await notifyUser(
                 adm.id,
                 'Chargeback Alert: Wallet Frozen',
                 `Transaction ${txRow.reference} (₦${roundCurrency(txRow.amount_ngn).toLocaleString()}) reversed with insufficient balance; wallet ${refreshedWallet.id} frozen.`
@@ -2130,7 +2106,7 @@ export async function processFlutterwaveWebhook(params: {
             );
           }
         } else if (txRow.delivery_id) {
-          notifyUser(
+          await notifyUser(
             txRow.user_id,
             'Delivery Payment Reversed',
             `Payment ${txRow.reference} for ${txRow.tracking_code || 'your delivery'} was reversed by the payment provider.`,
@@ -2158,7 +2134,7 @@ export async function processFlutterwaveWebhook(params: {
     }
 
     const doneAt = new Date().toISOString();
-    db.prepare("UPDATE payment_webhook_events SET status = 'processed', processing_error = NULL, processed_at = ? WHERE id = ?").run(
+    await db.prepare("UPDATE payment_webhook_events SET status = 'processed', processing_error = NULL, processed_at = ? WHERE id = ?").run(
       doneAt,
       webhookRowId
     );
@@ -2184,20 +2160,20 @@ export async function processFlutterwaveWebhook(params: {
     return { accepted: true, status: 'processed' };
   } catch (err: any) {
     const doneAt = new Date().toISOString();
-    db.prepare(
+    await db.prepare(
       "UPDATE payment_webhook_events SET status = 'failed', processing_error = ?, processed_at = ? WHERE id = ? AND status <> 'processed'"
     ).run(err?.message || 'Webhook processing error', doneAt, webhookRowId);
     return { accepted: true, status: 'failed', message: err?.message };
   }
 }
 
-export function confirmRiderCashCollection(params: {
+export async function confirmRiderCashCollection(params: {
   deliveryId: string;
   riderId: string;
   collectedAmountNgn?: number;
   notes?: string;
 }) {
-  const delivery = getDeliveryById(params.deliveryId);
+  const delivery = await getDeliveryById(params.deliveryId);
   if (!delivery) {
     throw new Error('Delivery not found.');
   }
@@ -2221,10 +2197,10 @@ export function confirmRiderCashCollection(params: {
   const amount = roundCurrency(params.collectedAmountNgn ?? delivery.deliveryFeeNgn);
   const cleanNote = params.notes?.trim() || '';
 
-  withImmediateTransaction(() => {
-    const cc = db.prepare('SELECT * FROM cash_collections WHERE delivery_id = ?').get(delivery.id) as any;
+  await withImmediateTransaction(async () => {
+    const cc = await db.prepare('SELECT * FROM cash_collections WHERE delivery_id = ?').get(delivery.id) as any;
     if (cc) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE cash_collections
         SET rider_id = ?,
             collected_amount_ngn = ?,
@@ -2244,29 +2220,29 @@ export function confirmRiderCashCollection(params: {
       );
     }
 
-    db.prepare(
+    await db.prepare(
       "UPDATE delivery_requests SET payment_status = 'collected_by_rider', updated_at = ? WHERE id = ?"
     ).run(now, delivery.id);
 
-    db.prepare(
+    await db.prepare(
       "UPDATE payment_transactions SET status = 'collected_by_rider', updated_at = ? WHERE delivery_id = ? AND payment_method = 'cash'"
     ).run(now, delivery.id);
   });
 
-  const updatedDelivery = getDeliveryById(delivery.id)!;
-  const customerRow = db
+  const updatedDelivery = (await getDeliveryById(delivery.id))!;
+  const customerRow = await db
     .prepare('SELECT profile_id FROM customers WHERE id = ?')
     .get(delivery.customerId) as { profile_id: string } | undefined;
   if (customerRow) {
-    notifyUser(
+    await notifyUser(
       customerRow.profile_id,
       'Cash Payment Collected',
       `Rider confirmed cash collection of ₦${amount.toLocaleString()} for ${delivery.trackingCode}.`,
       delivery.id
     );
   }
-  broadcastWsEvent('delivery:updated', updatedDelivery);
-  broadcastWsEvent('cash_collection:updated', {
+  await broadcastWsEvent('delivery:updated', updatedDelivery);
+  await broadcastWsEvent('cash_collection:updated', {
     deliveryId: delivery.id,
     status: 'collected_by_rider',
   });
@@ -2293,8 +2269,8 @@ export function confirmRiderCashCollection(params: {
   return updatedDelivery;
 }
 
-function requireNoPendingFlutterwaveCheckout(deliveryId: string): void {
-  const pending = db.prepare(`
+async function requireNoPendingFlutterwaveCheckout(deliveryId: string): Promise<void> {
+  const pending = await db.prepare(`
     SELECT 1 FROM payment_transactions
     WHERE delivery_id = ? AND provider = 'flutterwave' AND status = 'pending'
   `).get(deliveryId);
@@ -2303,15 +2279,15 @@ function requireNoPendingFlutterwaveCheckout(deliveryId: string): void {
   }
 }
 
-export function submitBankTransferProof(params: {
+export async function submitBankTransferProof(params: {
   deliveryId: string;
   userId: string;
   transferReference: string;
   transferProofNote?: string;
 }) {
-  const delivery = getDeliveryById(params.deliveryId);
+  const delivery = await getDeliveryById(params.deliveryId);
   if (!delivery) throw new Error('Delivery not found.');
-  const customerRow = db
+  const customerRow = await db
     .prepare('SELECT id FROM customers WHERE profile_id = ?')
     .get(params.userId) as { id: string } | undefined;
   if (!customerRow || delivery.customerId !== customerRow.id) {
@@ -2320,7 +2296,7 @@ export function submitBankTransferProof(params: {
   if (delivery.status === 'cancelled') {
     throw new Error('Cannot submit bank transfer proof for a cancelled delivery.');
   }
-  requireNoPendingFlutterwaveCheckout(delivery.id);
+  await requireNoPendingFlutterwaveCheckout(delivery.id);
   if (delivery.paymentStatus === 'paid') {
     throw new Error('This delivery has already been paid.');
   }
@@ -2335,18 +2311,18 @@ export function submitBankTransferProof(params: {
   let syncedTxId = '';
   let syncedCcId = '';
 
-  withImmediateTransaction(() => {
-    db.prepare(
+  await withImmediateTransaction(async () => {
+    await db.prepare(
       "UPDATE delivery_requests SET payment_method = 'bank_transfer', payment_status = 'pending_verification', payment_reference = ?, updated_at = ? WHERE id = ?"
     ).run(ref, now, delivery.id);
 
-    const existingTx = db
+    const existingTx = await db
       .prepare("SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' ORDER BY created_at DESC LIMIT 1")
       .get(delivery.id) as any;
 
     let txId = existingTx?.id;
     if (existingTx) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE payment_transactions
         SET payment_method = 'bank_transfer',
             provider = 'bank_transfer',
@@ -2357,7 +2333,7 @@ export function submitBankTransferProof(params: {
         WHERE id = ?
       `).run(ref, proofNote, now, existingTx.id);
     } else {
-      const tx = insertPaymentTxRow({
+      const tx = await insertPaymentTxRow({
         reference: generateReference('BNK'),
         userId: params.userId,
         customerName: delivery.customerName,
@@ -2376,12 +2352,12 @@ export function submitBankTransferProof(params: {
     }
     syncedTxId = txId;
 
-    const existingCc = db
+    const existingCc = await db
       .prepare('SELECT id FROM cash_collections WHERE delivery_id = ?')
       .get(delivery.id) as any;
     if (existingCc) {
       syncedCcId = existingCc.id;
-      db.prepare(`
+      await db.prepare(`
         UPDATE cash_collections
         SET payment_method = 'bank_transfer',
             status = 'pending_verification',
@@ -2392,7 +2368,7 @@ export function submitBankTransferProof(params: {
       `).run(ref, proofNote, now, existingCc.id);
     } else {
       syncedCcId = crypto.randomUUID();
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO cash_collections (
           id, delivery_id, tracking_code, payment_transaction_id, customer_id,
           payment_method, expected_amount_ngn, collected_amount_ngn,
@@ -2413,13 +2389,13 @@ export function submitBankTransferProof(params: {
     }
   });
 
-  const updated = getDeliveryById(delivery.id)!;
-  const refreshedTx = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(syncedTxId);
+  const updated = (await getDeliveryById(delivery.id))!;
+  const refreshedTx = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(syncedTxId);
   if (refreshedTx) {
-    broadcastWsEvent('payment:updated', mapPaymentTxRow(refreshedTx));
+    await broadcastWsEvent('payment:updated', mapPaymentTxRow(refreshedTx));
   }
-  broadcastWsEvent('delivery:updated', updated);
-  broadcastWsEvent('cash_collection:updated', {
+  await broadcastWsEvent('delivery:updated', updated);
+  await broadcastWsEvent('cash_collection:updated', {
     deliveryId: delivery.id,
     status: 'pending_verification',
   });
@@ -2466,14 +2442,14 @@ export function submitBankTransferProof(params: {
   return updated;
 }
 
-export function reconcileCashOrBankCollection(params: {
+export async function reconcileCashOrBankCollection(params: {
   collectionId: string;
   action: 'reconcile' | 'dispute';
   adminId: string;
   collectedAmountNgn?: number;
   notes?: string;
-}): CashCollectionRecord {
-  const row = db.prepare('SELECT * FROM cash_collections WHERE id = ?').get(params.collectionId) as any;
+}): Promise<CashCollectionRecord> {
+  const row = await db.prepare('SELECT * FROM cash_collections WHERE id = ?').get(params.collectionId) as any;
   if (!row) throw new Error('Collection record not found.');
   if (row.status === 'reconciled' && params.action === 'reconcile') {
     throw new Error('Collection record is already reconciled.');
@@ -2489,8 +2465,8 @@ export function reconcileCashOrBankCollection(params: {
       : roundCurrency(row.collected_amount_ngn);
   const cleanNotes = params.notes?.trim() || '';
 
-  withImmediateTransaction(() => {
-    db.prepare(`
+  await withImmediateTransaction(async () => {
+    await db.prepare(`
       UPDATE cash_collections
       SET status = ?,
           collected_amount_ngn = ?,
@@ -2510,39 +2486,39 @@ export function reconcileCashOrBankCollection(params: {
       row.id
     );
 
-    db.prepare('UPDATE delivery_requests SET payment_status = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE delivery_requests SET payment_status = ?, updated_at = ? WHERE id = ?').run(
       nextDeliveryPaymentStatus,
       now,
       row.delivery_id
     );
 
     if (row.payment_transaction_id) {
-      db.prepare(
+      await db.prepare(
         'UPDATE payment_transactions SET status = ?, verified_by = ?, verified_at = ?, updated_at = ? WHERE id = ?'
       ).run(nextDeliveryPaymentStatus, params.adminId, now, now, row.payment_transaction_id);
     }
 
     if (params.action === 'reconcile') {
-      const delivery = getDeliveryById(row.delivery_id);
+      const delivery = await getDeliveryById(row.delivery_id);
       if (delivery?.status === 'delivered') {
-        db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
+        await db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
           row.delivery_id
         );
       }
     }
   });
 
-  const updatedDelivery = getDeliveryById(row.delivery_id);
+  const updatedDelivery = await getDeliveryById(row.delivery_id);
   if (updatedDelivery) {
-    broadcastWsEvent('delivery:updated', updatedDelivery);
+    await broadcastWsEvent('delivery:updated', updatedDelivery);
   }
   if (row.payment_transaction_id) {
-    const updatedTx = db
+    const updatedTx = await db
       .prepare('SELECT * FROM payment_transactions WHERE id = ?')
       .get(row.payment_transaction_id);
-    if (updatedTx) broadcastWsEvent('payment:updated', mapPaymentTxRow(updatedTx));
+    if (updatedTx) await broadcastWsEvent('payment:updated', mapPaymentTxRow(updatedTx));
   }
-  notifyUser(
+  await notifyUser(
     row.customer_id,
     params.action === 'reconcile' ? 'Payment Verified & Reconciled' : 'Payment Verification Issue',
     params.action === 'reconcile'
@@ -2550,7 +2526,7 @@ export function reconcileCashOrBankCollection(params: {
       : `There is a verification dispute on your payment for ${row.tracking_code}. ${cleanNotes}`,
     row.delivery_id
   );
-  broadcastWsEvent('cash_collection:updated', { id: row.id, status: nextStatus });
+  await broadcastWsEvent('cash_collection:updated', { id: row.id, status: nextStatus });
 
   syncAsync(async (sb) => {
     const ccUpdate: Record<string, unknown> = {
@@ -2579,7 +2555,7 @@ export function reconcileCashOrBankCollection(params: {
     }
   });
 
-  const refreshed = db.prepare(`
+  const refreshed = await db.prepare(`
     SELECT cc.*, cp.full_name as customer_name, cp.phone as customer_phone, rp.full_name as rider_name
     FROM cash_collections cc
     LEFT JOIN profiles cp ON cp.id = cc.customer_id
@@ -2591,20 +2567,20 @@ export function reconcileCashOrBankCollection(params: {
   return mapCashCollectionRow(refreshed);
 }
 
-function applyCompletedRefund(paymentId: string, now: string): boolean {
-  const payment = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(paymentId) as any;
-  const completed = db.prepare(`
+async function applyCompletedRefund(paymentId: string, now: string): Promise<boolean> {
+  const payment = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(paymentId) as any;
+  const completed = await db.prepare(`
     SELECT COALESCE(SUM(amount_ngn), 0) AS total FROM refunds
     WHERE payment_transaction_id = ? AND status = 'completed'
   `).get(paymentId) as { total: number };
   if (!payment || roundCurrency(completed.total) < roundCurrency(payment.amount_ngn)) return false;
 
-  db.prepare("UPDATE payment_transactions SET status = 'refunded', updated_at = ? WHERE id = ?")
+  await db.prepare("UPDATE payment_transactions SET status = 'refunded', updated_at = ? WHERE id = ?")
     .run(now, paymentId);
-  if (payment.delivery_id && getDeliveryById(payment.delivery_id)?.paymentReference === payment.reference) {
-    db.prepare("UPDATE delivery_requests SET payment_status = 'refunded', updated_at = ? WHERE id = ?")
+  if (payment.delivery_id && (await getDeliveryById(payment.delivery_id))?.paymentReference === payment.reference) {
+    await db.prepare("UPDATE delivery_requests SET payment_status = 'refunded', updated_at = ? WHERE id = ?")
       .run(now, payment.delivery_id);
-    db.prepare("UPDATE payments SET status = 'refunded' WHERE delivery_id = ?").run(payment.delivery_id);
+    await db.prepare("UPDATE payments SET status = 'refunded' WHERE delivery_id = ?").run(payment.delivery_id);
   }
   return true;
 }
@@ -2624,11 +2600,11 @@ export async function processAdminRefund(params: {
 
   let txRow: any = null;
   if (params.paymentTransactionId) {
-    txRow = db
+    txRow = await db
       .prepare('SELECT * FROM payment_transactions WHERE id = ?')
       .get(params.paymentTransactionId);
   } else if (params.deliveryId) {
-    txRow = db
+    txRow = await db
       .prepare("SELECT * FROM payment_transactions WHERE delivery_id = ? AND status IN ('paid','collected_by_rider') ORDER BY created_at DESC LIMIT 1")
       .get(params.deliveryId);
   }
@@ -2653,13 +2629,13 @@ export async function processAdminRefund(params: {
   let refundStatus: 'pending' | 'completed' = 'completed';
   let isFullyRefunded = false;
 
-  withImmediateTransaction(() => {
-    const pending = db.prepare("SELECT 1 FROM refunds WHERE payment_transaction_id = ? AND status = 'pending'")
+  await withImmediateTransaction(async () => {
+    const pending = await db.prepare("SELECT 1 FROM refunds WHERE payment_transaction_id = ? AND status = 'pending'")
       .get(tx.id);
     if (pending) {
       throw new PaymentVerificationError('A refund is already pending for this transaction. Verify it before issuing another.');
     }
-    const reserved = db.prepare(`
+    const reserved = await db.prepare(`
       SELECT COALESCE(SUM(amount_ngn), 0) AS total
       FROM refunds WHERE payment_transaction_id = ? AND status IN ('pending','completed')
     `).get(tx.id) as { total: number };
@@ -2670,7 +2646,7 @@ export async function processAdminRefund(params: {
       if (tx.provider !== 'flutterwave' || !tx.providerTxId) {
         throw new Error('Flutterwave provider transaction ID is required for gateway refund.');
       }
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO refunds (
           id, reference, payment_transaction_id, delivery_id, user_id,
           amount_ngn, destination, reason, status, initiated_by, created_at
@@ -2686,16 +2662,16 @@ export async function processAdminRefund(params: {
       refundStatus = outcome.completed && providerRefundId ? 'completed' : 'pending';
     } catch (error) {
       if (error instanceof GatewayRefundRejected || error instanceof PaymentConfigError) {
-        db.prepare("UPDATE refunds SET status = 'failed', processed_at = ? WHERE id = ?").run(now, refundId);
+        await db.prepare("UPDATE refunds SET status = 'failed', processed_at = ? WHERE id = ?").run(now, refundId);
       }
       // An ambiguous response keeps the reservation until the refund can be checked.
       throw error;
     }
   }
 
-  withImmediateTransaction(() => {
+  await withImmediateTransaction(async () => {
     if (params.destination === 'wallet') {
-      creditWalletAtomic({
+      await creditWalletAtomic({
         userId: tx.userId,
         amountNgn: amount,
         reference: `WLT-${refundRef}`,
@@ -2711,10 +2687,10 @@ export async function processAdminRefund(params: {
     }
 
     if (params.destination === 'flutterwave') {
-      db.prepare('UPDATE refunds SET status = ?, provider_refund_id = ?, processed_at = ? WHERE id = ?')
+      await db.prepare('UPDATE refunds SET status = ?, provider_refund_id = ?, processed_at = ? WHERE id = ?')
         .run(refundStatus, providerRefundId, refundStatus === 'completed' ? now : null, refundId);
     } else {
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO refunds (
           id, reference, payment_transaction_id, delivery_id, user_id,
           amount_ngn, destination, reason, status, provider_refund_id,
@@ -2735,54 +2711,59 @@ export async function processAdminRefund(params: {
         now
       );
     }
-    if (refundStatus === 'completed') isFullyRefunded = applyCompletedRefund(tx.id, now);
+    if (refundStatus === 'completed') isFullyRefunded = await applyCompletedRefund(tx.id, now);
   });
 
-  if (refundStatus === 'pending') {
-    notifyUser(tx.userId, 'Refund Initiated', `Flutterwave is processing refund ${refundRef}.`, tx.deliveryId);
-  } else notifyUser(
-    tx.userId,
-    isFullyRefunded ? 'Payment Refunded' : 'Partial Payment Refunded',
-    `₦${amount.toLocaleString()} refunded (${params.destination}) for ${tx.trackingCode || tx.reference}. Reason: ${cleanReason}`,
-    tx.deliveryId
-  );
-  broadcastWsEvent('payment:updated', mapPaymentTxRow(db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id)));
-  if (tx.deliveryId) {
-    const d = getDeliveryById(tx.deliveryId);
-    if (d) broadcastWsEvent('delivery:updated', d);
+  const publish = async () => {
+    if (refundStatus === 'pending') {
+      await notifyUser(tx.userId, 'Refund Initiated', `Flutterwave is processing refund ${refundRef}.`, tx.deliveryId);
+    } else await notifyUser(
+      tx.userId,
+      isFullyRefunded ? 'Payment Refunded' : 'Partial Payment Refunded',
+      `₦${amount.toLocaleString()} refunded (${params.destination}) for ${tx.trackingCode || tx.reference}. Reason: ${cleanReason}`,
+      tx.deliveryId
+    );
+    await broadcastWsEvent('payment:updated', mapPaymentTxRow(await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id)));
+    if (tx.deliveryId) {
+      const d = await getDeliveryById(tx.deliveryId);
+      if (d) await broadcastWsEvent('delivery:updated', d);
+    }
+
+    syncAsync(async (sb) => {
+      await sb.from('refunds').upsert({
+        id: refundId,
+        reference: refundRef,
+        payment_transaction_id: tx.id,
+        delivery_id: tx.deliveryId,
+        user_id: tx.userId,
+        amount_ngn: amount,
+        destination: params.destination,
+        reason: cleanReason,
+        status: refundStatus,
+        provider_refund_id: providerRefundId,
+        initiated_by: params.adminId,
+        processed_at: refundStatus === 'completed' ? now : null,
+        created_at: now,
+      });
+      if (isFullyRefunded) {
+        await sb
+          .from('payment_transactions')
+          .update({ status: 'refunded', updated_at: now })
+          .eq('reference', tx.reference);
+        if (tx.deliveryId && (await getDeliveryById(tx.deliveryId))?.paymentReference === tx.reference) {
+          await sb
+            .from('delivery_requests')
+            .update({ payment_status: 'refunded', updated_at: now })
+            .eq('id', tx.deliveryId);
+        }
+      }
+    });
+  };
+  if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+    await publish();
   }
 
-  syncAsync(async (sb) => {
-    await sb.from('refunds').upsert({
-      id: refundId,
-      reference: refundRef,
-      payment_transaction_id: tx.id,
-      delivery_id: tx.deliveryId,
-      user_id: tx.userId,
-      amount_ngn: amount,
-      destination: params.destination,
-      reason: cleanReason,
-      status: refundStatus,
-      provider_refund_id: providerRefundId,
-      initiated_by: params.adminId,
-      processed_at: refundStatus === 'completed' ? now : null,
-      created_at: now,
-    });
-    if (isFullyRefunded) {
-      await sb
-        .from('payment_transactions')
-        .update({ status: 'refunded', updated_at: now })
-        .eq('reference', tx.reference);
-      if (tx.deliveryId && getDeliveryById(tx.deliveryId)?.paymentReference === tx.reference) {
-        await sb
-          .from('delivery_requests')
-          .update({ payment_status: 'refunded', updated_at: now })
-          .eq('id', tx.deliveryId);
-      }
-    }
-  });
-
-  const inserted = db.prepare(`
+  const inserted = await db.prepare(`
     SELECT rf.*, pt.reference as payment_reference, dr.tracking_code, p.full_name as customer_name
     FROM refunds rf
     LEFT JOIN payment_transactions pt ON pt.id = rf.payment_transaction_id
@@ -2793,13 +2774,13 @@ export async function processAdminRefund(params: {
   return mapRefundRow(inserted);
 }
 
-export function getCustomerWalletSummary(userId: string): {
+export async function getCustomerWalletSummary(userId: string): Promise<{
   wallet: WalletAccount;
   walletTransactions: WalletTransaction[];
   paymentTransactions: PaymentTransaction[];
-} {
-  const wallet = ensureWallet(userId);
-  const wRows = db
+}> {
+  const wallet = await ensureWallet(userId);
+  const wRows = await db
     .prepare(`
       SELECT wt.*, dr.tracking_code
       FROM wallet_transactions wt
@@ -2810,7 +2791,7 @@ export function getCustomerWalletSummary(userId: string): {
     `)
     .all(userId) as any[];
 
-  const pRows = db
+  const pRows = await db
     .prepare(`
       SELECT pt.*, dr.tracking_code as delivery_tracking_code
       FROM payment_transactions pt
@@ -2873,7 +2854,7 @@ function buildPaymentFilterWhere(filters?: {
   };
 }
 
-export function getAdminPaymentsOverview(filters?: {
+export async function getAdminPaymentsOverview(filters?: {
   search?: string;
   method?: string;
   status?: string;
@@ -2882,31 +2863,31 @@ export function getAdminPaymentsOverview(filters?: {
   dateTo?: string;
   page?: number;
   pageSize?: number;
-}): AdminPaymentsOverview {
-  const totalWalletBalancesRow = db
+}): Promise<AdminPaymentsOverview> {
+  const totalWalletBalancesRow = await db
     .prepare(
       "SELECT COALESCE(SUM(w.balance_ngn), 0) as total FROM wallets w JOIN profiles p ON p.id = w.user_id WHERE p.role = 'client'"
     )
     .get() as { total: number };
-  const totalWalletFundingRow = db
+  const totalWalletFundingRow = await db
     .prepare("SELECT COALESCE(SUM(amount_ngn), 0) as total FROM payment_transactions WHERE purpose = 'wallet_funding' AND status = 'paid'")
     .get() as { total: number };
-  const totalDeliveryPaymentsRow = db
+  const totalDeliveryPaymentsRow = await db
     .prepare("SELECT COALESCE(SUM(amount_ngn), 0) as total FROM payment_transactions WHERE purpose = 'delivery_payment' AND status = 'paid'")
     .get() as { total: number };
-  const totalCashRow = db
+  const totalCashRow = await db
     .prepare("SELECT COALESCE(SUM(amount_ngn), 0) as total FROM payment_transactions WHERE payment_method = 'cash' AND status IN ('collected_by_rider', 'paid')")
     .get() as { total: number };
-  const totalBankRow = db
+  const totalBankRow = await db
     .prepare("SELECT COALESCE(SUM(amount_ngn), 0) as total FROM payment_transactions WHERE payment_method = 'bank_transfer' AND status = 'paid'")
     .get() as { total: number };
-  const pendingRow = db
+  const pendingRow = await db
     .prepare("SELECT COUNT(*) as c, COALESCE(SUM(amount_ngn), 0) as total FROM payment_transactions WHERE status IN ('pending', 'pending_verification', 'collected_by_rider')")
     .get() as { c: number; total: number };
-  const failedRow = db
+  const failedRow = await db
     .prepare("SELECT COUNT(*) as c FROM payment_transactions WHERE status = 'failed'")
     .get() as { c: number };
-  const refundsRow = db
+  const refundsRow = await db
     .prepare("SELECT COUNT(*) as c, COALESCE(SUM(amount_ngn), 0) as total FROM refunds WHERE status = 'completed'")
     .get() as { c: number; total: number };
 
@@ -2914,7 +2895,7 @@ export function getAdminPaymentsOverview(filters?: {
   const pageSize = Math.min(100, Math.max(1, Number(filters?.pageSize || 15)));
   const page = Math.max(1, Number(filters?.page || 1));
 
-  const countRow = db
+  const countRow = await db
     .prepare(
       `SELECT COUNT(*) as c FROM payment_transactions pt LEFT JOIN profiles p ON p.id = pt.user_id ${whereSql}`
     )
@@ -2924,7 +2905,7 @@ export function getAdminPaymentsOverview(filters?: {
   const safePage = Math.min(page, totalPages);
   const offset = (safePage - 1) * pageSize;
 
-  const txRows = db
+  const txRows = await db
     .prepare(`
       SELECT pt.*, p.full_name as profile_name, p.email as profile_email, p.phone as profile_phone,
              dr.tracking_code as delivery_tracking_code
@@ -2937,7 +2918,7 @@ export function getAdminPaymentsOverview(filters?: {
     `)
     .all(...params, pageSize, offset) as any[];
 
-  const walletRows = db
+  const walletRows = await db
     .prepare(`
       SELECT w.*, p.full_name as customer_name, p.email as customer_email, p.phone as customer_phone
       FROM wallets w
@@ -2947,7 +2928,7 @@ export function getAdminPaymentsOverview(filters?: {
     `)
     .all() as any[];
 
-  const ccRows = db
+  const ccRows = await db
     .prepare(`
       SELECT cc.*, cp.full_name as customer_name, cp.phone as customer_phone, rp.full_name as rider_name
       FROM cash_collections cc
@@ -2959,7 +2940,7 @@ export function getAdminPaymentsOverview(filters?: {
     `)
     .all() as any[];
 
-  const refundRows = db
+  const refundRows = await db
     .prepare(`
       SELECT rf.*, pt.reference as payment_reference, dr.tracking_code, p.full_name as customer_name
       FROM refunds rf
@@ -2971,7 +2952,7 @@ export function getAdminPaymentsOverview(filters?: {
     `)
     .all() as any[];
 
-  const webhookRows = db
+  const webhookRows = await db
     .prepare('SELECT * FROM payment_webhook_events ORDER BY received_at DESC LIMIT 60')
     .all() as any[];
 
@@ -3017,67 +2998,68 @@ export function getAdminPaymentsOverview(filters?: {
   };
 }
 
-export function payDeliveryWithWallet(params: {
+export async function payDeliveryWithWallet(params: {
   deliveryId: string;
   userId: string;
   customerName: string;
   customerEmail: string;
   customerPhone: string;
   idempotencyKey?: string | null;
-}): { delivery: NonNullable<ReturnType<typeof getDeliveryById>>; wallet: WalletAccount; paymentTransaction: PaymentTransaction } {
-  const delivery = getDeliveryById(params.deliveryId);
-  if (!delivery) throw new Error('Delivery not found.');
-  const customerRow = db
-    .prepare('SELECT id FROM customers WHERE profile_id = ?')
-    .get(params.userId) as { id: string } | undefined;
-  if (!customerRow || delivery.customerId !== customerRow.id) {
-    throw new Error('You are not authorized to pay for this delivery.');
-  }
-  if (delivery.status === 'cancelled') {
-    throw new Error('Cannot pay for a cancelled delivery.');
-  }
-  requireNoPendingFlutterwaveCheckout(delivery.id);
-  if (delivery.paymentStatus === 'paid') {
-    throw new Error('This delivery is already paid.');
-  }
-  if (delivery.paymentStatus === 'collected_by_rider') {
-    throw new Error('Cash for this delivery has already been collected by the rider.');
-  }
-
-  const existingTx = db
-    .prepare(
-      "SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' AND status <> 'paid' AND provider <> 'flutterwave' ORDER BY created_at DESC LIMIT 1"
-    )
-    .get(delivery.id) as any;
-
-  const reference = generateReference('PAY');
-  const paymentTxId = existingTx?.id || crypto.randomUUID();
+}): Promise<{ delivery: NonNullable<Awaited<ReturnType<typeof getDeliveryById>>>; wallet: WalletAccount; paymentTransaction: PaymentTransaction }> {
   const now = new Date().toISOString();
 
-  const debit = debitWalletAtomic({
-    userId: params.userId,
-    amountNgn: delivery.deliveryFeeNgn,
-    reference: `WLT-${reference}`,
-    idempotencyKey: params.idempotencyKey ? `pay-del:${params.idempotencyKey}` : `pay-del:${delivery.id}`,
-    category: 'delivery_payment',
-    description: `Wallet payment for delivery ${delivery.trackingCode}`,
-    deliveryId: delivery.id,
-    paymentTransactionId: paymentTxId,
-    actorUserId: params.userId,
-    actorRole: 'client',
-    metadata: { trackingCode: delivery.trackingCode },
-  });
+  const { delivery, debit, tx, existingTx } = await withImmediateTransaction(async () => {
+    const currentDelivery = await getDeliveryById(params.deliveryId);
+    if (!currentDelivery) throw new Error('Delivery not found.');
+    const customerRow = await db
+      .prepare('SELECT id FROM customers WHERE profile_id = ?')
+      .get(params.userId) as { id: string } | undefined;
+    if (!customerRow || currentDelivery.customerId !== customerRow.id) {
+      throw new Error('You are not authorized to pay for this delivery.');
+    }
+    if (currentDelivery.status === 'cancelled') {
+      throw new Error('Cannot pay for a cancelled delivery.');
+    }
+    await requireNoPendingFlutterwaveCheckout(currentDelivery.id);
+    if (currentDelivery.paymentStatus === 'paid') {
+      throw new Error('This delivery is already paid.');
+    }
+    if (currentDelivery.paymentStatus === 'collected_by_rider') {
+      throw new Error('Cash for this delivery has already been collected by the rider.');
+    }
 
-  const tx = withImmediateTransaction(() => {
+    const foundExistingTx = await db
+      .prepare(
+        "SELECT * FROM payment_transactions WHERE delivery_id = ? AND purpose = 'delivery_payment' AND status <> 'paid' AND provider <> 'flutterwave' ORDER BY created_at DESC LIMIT 1"
+      )
+      .get(currentDelivery.id) as any;
+
+    const reference = generateReference('PAY');
+    const paymentTxId = foundExistingTx?.id || crypto.randomUUID();
+
+    const debitOutcome = await debitWalletAtomic({
+      userId: params.userId,
+      amountNgn: currentDelivery.deliveryFeeNgn,
+      reference: `WLT-${reference}`,
+      idempotencyKey: params.idempotencyKey ? `pay-del:${params.idempotencyKey}` : `pay-del:${currentDelivery.id}`,
+      category: 'delivery_payment',
+      description: `Wallet payment for delivery ${currentDelivery.trackingCode}`,
+      deliveryId: currentDelivery.id,
+      paymentTransactionId: paymentTxId,
+      actorUserId: params.userId,
+      actorRole: 'client',
+      metadata: { trackingCode: currentDelivery.trackingCode },
+    });
+
     let settledTx: PaymentTransaction;
-    if (existingTx) {
+    if (foundExistingTx) {
       let existingMeta: Record<string, unknown> = {};
       try {
-        existingMeta = existingTx.metadata ? JSON.parse(existingTx.metadata) : {};
+        existingMeta = foundExistingTx.metadata ? JSON.parse(foundExistingTx.metadata) : {};
       } catch {
         existingMeta = {};
       }
-      db.prepare(`
+      await db.prepare(`
         UPDATE payment_transactions
         SET payment_method = 'wallet',
             provider = 'internal',
@@ -3091,15 +3073,15 @@ export function payDeliveryWithWallet(params: {
       `).run(
         now,
         params.userId,
-        JSON.stringify({ ...existingMeta, walletTransactionId: debit.transaction.id }),
+        JSON.stringify({ ...existingMeta, walletTransactionId: debitOutcome.transaction.id }),
         now,
-        existingTx.id
+        foundExistingTx.id
       );
       settledTx = mapPaymentTxRow(
-        db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(existingTx.id)
+        await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(foundExistingTx.id)
       );
     } else {
-      settledTx = insertPaymentTxRow({
+      settledTx = await insertPaymentTxRow({
         id: paymentTxId,
         reference,
         idempotencyKey: params.idempotencyKey || null,
@@ -3107,40 +3089,48 @@ export function payDeliveryWithWallet(params: {
         customerName: params.customerName,
         customerEmail: params.customerEmail,
         customerPhone: params.customerPhone,
-        walletId: debit.wallet.id,
-        deliveryId: delivery.id,
-        trackingCode: delivery.trackingCode,
+        walletId: debitOutcome.wallet.id,
+        deliveryId: currentDelivery.id,
+        trackingCode: currentDelivery.trackingCode,
         purpose: 'delivery_payment',
         paymentMethod: 'wallet',
         provider: 'internal',
-        amountNgn: delivery.deliveryFeeNgn,
+        amountNgn: currentDelivery.deliveryFeeNgn,
         status: 'paid',
         verifiedAt: now,
         verifiedBy: params.userId,
-        metadata: { walletTransactionId: debit.transaction.id },
+        metadata: { walletTransactionId: debitOutcome.transaction.id },
       });
     }
 
-    db.prepare(
-      "UPDATE delivery_requests SET payment_method = 'wallet', payment_status = 'paid', payment_reference = ?, updated_at = ? WHERE id = ?"
-    ).run(settledTx.reference, now, delivery.id);
+    const deliveryUpdate = await db.prepare(
+      "UPDATE delivery_requests SET payment_method = 'wallet', payment_status = 'paid', payment_reference = ?, updated_at = ? WHERE id = ? AND payment_status NOT IN ('paid', 'collected_by_rider') AND status <> 'cancelled'"
+    ).run(settledTx.reference, now, currentDelivery.id);
+    if (deliveryUpdate.changes === 0) {
+      throw new Error('This delivery is no longer eligible for wallet payment.');
+    }
 
-    db.prepare(
+    await db.prepare(
       "DELETE FROM cash_collections WHERE delivery_id = ? AND status IN ('pending', 'pending_verification', 'disputed')"
-    ).run(delivery.id);
+    ).run(currentDelivery.id);
 
-    if (delivery.status === 'delivered') {
-      db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
-        delivery.id
+    if (currentDelivery.status === 'delivered') {
+      await db.prepare("UPDATE payments SET status = 'settled' WHERE delivery_id = ? AND status = 'pending'").run(
+        currentDelivery.id
       );
     }
 
-    return settledTx;
+    return {
+      delivery: currentDelivery,
+      debit: debitOutcome,
+      tx: settledTx,
+      existingTx: foundExistingTx,
+    };
   });
 
-  const updatedDelivery = getDeliveryById(delivery.id)!;
-  broadcastWsEvent('delivery:updated', updatedDelivery);
-  broadcastWsEvent('payment:updated', tx);
+  const updatedDelivery = (await getDeliveryById(delivery.id))!;
+  await broadcastWsEvent('delivery:updated', updatedDelivery);
+  await broadcastWsEvent('payment:updated', tx);
 
   syncAsync(async (sb) => {
     if (existingTx) {
@@ -3176,16 +3166,16 @@ export function payDeliveryWithWallet(params: {
   return { delivery: updatedDelivery, wallet: debit.wallet, paymentTransaction: tx };
 }
 
-export function exportPaymentsCsv(filters?: {
+export async function exportPaymentsCsv(filters?: {
   search?: string;
   method?: string;
   status?: string;
   purpose?: string;
   dateFrom?: string;
   dateTo?: string;
-}): string {
+}): Promise<string> {
   const { whereSql, params } = buildPaymentFilterWhere(filters);
-  const rows = db
+  const rows = await db
     .prepare(`
       SELECT pt.*, p.full_name as profile_name, p.email as profile_email, p.phone as profile_phone,
              dr.tracking_code as delivery_tracking_code
@@ -3241,7 +3231,7 @@ export function exportPaymentsCsv(filters?: {
   return [header, ...lines].join('\n');
 }
 
-export function getWalletAuditLogs(limit = 50): Array<{
+export async function getWalletAuditLogs(limit = 50): Promise<Array<{
   id: string;
   walletId: string;
   userId: string;
@@ -3253,8 +3243,8 @@ export function getWalletAuditLogs(limit = 50): Array<{
   actorId: string;
   actorName: string | null;
   createdAt: string;
-}> {
-  const rows = db
+}>> {
+  const rows = await db
     .prepare(`
       SELECT wal.*, p.full_name as customer_name
       FROM wallet_audit_logs wal
@@ -3278,20 +3268,20 @@ export function getWalletAuditLogs(limit = 50): Array<{
   }));
 }
 
-export function getPaymentTransactionByKey(idempotencyKey: string): PaymentTransaction | null {
-  const row = db
+export async function getPaymentTransactionByKey(idempotencyKey: string): Promise<PaymentTransaction | null> {
+  const row = await db
     .prepare('SELECT * FROM payment_transactions WHERE idempotency_key = ?')
     .get(idempotencyKey);
   return row ? mapPaymentTxRow(row) : null;
 }
 
-export function cancelDeliveryPayments(deliveryId: string, opts?: { reason?: string }): void {
+export async function cancelDeliveryPayments(deliveryId: string, opts?: { reason?: string }): Promise<void> {
   const now = new Date().toISOString();
   const reason = opts?.reason?.trim() || 'Delivery cancelled before payment completed';
   const updatedIds: string[] = [];
 
-  withImmediateTransaction(() => {
-    const unpaidRows = db
+  await withImmediateTransaction(async () => {
+    const unpaidRows = await db
       .prepare(
         "SELECT id FROM payment_transactions WHERE delivery_id = ? AND status IN ('pending', 'pending_verification')"
       )
@@ -3301,31 +3291,36 @@ export function cancelDeliveryPayments(deliveryId: string, opts?: { reason?: str
     }
 
     if (updatedIds.length > 0) {
-      db.prepare(
+      await db.prepare(
         "UPDATE payment_transactions SET status = 'failed', failure_reason = ?, updated_at = ? WHERE delivery_id = ? AND status IN ('pending', 'pending_verification')"
       ).run(reason, now, deliveryId);
     }
 
-    db.prepare(
+    await db.prepare(
       "DELETE FROM cash_collections WHERE delivery_id = ? AND status IN ('pending', 'pending_verification', 'disputed')"
     ).run(deliveryId);
   });
 
-  for (const id of updatedIds) {
-    const row = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id);
-    if (row) broadcastWsEvent('payment:updated', mapPaymentTxRow(row));
-  }
+  const publish = async () => {
+    for (const id of updatedIds) {
+      const row = await db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(id);
+      if (row) await broadcastWsEvent('payment:updated', mapPaymentTxRow(row));
+    }
 
-  syncAsync(async (sb) => {
-    await sb
-      .from('payment_transactions')
-      .update({ status: 'failed', failure_reason: reason, updated_at: now })
-      .eq('delivery_id', deliveryId)
-      .in('status', ['pending', 'pending_verification']);
-    await sb
-      .from('cash_collections')
-      .delete()
-      .eq('delivery_id', deliveryId)
-      .in('status', ['pending', 'pending_verification', 'disputed']);
-  });
+    syncAsync(async (sb) => {
+      await sb
+        .from('payment_transactions')
+        .update({ status: 'failed', failure_reason: reason, updated_at: now })
+        .eq('delivery_id', deliveryId)
+        .in('status', ['pending', 'pending_verification']);
+      await sb
+        .from('cash_collections')
+        .delete()
+        .eq('delivery_id', deliveryId)
+        .in('status', ['pending', 'pending_verification', 'disputed']);
+    });
+  };
+  if (!deferDatabaseEffect(() => void publish().catch(console.error))) {
+    await publish();
+  }
 }

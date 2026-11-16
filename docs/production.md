@@ -10,9 +10,11 @@ Use a Docker host with Compose, DNS pointing the SAQO hostname to that host, and
 
 Caddy obtains the HTTPS certificate and forwards WebSocket upgrades. The application port stays inside the Compose network. The application trusts one proxy hop in this topology. Leave `SAQO_TRUST_PROXY` disabled when running the server directly.
 
-### Vercel frontend preview
+### Vercel frontend
 
-`vercel.json` builds the Vite frontend as a static, non-indexed preview without a backend. It does not submit bookings, accept logins or payments, or connect to the dispatch WebSocket. Use a preview deployment for review. Before launching from Vercel, provision the persistent backend and verify HTTPS routing for `/api` and WebSocket routing for `/ws` from the frontend, then remove the static preview build flag and the indexing block.
+Vercel Preview builds show a static, non-indexed preview. For a Production build, set `VITE_SAQO_API_ORIGIN` to the HTTPS origin of the SAQO API. Set `SAQO_FRONTEND_ORIGIN` if customers use a domain other than the project's default production URL. Enable Vercel system environment variables. Set `APP_URL` on the API to that same customer-facing origin. The build checks the API, cross-origin authorization headers, and WebSocket before enabling live features. Set `SAQO_API_ORIGIN` on the backend so the payment and WhatsApp webhooks point to the API host.
+
+The Supabase migrations create the private `saqo` operations schema alongside the existing `public` wallet tables. Browser roles cannot read the operations schema or call wallet mutation functions. The API and dispatch worker currently use SQLite, so the Supabase migration alone does not switch their storage. Connect the server to Postgres, migrate the existing accounts and deliveries, and verify the full queue and handoff flow before pointing the Vercel production build at the new API.
 
 ## Test the Twilio WhatsApp webhook before deployment
 

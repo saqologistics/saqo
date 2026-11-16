@@ -5,8 +5,10 @@ import { rankEligibleRiders } from '../shared/dispatch';
 import { sendOpsAlert } from './opsAlerts';
 import type { DeliveryRequest, LiveWsEvent, SupportPresence, UserRole } from '../shared/types';
 import {
+  countActiveSupportAgents,
   createNotification,
   db,
+  getAdminAcceptingChats,
   persistDispatchChange,
   getAllRiders,
   getDeliveryById,
@@ -15,6 +17,7 @@ import {
   getProfileById,
   getSupportConversationById,
   listDeliveries,
+  setAdminAcceptingChatsDb,
 } from './db';
 
 const wsClients = new Set<WebSocket>();
@@ -26,21 +29,32 @@ const offerTimers = new Map<string, NodeJS.Timeout>();
 let adminOfflineGraceTimer: NodeJS.Timeout | null = null;
 let lastBroadcastPresence: SupportPresence | null = null;
 
-const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-const supabaseKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  process.env.VITE_SUPABASE_ANON_KEY;
+const isEdgeRuntime = () => process.env.SAQO_EDGE_RUNTIME === '1';
 
+let supabaseClient: ReturnType<typeof createClient> | null = null;
 let supabaseChannel: RealtimeChannel | null = null;
-if (supabaseUrl && supabaseKey) {
-  try {
-    const supabase = createClient(supabaseUrl, supabaseKey);
-    supabaseChannel = supabase.channel('saqo-notifications');
-    supabaseChannel.subscribe();
-  } catch {
-    supabaseChannel = null;
+
+function getSupabaseBroadcastChannel(): RealtimeChannel | null {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  if (!supabaseClient) {
+    try {
+      supabaseClient = createClient(url, key);
+    } catch {
+      return null;
+    }
   }
+  if (!supabaseChannel) {
+    supabaseChannel = supabaseClient.channel('saqo-notifications');
+    if (!isEdgeRuntime()) {
+      supabaseChannel.subscribe();
+    }
+  }
+  return supabaseChannel;
 }
 
 function getConnectedAdminPresence(): SupportPresence {
@@ -65,51 +79,67 @@ export function getSupportPresence(): SupportPresence {
   return connected;
 }
 
+export async function getSupportPresenceAsync(): Promise<SupportPresence> {
+  if (isEdgeRuntime()) {
+    const accepting = await getAdminAcceptingChats();
+    const onlineAdminCount = accepting ? await countActiveSupportAgents() : 0;
+    return { adminOnline: onlineAdminCount > 0, onlineAdminCount };
+  }
+  adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
+  return getSupportPresence();
+}
+
 function cancelOfflineGrace(): void {
   if (adminOfflineGraceTimer) clearTimeout(adminOfflineGraceTimer);
   adminOfflineGraceTimer = null;
 }
 
-function broadcastPresenceIfChanged(): SupportPresence {
-  const presence = getSupportPresence();
+async function broadcastPresenceIfChanged(): Promise<SupportPresence> {
+  const presence = await getSupportPresenceAsync();
   if (
     !lastBroadcastPresence ||
     lastBroadcastPresence.adminOnline !== presence.adminOnline ||
     lastBroadcastPresence.onlineAdminCount !== presence.onlineAdminCount
   ) {
     lastBroadcastPresence = presence;
-    broadcastWsEvent('support:presence', presence);
+    await broadcastWsEvent('support:presence', presence);
   }
   return presence;
 }
 
-export function setAdminChatAvailability(available: boolean): SupportPresence {
+export async function setAdminChatAvailability(available: boolean): Promise<SupportPresence> {
   adminAcceptingChats = available;
+  await setAdminAcceptingChatsDb(available);
   cancelOfflineGrace();
-  return broadcastPresenceIfChanged();
+  return await broadcastPresenceIfChanged();
+}
+
+export async function isAdminChatAvailableFlagAsync(): Promise<boolean> {
+  adminAcceptingChats = await getAdminAcceptingChats().catch(() => adminAcceptingChats);
+  return adminAcceptingChats;
 }
 
 export function isAdminChatAvailableFlag(): boolean {
   return adminAcceptingChats;
 }
 
-export function setWsClientAuth(ws: WebSocket, userId: string, role: UserRole, expiresAt: number): void {
+export async function setWsClientAuth(ws: WebSocket, userId: string, role: UserRole, expiresAt: number): Promise<void> {
   const prev = wsAuthMeta.get(ws);
   wsAuthMeta.set(ws, { userId, role, expiresAt });
   if (role === 'admin') {
     cancelOfflineGrace();
-    broadcastPresenceIfChanged();
+    await broadcastPresenceIfChanged();
   } else if (prev?.role === 'admin') {
-    broadcastPresenceIfChanged();
+    await broadcastPresenceIfChanged();
   }
 }
 
-export function clearWsClientAuth(ws: WebSocket): void {
+export async function clearWsClientAuth(ws: WebSocket): Promise<void> {
   const prev = wsAuthMeta.get(ws);
   wsAuthMeta.delete(ws);
   if (prev?.role === 'admin') {
     cancelOfflineGrace();
-    broadcastPresenceIfChanged();
+    await broadcastPresenceIfChanged();
   }
 }
 
@@ -123,22 +153,22 @@ export function setWsSupportVisitor(ws: WebSocket, token: string): void {
   else wsSupportVisitors.delete(ws);
 }
 
-function canReadSupport(ws: WebSocket, conversation: ReturnType<typeof getSupportConversationById>): boolean {
+function canReadSupport(ws: WebSocket, conversation: Awaited<ReturnType<typeof getSupportConversationById>>): boolean {
   if (!conversation) return false;
   const auth = wsAuthMeta.get(ws);
   if (auth && auth.expiresAt > Date.now()) {
     if (auth.role === 'admin' || auth.userId === conversation.userId) return true;
   }
-  return Boolean(conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
+  return Boolean(!conversation.userId && conversation.visitorToken && wsSupportVisitors.get(ws) === conversation.visitorToken);
 }
 
-export function sendSupportTyping(ws: WebSocket, conversationId: string, isTyping: boolean): void {
-  const conversation = getSupportConversationById(conversationId);
+export async function sendSupportTyping(ws: WebSocket, conversationId: string, isTyping: boolean): Promise<void> {
+  const conversation = await getSupportConversationById(conversationId);
   if (!conversation || !canReadSupport(ws, conversation)) return;
   const auth = wsAuthMeta.get(ws);
-  const profile = auth && auth.expiresAt > Date.now() ? getProfileById(auth.userId) : null;
+  const profile = auth && auth.expiresAt > Date.now() ? await getProfileById(auth.userId) : null;
   const admin = profile?.role === 'admin' && profile.accountStatus === 'active';
-  broadcastWsEvent('support:typing', {
+  await broadcastWsEvent('support:typing', {
     conversationId,
     senderRole: admin ? 'admin' : 'visitor',
     senderName: admin ? profile.fullName : conversation.visitorName,
@@ -148,7 +178,7 @@ export function sendSupportTyping(ws: WebSocket, conversationId: string, isTypin
 
 export function registerWsClient(ws: WebSocket): void {
   wsClients.add(ws);
-  ws.on('close', () => {
+  ws.on('close', async () => {
     const meta = wsAuthMeta.get(ws);
     wsAuthMeta.delete(ws);
     wsClients.delete(ws);
@@ -157,20 +187,20 @@ export function registerWsClient(ws: WebSocket): void {
     if (meta?.role !== 'admin') return;
 
     if (getConnectedAdminPresence().adminOnline || !lastBroadcastPresence?.adminOnline) {
-      broadcastPresenceIfChanged();
+      await broadcastPresenceIfChanged();
       return;
     }
     // Keep API reads and WebSocket events consistent during short reconnects.
     if (!adminOfflineGraceTimer) {
-      adminOfflineGraceTimer = setTimeout(() => {
+      adminOfflineGraceTimer = setTimeout(async () => {
         adminOfflineGraceTimer = null;
-        broadcastPresenceIfChanged();
+        await broadcastPresenceIfChanged();
       }, 5000);
     }
   });
 }
 
-export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): void {
+export async function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): Promise<void> {
   const eventObj: LiveWsEvent = {
     type,
     payload,
@@ -184,7 +214,7 @@ export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): v
   }
   const supportId = type === 'support:conversation' ? data?.id :
     type === 'support:message' || type === 'support:typing' ? data?.conversationId : undefined;
-  const conversation = typeof supportId === 'string' ? getSupportConversationById(supportId) : null;
+  const conversation = typeof supportId === 'string' ? await getSupportConversationById(supportId) : null;
   const message = JSON.stringify(eventObj);
 
   for (const client of wsClients) {
@@ -210,7 +240,7 @@ export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): v
     } else if (type === 'rider:location') {
       allowed = Boolean(auth?.role === 'admin');
       if (!allowed && tracked) {
-        const current = db.prepare(`
+        const current = await db.prepare(`
           SELECT 1 FROM delivery_requests
           WHERE tracking_code = ? AND assigned_rider_id = ? AND status NOT IN ('delivered','cancelled')
         `).get(tracked, String(data?.riderId ?? ''));
@@ -230,13 +260,41 @@ export function broadcastWsEvent(type: LiveWsEvent['type'], payload: unknown): v
     if (allowed) client.send(message);
   }
 
-  if (supabaseChannel && type === 'notification:created') {
-    // This shared channel only signals a refresh. The authenticated API returns the recipient's inbox.
-    void supabaseChannel.send({
-      type: 'broadcast',
-      event: 'saqo-event',
-      payload: { type: 'notifications:refresh', payload: null, timestamp: eventObj.timestamp },
-    }).catch(() => {});
+  const channel = getSupabaseBroadcastChannel();
+  if (channel) {
+    // Only send non-sensitive public/refresh signals over shared Supabase Realtime channels.
+    let publicEvt: LiveWsEvent | null = null;
+    if (type === 'settings:updated') {
+      publicEvt = {
+        type: 'settings:updated',
+        payload: { showDeliveryStateSelectors: Boolean(data?.showDeliveryStateSelectors) },
+        timestamp: eventObj.timestamp,
+      };
+    } else if (isDelivery) {
+      publicEvt = {
+        type,
+        payload: null,
+        timestamp: eventObj.timestamp,
+      };
+    } else if (type === 'support:conversation') {
+      publicEvt = { type: 'support:refresh', payload: null, timestamp: eventObj.timestamp };
+    } else if (!type.startsWith('support:')) {
+      publicEvt = { type: 'notifications:refresh', payload: null, timestamp: eventObj.timestamp };
+    }
+    if (publicEvt) {
+      const sendViaChannel = async () => {
+        if (typeof channel.httpSend === 'function' && (isEdgeRuntime() || channel.state !== 'joined')) {
+          await channel.httpSend('saqo-event', publicEvt);
+        } else {
+          await channel.send({ type: 'broadcast', event: 'saqo-event', payload: publicEvt });
+        }
+      };
+      if (isEdgeRuntime()) {
+        await sendViaChannel().catch(() => {});
+      } else {
+        void sendViaChannel().catch(() => {});
+      }
+    }
   }
 }
 
@@ -255,71 +313,101 @@ export function canDispatch(delivery: { paymentMethod: string; paymentStatus: st
   return delivery.paymentMethod === 'cash' || delivery.paymentStatus === 'paid';
 }
 
-export function dispatchWaitingDeliveries(): void {
-  const waiting = db.prepare(`
+let lastSweepAt = 0;
+
+export async function expireTimedOutOffers(force = false): Promise<number> {
+  const nowMs = Date.now();
+  if (!force && nowMs - lastSweepAt < 1500) return 0;
+  lastSweepAt = nowMs;
+  const nowIso = new Date(nowMs).toISOString();
+  const expired = await persistDispatchChange(async () => {
+    const rows = await db.prepare(`
+      UPDATE delivery_assignments SET status = 'timed_out', responded_at = ?
+      WHERE status = 'offered' AND expires_at <= ?
+      RETURNING id, delivery_id, rider_id
+    `).all(nowIso, nowIso) as Array<{ id: string; delivery_id: string; rider_id: string }>;
+    for (const row of rows) {
+      clearOfferTimer(row.id);
+      await releaseOffer(row.delivery_id, row.rider_id);
+    }
+    return rows;
+  });
+  for (const row of expired) {
+    await broadcastWsEvent('assignment:updated', { id: row.id, status: 'timed_out' });
+  }
+  if (expired.length > 0) {
+    await dispatchWaitingDeliveries();
+  }
+  return expired.length;
+}
+
+export async function dispatchWaitingDeliveries(): Promise<void> {
+  const waiting = await db.prepare(`
     SELECT id FROM delivery_requests
     WHERE status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+      AND (payment_method = 'cash' OR payment_status = 'paid')
     ORDER BY created_at, rowid
   `).all() as Array<{ id: string }>;
-  for (const { id } of waiting) dispatchNextRiderForDelivery(id);
+  for (const { id } of waiting) await dispatchNextRiderForDelivery(id);
 }
 
 function scheduleOfferExpiry(assignmentId: string, expiresAt: string): void {
   clearOfferTimer(assignmentId);
-  const timer = setTimeout(() => {
+  if (isEdgeRuntime()) return;
+  const timer = setTimeout(async () => {
     offerTimers.delete(assignmentId);
     const now = new Date().toISOString();
-    const expired = persistDispatchChange(() => {
-      const assignment = db.prepare(`
+    const expired = await persistDispatchChange(async () => {
+      const assignment = await db.prepare(`
         UPDATE delivery_assignments SET status = 'timed_out', responded_at = ?
         WHERE id = ? AND status = 'offered'
         RETURNING delivery_id, rider_id
       `).get(now, assignmentId) as { delivery_id: string; rider_id: string } | undefined;
-      if (assignment) releaseOffer(assignment.delivery_id, assignment.rider_id);
+      if (assignment) await releaseOffer(assignment.delivery_id, assignment.rider_id);
       return assignment;
     });
     if (!expired) return;
-    broadcastWsEvent('assignment:updated', { id: assignmentId, status: 'timed_out' });
-    dispatchWaitingDeliveries();
+    await broadcastWsEvent('assignment:updated', { id: assignmentId, status: 'timed_out' });
+    await dispatchWaitingDeliveries();
   }, Math.max(0, Date.parse(expiresAt) - Date.now()));
   timer.unref();
   offerTimers.set(assignmentId, timer);
 }
 
-export function releaseOffer(deliveryId: string, riderId: string): void {
-  db.prepare(`
+export async function releaseOffer(deliveryId: string, riderId: string): Promise<void> {
+  await db.prepare(`
     UPDATE delivery_requests SET status = 'pending_dispatch', assigned_rider_id = NULL, updated_at = ?
     WHERE id = ? AND assigned_rider_id = ? AND status = 'assigned'
   `).run(new Date().toISOString(), deliveryId, riderId);
 }
 
-export function resumeDispatch(): () => void {
-  db.prepare(`
+export async function resumeDispatch(): Promise<() => void> {
+  await db.prepare(`
     UPDATE delivery_requests SET status = 'pending_dispatch', assigned_rider_id = NULL, updated_at = ?
     WHERE status = 'assigned' AND NOT EXISTS (
       SELECT 1 FROM delivery_assignments a WHERE a.delivery_id = delivery_requests.id
         AND a.rider_id = delivery_requests.assigned_rider_id AND a.status IN ('offered', 'accepted')
     )
   `).run(new Date().toISOString());
-  const offers = db.prepare(`SELECT id, expires_at FROM delivery_assignments WHERE status = 'offered'`)
+  const offers = await db.prepare(`SELECT id, expires_at FROM delivery_assignments WHERE status = 'offered'`)
     .all() as Array<{ id: string; expires_at: string }>;
   for (const offer of offers) scheduleOfferExpiry(offer.id, offer.expires_at);
-  dispatchWaitingDeliveries();
+  await dispatchWaitingDeliveries();
   const configuredDelay = Number(process.env.SAQO_DISPATCH_ALERT_SECONDS);
   const delaySeconds = configuredDelay > 0 && Number.isFinite(configuredDelay) ? configuredDelay : 300;
-  const checkQueue = () => {
+  const checkQueue = async () => {
     const cutoff = new Date(Date.now() - delaySeconds * 1000).toISOString();
-    const { total } = db.prepare(`
+    const { total } = await db.prepare(`
       SELECT COUNT(*) AS total FROM delivery_requests
       WHERE status IN ('pending_dispatch', 'no_rider_available')
         AND (payment_method = 'cash' OR payment_status = 'paid') AND created_at <= ?
     `).get(cutoff) as { total: number };
-    if (total) void sendOpsAlert('dispatch_delay', { waitingDeliveries: total, delaySeconds });
+    if (Number(total) > 0) void sendOpsAlert('dispatch_delay', { waitingDeliveries: Number(total), delaySeconds });
   };
-  checkQueue();
-  const poll = setInterval(() => {
-    dispatchWaitingDeliveries();
-    checkQueue();
+  await checkQueue();
+  const poll = setInterval(async () => {
+    await dispatchWaitingDeliveries();
+    await checkQueue();
   }, 10_000).unref();
   return () => {
     clearInterval(poll);
@@ -328,85 +416,93 @@ export function resumeDispatch(): () => void {
   };
 }
 
-export function dispatchNextRiderForDelivery(deliveryId: string): {
+export async function dispatchNextRiderForDelivery(deliveryId: string): Promise<{
   offered: boolean;
   riderId?: string;
   riderName?: string;
-} {
-  const delivery = getDeliveryById(deliveryId);
-  if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
-    return { offered: false };
-  }
-
-  const settings = getPlatformSettings();
-  const riders = getAllRiders();
-  const allDeliveries = listDeliveries();
-
-  const previousAttempts = db
-    .prepare(
-      `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
-    )
-    .all(deliveryId) as Array<{ rider_id: string }>;
-  const excludedRiderIds = previousAttempts.map((a) => a.rider_id);
-
-  const candidates = riders.map((rider) => ({
-    rider,
-    activeDeliveries: allDeliveries.filter(
-      (d) =>
-        d.assignedRiderId === rider.riderId &&
-        activeStatuses.includes(d.status)
-    ),
-  }));
-
-  const ranked = rankEligibleRiders({
-    delivery,
-    candidates,
-    settings,
-    excludedRiderIds,
-  });
-
-  if (ranked.length === 0) {
-    if (delivery.status === 'no_rider_available') return { offered: false };
-    const now = new Date().toISOString();
-    db.prepare(`UPDATE delivery_requests SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ? WHERE id = ?`).run(
-      now,
-      deliveryId
-    );
-    db.prepare(`
-      INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
-      VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
-    `).run(
-      `hist-${crypto.randomUUID().slice(0, 8)}`,
-      deliveryId,
-      'Queued until an eligible rider has capacity.',
-      now
-    );
-
-    const custRow = db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId) as {
-      profile_id: string;
-    } | undefined;
-    if (custRow) {
-      const notif = createNotification(
-        custRow.profile_id,
-        'No rider available right now',
-        `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
-        deliveryId
-      );
-      broadcastWsEvent('notification:created', notif);
+}> {
+  const committed = await persistDispatchChange(async () => {
+    const delivery = await getDeliveryById(deliveryId);
+    if (!delivery || !queuedStatuses.includes(delivery.status) || delivery.assignedRiderId || !canDispatch(delivery)) {
+      return null;
     }
 
-    const updated = getDeliveryById(deliveryId);
-    broadcastWsEvent('delivery:updated', updated);
-    return { offered: false };
-  }
+    const settings = await getPlatformSettings();
+    const riders = await getAllRiders();
+    const allDeliveries = await listDeliveries();
 
-  const topCandidate = ranked[0];
-  const assignmentId = `asg-${crypto.randomUUID().slice(0, 8)}`;
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1000);
+    const previousAttempts = await db
+      .prepare(
+        `SELECT rider_id FROM delivery_assignments WHERE delivery_id = ? AND status IN ('rejected', 'timed_out', 'offered')`
+      )
+      .all(deliveryId) as Array<{ rider_id: string }>;
+    const excludedRiderIds = previousAttempts.map((a) => a.rider_id);
 
-  persistDispatchChange(() => {
-    db.prepare(`
+    const candidates = riders.map((rider) => ({
+      rider,
+      activeDeliveries: allDeliveries.filter(
+        (d) =>
+          d.assignedRiderId === rider.riderId &&
+          activeStatuses.includes(d.status)
+      ),
+    }));
+
+    const ranked = rankEligibleRiders({
+      delivery,
+      candidates,
+      settings,
+      excludedRiderIds,
+    });
+
+    if (ranked.length === 0) {
+      if (delivery.status === 'no_rider_available') return { kind: 'noop' as const };
+      const nowIso = new Date().toISOString();
+      const locked = await db.prepare(`
+        UPDATE delivery_requests
+        SET status = 'no_rider_available', assigned_rider_id = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+      `).run(nowIso, deliveryId);
+      if (locked.changes === 0) return { kind: 'noop' as const };
+
+      await db.prepare(`
+        INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
+        VALUES (?, ?, 'no_rider_available', ?, 'system', ?)
+      `).run(
+        `hist-${crypto.randomUUID().slice(0, 8)}`,
+        deliveryId,
+        'Queued until an eligible rider has capacity.',
+        nowIso
+      );
+
+      const custRow = await db.prepare(`SELECT profile_id FROM customers WHERE id = ?`).get(delivery.customerId) as {
+        profile_id: string;
+      } | undefined;
+      const custNotif = custRow
+        ? await createNotification(
+            custRow.profile_id,
+            'No rider available right now',
+            `Parcel ${delivery.trackingCode} is queued until an eligible rider has capacity.`,
+            deliveryId
+          )
+        : null;
+      const updated = await getDeliveryById(deliveryId);
+      return { kind: 'no_rider' as const, custNotif, updated };
+    }
+
+    const topCandidate = ranked[0];
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const locked = await db.prepare(`
+      UPDATE delivery_requests
+      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
+      WHERE id = ? AND status IN ('pending_dispatch', 'no_rider_available') AND assigned_rider_id IS NULL
+    `).run(topCandidate.rider.riderId, nowIso, deliveryId);
+    if (locked.changes === 0) return { kind: 'noop' as const };
+
+    const assignmentId = `asg-${crypto.randomUUID().slice(0, 8)}`;
+    const expiresAt = new Date(now.getTime() + settings.offerTimeoutSeconds * 1000);
+
+    await db.prepare(`
       INSERT INTO delivery_assignments (
         id, delivery_id, rider_id, status, score, distance_to_pickup_km,
         route_compatibility_score, offered_at, expires_at
@@ -418,17 +514,11 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
       topCandidate.compositeScore,
       topCandidate.distanceToPickupKm,
       topCandidate.routeCompatibilityScore,
-      now.toISOString(),
+      nowIso,
       expiresAt.toISOString()
     );
 
-    db.prepare(`
-      UPDATE delivery_requests
-      SET status = 'assigned', assigned_rider_id = ?, updated_at = ?
-      WHERE id = ?
-    `).run(topCandidate.rider.riderId, now.toISOString(), deliveryId);
-
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
       VALUES (?, ?, 'assigned', ?, 'system', ?)
     `).run(
@@ -437,54 +527,73 @@ export function dispatchNextRiderForDelivery(deliveryId: string): {
       `Smart dispatch offered parcel to ${topCandidate.rider.fullName} (${topCandidate.distanceToPickupKm} km away, route fit ${Math.round(
         topCandidate.routeCompatibilityScore * 100
       )}%).`,
-      now.toISOString()
+      nowIso
     );
-  });
 
-  const riderNotif = createNotification(
-    topCandidate.rider.id,
-    'New Delivery Request Available',
-    `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} → ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
-    deliveryId
-  );
-  broadcastWsEvent('notification:created', riderNotif);
-
-  const custRow = db
-    .prepare('SELECT profile_id FROM customers WHERE id = ?')
-    .get(delivery.customerId) as { profile_id: string } | undefined;
-  if (custRow) {
-    const custNotif = createNotification(
-      custRow.profile_id,
-      'Rider Assigned',
-      `${topCandidate.rider.fullName} (${topCandidate.rider.vehicleType}) has been matched to parcel ${delivery.trackingCode}.`,
+    const riderNotif = await createNotification(
+      topCandidate.rider.id,
+      'New Delivery Request Available',
+      `${delivery.trackingCode}: ${delivery.pickupAddress}, ${delivery.pickupState} → ${delivery.destinationAddress}, ${delivery.destinationState} (${topCandidate.distanceToPickupKm} km away).`,
       deliveryId
     );
-    broadcastWsEvent('notification:created', custNotif);
-  }
+    const custRow = await db
+      .prepare('SELECT profile_id FROM customers WHERE id = ?')
+      .get(delivery.customerId) as { profile_id: string } | undefined;
+    const custNotif = custRow
+      ? await createNotification(
+          custRow.profile_id,
+          'Rider Assigned',
+          `${topCandidate.rider.fullName} (${topCandidate.rider.vehicleType}) has been matched to parcel ${delivery.trackingCode}.`,
+          deliveryId
+        )
+      : null;
 
-  const updatedDelivery = getDeliveryById(deliveryId);
-  broadcastWsEvent('delivery:updated', updatedDelivery);
-  broadcastWsEvent('assignment:offered', {
-    id: assignmentId,
-    deliveryId,
-    trackingCode: delivery.trackingCode,
-    riderId: topCandidate.rider.riderId,
-    riderProfileId: topCandidate.rider.id,
-    riderName: topCandidate.rider.fullName,
-    status: 'offered',
-    score: topCandidate.compositeScore,
-    distanceToPickupKm: topCandidate.distanceToPickupKm,
-    routeCompatibilityScore: topCandidate.routeCompatibilityScore,
-    offeredAt: now.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    delivery: updatedDelivery && { ...updatedDelivery, deliveryOtp: undefined },
+    const updatedDelivery = await getDeliveryById(deliveryId);
+    return {
+      kind: 'offered' as const,
+      assignmentId,
+      delivery,
+      topCandidate,
+      nowIso,
+      expiresAtIso: expiresAt.toISOString(),
+      riderNotif,
+      custNotif,
+      updatedDelivery,
+    };
   });
 
-  scheduleOfferExpiry(assignmentId, expiresAt.toISOString());
+  if (!committed || committed.kind === 'noop') return { offered: false };
+
+  if (committed.kind === 'no_rider') {
+    if (committed.custNotif) await broadcastWsEvent('notification:created', committed.custNotif);
+    await broadcastWsEvent('delivery:updated', committed.updated);
+    return { offered: false };
+  }
+
+  await broadcastWsEvent('notification:created', committed.riderNotif);
+  if (committed.custNotif) await broadcastWsEvent('notification:created', committed.custNotif);
+  await broadcastWsEvent('delivery:updated', committed.updatedDelivery);
+  await broadcastWsEvent('assignment:offered', {
+    id: committed.assignmentId,
+    deliveryId,
+    trackingCode: committed.delivery.trackingCode,
+    riderId: committed.topCandidate.rider.riderId,
+    riderProfileId: committed.topCandidate.rider.id,
+    riderName: committed.topCandidate.rider.fullName,
+    status: 'offered',
+    score: committed.topCandidate.compositeScore,
+    distanceToPickupKm: committed.topCandidate.distanceToPickupKm,
+    routeCompatibilityScore: committed.topCandidate.routeCompatibilityScore,
+    offeredAt: committed.nowIso,
+    expiresAt: committed.expiresAtIso,
+    delivery: committed.updatedDelivery && { ...committed.updatedDelivery, deliveryOtp: undefined },
+  });
+
+  scheduleOfferExpiry(committed.assignmentId, committed.expiresAtIso);
 
   return {
     offered: true,
-    riderId: topCandidate.rider.riderId,
-    riderName: topCandidate.rider.fullName,
+    riderId: committed.topCandidate.rider.riderId,
+    riderName: committed.topCandidate.rider.fullName,
   };
 }

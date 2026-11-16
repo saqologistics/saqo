@@ -11,6 +11,7 @@ import {
   LogOut,
   Mail,
   MapPin,
+  Menu,
   MessageCircle,
   MoreHorizontal,
   Package,
@@ -26,6 +27,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiRequest } from '../lib/api';
+import { isSupabaseEdgeApi } from '../lib/deployment';
 import { useRealtime } from '../hooks/useRealtime';
 import { NIGERIA_STATES } from '../shared/nigeria';
 import { formatNaira } from '../shared/pricing';
@@ -48,6 +50,7 @@ import type {
 import { AdminGatewaySettingsCard } from './AdminGatewaySettingsCard';
 import { AdminPaymentsSection } from './AdminPaymentsSection';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { MobileNavDrawer } from './MobileNavDrawer';
 import { PWAInstallButton } from './PWAInstallButton';
 import { SaqoLogo } from './SaqoLogo';
 import { buildWhatsAppUrl } from './WhatsAppWidget';
@@ -78,7 +81,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onLogout,
   onSettingsChanged,
 }) => {
-  const [section, setSection] = useState<AdminSection>('overview');
+  const sectionStorageKey = `saqo_admin_section_${profile.id}`;
+  const [section, setSection] = useState<AdminSection>(() => {
+    try {
+      const saved = window.sessionStorage.getItem(sectionStorageKey);
+      if (
+        saved &&
+        ['overview', 'deliveries', 'riders', 'customers', 'chats', 'settings', 'finance'].includes(
+          saved,
+        )
+      ) {
+        return saved as AdminSection;
+      }
+    } catch {
+      // Ignore storage read errors.
+    }
+    return 'overview';
+  });
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(sectionStorageKey, section);
+    } catch {
+      // Ignore storage write errors.
+    }
+  }, [sectionStorageKey, section]);
   const [deliveries, setDeliveries] = useState<AdminDeliveryRecord[]>([]);
   const [riders, setRiders] = useState<RiderProfile[]>([]);
   const [customers, setCustomers] = useState<CustomerSummary[]>([]);
@@ -163,6 +190,35 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const adminChatEndRef = React.useRef<HTMLDivElement | null>(null);
   const lastAdminTypingEmitRef = React.useRef<number>(0);
   const presenceUpdateCount = React.useRef(0);
+  const activeAdminThread = React.useRef(activeChatId);
+  activeAdminThread.current = activeChatId;
+  const chatMessageRequest = React.useRef(0);
+  const changingPresence = React.useRef(false);
+
+  useEffect(() => {
+    if (!isSupabaseEdgeApi) return;
+    const controller = new AbortController();
+    let timer: number;
+    const heartbeat = async () => {
+      const revision = presenceUpdateCount.current;
+      try {
+        const { presence } = await apiRequest<{ presence: SupportPresence }>('/api/admin/support/heartbeat', {
+          method: 'POST',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]),
+        });
+        if (!controller.signal.aborted && revision === presenceUpdateCount.current) setChatPresence(presence);
+      } catch {
+        // The next heartbeat retries a transient connection failure.
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(heartbeat, 25000);
+      }
+    };
+    void heartbeat();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [profile.id]);
 
   const loadSupportChats = useCallback(async () => {
     const presenceUpdate = presenceUpdateCount.current;
@@ -173,9 +229,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         adminAcceptingChats: boolean;
       }>('/api/admin/support/conversations');
       setConversations(res.conversations);
-      if (res.presence && presenceUpdate === presenceUpdateCount.current) setChatPresence(res.presence);
-      if (typeof res.adminAcceptingChats === 'boolean') {
-        setAdminAcceptingChats(res.adminAcceptingChats);
+      if (presenceUpdate === presenceUpdateCount.current) {
+        if (res.presence) setChatPresence(res.presence);
+        if (typeof res.adminAcceptingChats === 'boolean') {
+          setAdminAcceptingChats(res.adminAcceptingChats);
+        }
       }
     } catch {
       // non-fatal if support chats endpoint temporarily unavailable
@@ -183,20 +241,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, []);
 
   const loadChatMessages = useCallback(async (convId: string) => {
+    const request = ++chatMessageRequest.current;
+    const isCurrent = () => request === chatMessageRequest.current && activeAdminThread.current === convId;
     setLoadingChatMessages(true);
     try {
       const res = await apiRequest<{
         conversation: SupportConversation;
         messages: SupportMessage[];
       }>(`/api/admin/support/conversations/${encodeURIComponent(convId)}/messages`);
-      setChatMessages(res.messages);
+      if (!isCurrent()) return;
+      setChatMessages((prev) => {
+        const loaded = new Set(res.messages.map((message) => message.id));
+        return [
+          ...res.messages,
+          ...prev.filter((message) => message.conversationId === convId && !loaded.has(message.id)),
+        ].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      });
       setConversations((prev) =>
         prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
       );
     } catch (err: any) {
-      setError(err.message || 'Could not load chat history.');
+      if (isCurrent()) setError(err.message || 'Could not load chat history.');
     } finally {
-      setLoadingChatMessages(false);
+      if (isCurrent()) setLoadingChatMessages(false);
     }
   }, []);
 
@@ -266,6 +333,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const { sendEvent } = useRealtime((evt) => {
     if (
       evt.type === 'connected' ||
+      evt.type === 'notifications:refresh' ||
       evt.type === 'settings:updated' ||
       evt.type === 'delivery:created' ||
       evt.type === 'delivery:updated' ||
@@ -274,6 +342,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       evt.type === 'complaint:updated'
     ) {
       loadOverview();
+    } else if (evt.type === 'support:refresh') {
+      void loadSupportChats();
+      if (section === 'chats' && activeChatId) void loadChatMessages(activeChatId);
     } else if (evt.type === 'support:presence') {
       presenceUpdateCount.current += 1;
       setChatPresence(evt.payload as SupportPresence);
@@ -730,8 +801,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   });
 
   const activeConversation = conversations.find((c) => c.id === activeChatId) || null;
+  const activeChatMessages = chatMessages.filter((message) => message.conversationId === activeChatId);
 
   const handleToggleAdminPresence = async () => {
+    if (changingPresence.current) return;
+    changingPresence.current = true;
+    presenceUpdateCount.current += 1;
     try {
       const nextAvailable = !adminAcceptingChats;
       const res = await apiRequest<{
@@ -741,6 +816,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         method: 'POST',
         body: JSON.stringify({ available: nextAvailable }),
       });
+      presenceUpdateCount.current += 1;
       setChatPresence(res.presence);
       setAdminAcceptingChats(res.adminAcceptingChats);
       setToast(
@@ -750,6 +826,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       );
     } catch (err: any) {
       setError(err.message || 'Could not update availability.');
+    } finally {
+      changingPresence.current = false;
     }
   };
 
@@ -766,10 +844,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         method: 'POST',
         body: JSON.stringify({ body: text }),
       });
-      if (!presetBody) setChatReply('');
-      setChatMessages((prev) =>
-        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
-      );
+      if (activeAdminThread.current === activeChatId) {
+        if (!presetBody) setChatReply((prev) => prev.trim() === text ? '' : prev);
+        setChatMessages((prev) =>
+          prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+        );
+      }
       setConversations((prev) =>
         prev
           .map((c) => (c.id === res.conversation.id ? res.conversation : c))
@@ -804,7 +884,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setConversations((prev) =>
         prev.map((c) => (c.id === res.conversation.id ? res.conversation : c))
       );
-      if (convId === activeChatId) {
+      if (convId === activeAdminThread.current) {
         setChatMessages((prev) =>
           prev.some((m) => m.id === res.systemMessage.id)
             ? prev
@@ -870,7 +950,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   ];
 
   return (
-    <div className="min-h-screen bg-neutral-50 text-black flex">
+    <div className="min-h-screen bg-[#F4F4F4] text-black flex">
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex w-64 bg-black text-white flex-col justify-between shrink-0">
         <div>
@@ -879,16 +959,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <SaqoLogo inverted />
             </button>
           </div>
-          <nav className="p-4 space-y-1">
+          <nav className="p-4 space-y-1.5">
             {navItems.map((item) => (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => setSection(item.id)}
-                className={`w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+                className={`w-full flex items-center justify-between gap-2 px-3.5 py-3 rounded-xl text-sm font-display transition-colors cursor-pointer ${
                   section === item.id
-                    ? 'bg-white text-black font-semibold'
-                    : 'text-neutral-300 hover:bg-white/10 hover:text-white'
+                    ? 'bg-white text-black font-extrabold tracking-tight shadow-sm'
+                    : 'text-neutral-300 font-bold hover:bg-white/10 hover:text-white'
                 }`}
               >
                 <span className="flex items-center gap-3 min-w-0">
@@ -928,12 +1008,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Top Bar */}
-        <header className="bg-white border-b border-neutral-200 px-4 sm:px-6 h-16 flex items-center justify-between gap-3 sticky top-0 z-30">
+        <header className="bg-white border-b-2 border-neutral-200 px-4 sm:px-6 h-16 flex items-center justify-between gap-3 sticky top-0 z-30">
           <div className="flex items-center gap-3 min-w-0">
             <button type="button" onClick={onGoHome} className="lg:hidden cursor-pointer shrink-0">
               <SaqoLogo />
             </button>
-            <h1 className="font-display font-bold text-sm sm:text-lg capitalize truncate">
+            <h1 className="font-display font-extrabold text-lg sm:text-xl tracking-tight capitalize truncate">
               <span className="hidden sm:inline">SAQO Operations / </span>
               {section === 'overview'
                 ? 'Live Fleet'
@@ -946,25 +1026,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <PWAInstallButton compact />
+            <div className="hidden lg:inline-flex">
+              <PWAInstallButton compact />
+            </div>
             <button
               type="button"
               onClick={loadOverview}
-              className="border border-neutral-300 px-3 py-1.5 rounded-lg text-xs font-semibold hover:border-black cursor-pointer"
+              className="hidden sm:inline-flex border-2 border-neutral-300 px-3.5 py-1.5 rounded-full font-display text-xs font-bold hover:border-black cursor-pointer"
             >
               Refresh
             </button>
             <button
               type="button"
-              onClick={onLogout}
-              className="lg:hidden bg-black text-white px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer"
+              onClick={() => setMobileMoreOpen(true)}
+              aria-label="Open admin navigation menu"
+              aria-expanded={mobileMoreOpen}
+              className="lg:hidden p-2 rounded-xl text-black hover:bg-neutral-100 active:scale-90 transition-all duration-200 cursor-pointer"
             >
-              Sign out
+              <Menu
+                className={`w-5 h-5 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  mobileMoreOpen ? 'rotate-90 scale-90 opacity-60' : 'rotate-0 scale-100 opacity-100'
+                }`}
+              />
             </button>
           </div>
         </header>
 
-        <main className="flex-1 px-4 sm:px-6 pt-5 sm:pt-6 pb-24 lg:pb-10 max-w-7xl w-full mx-auto space-y-6">
+        <main className="flex-1 px-4 sm:px-6 pt-5 sm:pt-6 pb-28 lg:pb-12 max-w-7xl w-full mx-auto space-y-6">
           {error && (
             <div role="alert" className="bg-white border border-black rounded-xl p-4 text-sm font-medium flex justify-between">
               <span>{error}</span>
@@ -992,39 +1080,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               {section === 'overview' && (
                 <div className="space-y-6">
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Active Deliveries</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Active Deliveries
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {activeDeliveries.length}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {completedDeliveries.length} completed · {cancelledDeliveries.length} cancelled
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Fleet Status ({riders.length} Riders)</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Fleet Status ({riders.length} Riders)
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {availableRiders.length + busyRiders.length} Online
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {availableRiders.length} available · {busyRiders.length} busy · {offlineRiders.length} offline
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Registered Customers</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Registered Customers
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {customers.length}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {deliveries.length} total parcel orders
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Gross Parcel Volume</p>
-                      <p className="font-display font-extrabold text-3xl mt-1 tabular-nums">
+                    <div className="bg-black text-white border-2 border-black rounded-2xl shadow-sm p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-400">
+                        Gross Parcel Volume
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-4xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(grossVolumeNgn)}
                       </p>
-                      <p className="text-xs text-neutral-500 mt-1 tabular-nums">
+                      <p className="text-xs text-neutral-300 mt-1 tabular-nums">
                         Max {settings?.maxActiveParcelsPerRider} parcels/rider
                       </p>
                     </div>
@@ -1173,9 +1269,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* DELIVERIES MANAGEMENT */}
               {section === 'deliveries' && (
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
                   <div className="p-4 sm:p-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-lg overflow-x-auto max-w-full">
+                    <div className="flex items-center gap-1.5 p-1 bg-neutral-100 rounded-xl overflow-x-auto max-w-full">
                       {(
                         [
                           { id: 'all', label: 'All' },
@@ -1189,8 +1285,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           key={f.id}
                           type="button"
                           onClick={() => setDeliveryFilter(f.id)}
-                          className={`px-3 py-1.5 rounded-md text-xs font-semibold cursor-pointer whitespace-nowrap ${
-                            deliveryFilter === f.id ? 'bg-white text-black shadow-sm' : 'text-neutral-600'
+                          className={`px-3.5 py-1.5 rounded-lg text-xs font-display font-bold cursor-pointer whitespace-nowrap transition-colors ${
+                            deliveryFilter === f.id
+                              ? 'bg-black text-white shadow-xs'
+                              : 'text-neutral-600 hover:text-black'
                           }`}
                         >
                           {f.label}
@@ -1422,10 +1520,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* RIDERS MANAGEMENT */}
               {section === 'riders' && (
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                  <div className="px-4 sm:px-6 py-4 sm:py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+                  <div className="px-4 sm:px-6 py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
                     <div>
-                      <h2 className="font-display font-bold text-xl">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Fleet Roster
+                      </p>
+                      <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight mt-0.5">
                         Fleet Riders ({filteredRiders.length})
                       </h2>
                       <p className="text-xs text-neutral-500 mt-0.5">
@@ -1670,10 +1771,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {/* CUSTOMERS MANAGEMENT */}
               {section === 'customers' && (
-                <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
-                  <div className="px-4 sm:px-6 py-4 sm:py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
+                <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
+                  <div className="px-4 sm:px-6 py-5 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-4">
                     <div>
-                      <h2 className="font-display font-bold text-xl">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Client Directory
+                      </p>
+                      <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight mt-0.5">
                         Customer Accounts ({filteredCustomers.length})
                       </h2>
                       <p className="text-xs text-neutral-500 mt-0.5">
@@ -1809,10 +1913,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <>
                 <form
                   onSubmit={handleSaveSettings}
-                  className="bg-white border border-neutral-200 rounded-xl p-6 sm:p-8 max-w-3xl space-y-6"
+                  className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-6 sm:p-8 max-w-3xl space-y-6"
                 >
                   <div>
-                    <h2 className="font-display font-bold text-xl">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Dispatch Controls
+                    </p>
+                    <h2 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight mt-0.5">
                       Smart Dispatch, Pricing & WhatsApp Settings
                     </h2>
                     <p className="text-sm text-neutral-600 mt-1">
@@ -2006,48 +2113,56 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <AdminPaymentsSection onNotify={(msg) => setToast(msg)} />
                   {/* Financial Summary Breakdown */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Gross Parcel Volume</p>
-                      <p className="font-display font-extrabold text-2xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Gross Parcel Volume
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(grossVolumeNgn)}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1 tabular-nums">
                         {nonRefundedPayments.length} active/settled transactions
                       </p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">Rider Payout Pool</p>
-                      <p className="font-display font-extrabold text-2xl mt-1 tabular-nums">
+                    <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                        Rider Payout Pool
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(riderPayoutsNgn)}
                       </p>
                       <p className="text-xs text-neutral-500 mt-1">Allocated to verified fleet</p>
                     </div>
-                    <div className="bg-white border border-neutral-200 rounded-xl p-5">
-                      <p className="text-xs text-neutral-500">SAQO Net Revenue</p>
-                      <p className="font-display font-extrabold text-2xl mt-1 tabular-nums">
+                    <div className="bg-black text-white border-2 border-black rounded-2xl shadow-sm p-5 sm:p-6">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-neutral-400">
+                        SAQO Net Revenue
+                      </p>
+                      <p className="font-display font-extrabold text-2xl sm:text-3xl tracking-tight mt-1.5 tabular-nums">
                         {formatNaira(platformRevenueNgn)}
                       </p>
-                      <p className="text-xs text-neutral-500 mt-1">Platform commission share</p>
+                      <p className="text-xs text-neutral-300 mt-1">Platform commission share</p>
                     </div>
                   </div>
 
-                  <div className="bg-white border border-neutral-200 rounded-xl overflow-hidden">
+                  <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs overflow-hidden">
                     <div className="px-4 sm:px-6 py-4 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-3">
                       <div className="flex items-center gap-2">
                         <AlertTriangle className="w-4 h-4" />
-                        <h2 className="font-display font-bold text-lg">
+                        <h2 className="font-display font-extrabold text-lg tracking-tight">
                           Tickets: Complaints & Suggestions ({filteredTickets.length})
                         </h2>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
-                        <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-lg">
+                        <div className="flex items-center gap-1 p-1 bg-neutral-100 rounded-xl">
                           {(['all', 'complaint', 'suggestion'] as const).map((tf) => (
                             <button
                               key={tf}
                               type="button"
                               onClick={() => setTicketFilter(tf)}
-                              className={`px-3 py-1 rounded-md text-xs font-semibold capitalize cursor-pointer ${
-                                ticketFilter === tf ? 'bg-white text-black shadow-sm' : 'text-neutral-600'
+                              className={`px-3 py-1 rounded-lg text-xs font-display font-bold capitalize cursor-pointer transition-colors ${
+                                ticketFilter === tf
+                                  ? 'bg-black text-white shadow-xs'
+                                  : 'text-neutral-600 hover:text-black'
                               }`}
                             >
                               {tf}
@@ -2215,7 +2330,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               {section === 'chats' && (
                 <div className="space-y-4">
                   {/* Live Presence & Filters Bar */}
-                  <div className="bg-white border border-neutral-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="bg-white border border-neutral-200 rounded-2xl shadow-xs p-4 sm:p-5 flex flex-wrap items-center justify-between gap-3">
                     <div className="flex items-center gap-3 min-w-0">
                       <span
                         className={`w-2.5 h-2.5 rounded-full shrink-0 ${
@@ -2441,16 +2556,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
                           {/* Message History */}
                           <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-neutral-50">
-                            {loadingChatMessages ? (
+                            {loadingChatMessages && activeChatMessages.length === 0 ? (
                               <p className="text-xs text-neutral-500 text-center py-6">
                                 Loading message history...
                               </p>
-                            ) : chatMessages.length === 0 ? (
+                            ) : activeChatMessages.length === 0 ? (
                               <p className="text-xs text-neutral-500 text-center py-6">
                                 No messages yet.
                               </p>
                             ) : (
-                              chatMessages.map((m) => {
+                              activeChatMessages.map((m) => {
                                 if (m.senderRole === 'system') {
                                   return (
                                     <div key={m.id} className="flex justify-center">
@@ -2559,14 +2674,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </main>
       </div>
 
-      {/* Native Mobile Bottom Navigation (5 spacious slots + More sheet) */}
+      {/* Native Mobile Bottom Navigation (5 crisp quick slots + Full Bold Drawer) */}
       <nav
         aria-label="Admin mobile navigation"
-        className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-neutral-200 grid grid-cols-5 pb-[env(safe-area-inset-bottom)]"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur-md border-t-2 border-black shadow-[0_-8px_28px_rgba(0,0,0,0.08)] grid grid-cols-5 gap-1 px-1.5 pt-1.5 pb-[calc(0.45rem+env(safe-area-inset-bottom))]"
       >
         {navItems.slice(0, 4).map((item) => {
           const targetId = item.id === 'customers' ? 'chats' : item.id;
           const navItem = navItems.find((n) => n.id === targetId)!;
+          const isActive = section === navItem.id && !mobileMoreOpen;
           return (
             <button
               key={navItem.id}
@@ -2575,14 +2691,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 setSection(navItem.id);
                 setMobileMoreOpen(false);
               }}
-              className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-[11px] font-semibold ${
-                section === navItem.id ? 'text-black' : 'text-neutral-600'
+              className={`relative flex flex-col items-center justify-center py-2 px-0.5 rounded-xl gap-1 transition-all cursor-pointer ${
+                isActive
+                  ? 'bg-black text-white shadow-sm'
+                  : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
               }`}
             >
               {navItem.icon}
-              <span className="truncate max-w-full">{navItem.mobileLabel}</span>
+              <span className="font-display font-extrabold text-[10.5px] sm:text-[11px] leading-none tracking-tight truncate max-w-full">
+                {navItem.mobileLabel}
+              </span>
               {navItem.badge && (
-                <span className="absolute top-1 right-2 min-w-[15px] h-[15px] px-1 rounded-full bg-black text-white text-[9px] font-mono font-bold flex items-center justify-center tabular-nums">
+                <span
+                  className={`absolute top-1 right-1.5 min-w-[15px] h-[15px] px-1 rounded-full text-[9px] font-mono font-bold flex items-center justify-center tabular-nums ${
+                    isActive ? 'bg-white text-black' : 'bg-black text-white'
+                  }`}
+                >
                   {navItem.badge}
                 </span>
               )}
@@ -2593,82 +2717,83 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           type="button"
           onClick={() => setMobileMoreOpen((v) => !v)}
           aria-expanded={mobileMoreOpen}
-          className={`relative flex flex-col items-center justify-center py-2.5 px-1 gap-1 text-[11px] font-semibold ${
+          className={`relative flex flex-col items-center justify-center py-2 px-0.5 rounded-xl gap-1 transition-all cursor-pointer ${
             ['customers', 'settings', 'finance'].includes(section) || mobileMoreOpen
-              ? 'text-black'
-              : 'text-neutral-600'
+              ? 'bg-black text-white shadow-sm'
+              : 'text-neutral-600 hover:text-black hover:bg-neutral-100'
           }`}
         >
-          <MoreHorizontal className="w-4 h-4" />
-          <span>More</span>
+          <MoreHorizontal className="w-4 h-4" strokeWidth={2.5} />
+          <span className="font-display font-extrabold text-[10.5px] sm:text-[11px] leading-none tracking-tight">
+            Menu
+          </span>
           {openTicketsCount > 0 && (
-            <span className="absolute top-1 right-2 min-w-[15px] h-[15px] px-1 rounded-full bg-black text-white text-[9px] font-mono font-bold flex items-center justify-center tabular-nums">
+            <span
+              className={`absolute top-1 right-1.5 min-w-[15px] h-[15px] px-1 rounded-full text-[9px] font-mono font-bold flex items-center justify-center tabular-nums ${
+                ['customers', 'settings', 'finance'].includes(section) || mobileMoreOpen
+                  ? 'bg-white text-black'
+                  : 'bg-black text-white'
+              }`}
+            >
               {openTicketsCount}
             </span>
           )}
         </button>
       </nav>
 
-      {/* Mobile More Sections Sheet */}
-      {mobileMoreOpen && (
-        <div
-          role="dialog"
-          aria-label="More admin sections"
-          className="lg:hidden fixed inset-0 z-50 bg-black/50 flex items-end justify-center"
-          onClick={() => setMobileMoreOpen(false)}
-        >
-          <div
-            className="bg-white border-t border-black rounded-t-2xl w-full p-5 pb-8 space-y-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-neutral-200 pb-3">
-              <p className="font-display font-bold text-base">Operations Menu</p>
+      {/* Bold Full-Screen Mobile Admin Navigation Drawer */}
+      <MobileNavDrawer
+        open={mobileMoreOpen}
+        onClose={() => setMobileMoreOpen(false)}
+        ariaLabel="Operations navigation"
+        breakpoint="lg"
+        headerAction={
+          <span className="px-3 py-1.5 rounded-full bg-black text-white text-xs font-bold whitespace-nowrap">
+            Admin
+          </span>
+        }
+        items={navItems.map((item) => ({
+          id: item.id,
+          label: item.label,
+          active: section === item.id,
+          badge:
+            item.badge !== undefined
+              ? item.badge
+              : item.id === 'finance' && openTicketsCount > 0
+              ? `${openTicketsCount} open`
+              : undefined,
+          onSelect: () => setSection(item.id),
+        }))}
+        footerContent={
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => setMobileMoreOpen(false)}
-                aria-label="Close operations menu"
-                className="w-8 h-8 rounded-full bg-neutral-100 flex items-center justify-center cursor-pointer"
+                onClick={() => {
+                  loadOverview();
+                  setMobileMoreOpen(false);
+                }}
+                className="inline-flex items-center gap-1.5 border border-neutral-300 bg-white px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer"
               >
-                <X className="w-4 h-4" />
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Refresh Data</span>
               </button>
+              <PWAInstallButton />
             </div>
-            <div className="grid grid-cols-1 gap-2">
-              {(['customers', 'settings', 'finance'] as AdminSection[]).map((id) => {
-                const item = navItems.find((n) => n.id === id)!;
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => {
-                      setSection(item.id);
-                      setMobileMoreOpen(false);
-                    }}
-                    className={`w-full flex items-center justify-between px-4 py-3 rounded-xl border text-sm font-semibold cursor-pointer ${
-                      section === item.id
-                        ? 'bg-black text-white border-black'
-                        : 'bg-white text-black border-neutral-200'
-                    }`}
-                  >
-                    <span className="inline-flex items-center gap-3">
-                      {item.icon}
-                      <span>{item.label}</span>
-                    </span>
-                    {item.id === 'finance' && openTicketsCount > 0 && (
-                      <span
-                        className={`text-xs font-mono font-bold px-2 py-0.5 rounded tabular-nums ${
-                          section === item.id ? 'bg-white text-black' : 'bg-black text-white'
-                        }`}
-                      >
-                        {openTicketsCount} open
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMoreOpen(false);
+                onLogout();
+              }}
+              className="w-full inline-flex items-center justify-center gap-2 bg-black text-white py-3 rounded-xl text-sm font-bold cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Sign out ({profile.fullName.split(' ')[0]})</span>
+            </button>
           </div>
-        </div>
-      )}
+        }
+      />
 
       {/* User Details Drawer / Modal */}
       {(inspectedCustomer || inspectedRider) && (

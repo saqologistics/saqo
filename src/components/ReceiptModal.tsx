@@ -6,7 +6,11 @@ import {
   printReceipt,
   type SaqoReceiptData,
 } from '../lib/receipt';
-import { formatNaira } from '../shared/pricing';
+import {
+  formatNaira,
+  formatPaymentMethodLabel,
+  formatPaymentStatusLabel,
+} from '../shared/pricing';
 
 interface Props {
   receipt: SaqoReceiptData | null;
@@ -24,7 +28,7 @@ export const ReceiptModal: React.FC<Props> = ({ receipt, onClose }) => {
     minute: '2-digit',
   });
 
-  const statusLabel = receipt.status.replace(/_/g, ' ').toUpperCase();
+  const statusLabel = formatPaymentStatusLabel(receipt.paymentMethod, receipt.status).toUpperCase();
 
   return (
     <div
@@ -81,8 +85,8 @@ export const ReceiptModal: React.FC<Props> = ({ receipt, onClose }) => {
             </div>
             <div className="flex items-center justify-between py-2.5 gap-3">
               <span className="font-mono uppercase text-[11px] text-neutral-500">Method</span>
-              <span className="font-mono font-semibold uppercase text-neutral-900">
-                {receipt.paymentMethod.replace(/_/g, ' ')}
+              <span className="font-semibold text-neutral-900">
+                {formatPaymentMethodLabel(receipt.paymentMethod)}
               </span>
             </div>
             <div className="flex items-center justify-between py-2.5 gap-3">

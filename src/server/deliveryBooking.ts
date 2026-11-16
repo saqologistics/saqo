@@ -21,7 +21,7 @@ interface BookingDetails {
   riderCommissionPercent: number;
 }
 
-export function createBookingRows(details: BookingDetails) {
+export async function createBookingRows(details: BookingDetails) {
   const {
     customerId, pickupState, pickupAddress, pCoords, destinationState, destinationAddress, dCoords,
     recipientName, recipientPhone, parcelCategory, parcelDescription, weightKg,
@@ -38,7 +38,7 @@ export function createBookingRows(details: BookingDetails) {
         ? 'pending_verification'
         : 'pending';
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO delivery_requests (
       id, tracking_code, customer_id, pickup_state, pickup_address, pickup_lat, pickup_lng,
       destination_state, destination_address, destination_lat, destination_lng,
@@ -70,7 +70,7 @@ export function createBookingRows(details: BookingDetails) {
     now
   );
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO parcels (id, delivery_id, category, description, weight_kg)
     VALUES (?, ?, ?, ?, ?)
   `).run(
@@ -86,12 +86,12 @@ export function createBookingRows(details: BookingDetails) {
     riderCommissionPercent
   );
   const platformFee = quote.deliveryFeeNgn - riderPayout;
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO payments (id, delivery_id, amount_ngn, rider_payout_ngn, platform_fee_ngn, status, created_at)
     VALUES (?, ?, ?, ?, ?, 'pending', ?)
   `).run(`pay-${crypto.randomUUID().slice(0, 8)}`, deliveryId, quote.deliveryFeeNgn, riderPayout, platformFee, now);
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO delivery_status_history (id, delivery_id, status, note, actor_role, created_at)
     VALUES (?, ?, 'pending_dispatch', ?, 'client', ?)
   `).run(

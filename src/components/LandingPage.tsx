@@ -1,8 +1,7 @@
 import type { publicTrackingDelivery, publicTrackingHistory } from '../server/db';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowRight,
-  ArrowUpDown,
   BadgeCheck,
   Check,
   CheckCircle2,
@@ -14,7 +13,6 @@ import {
   Phone,
   RefreshCw,
   Search,
-  ShieldCheck,
   Truck,
   X,
 } from 'lucide-react';
@@ -22,7 +20,7 @@ import heroCourierImg from '../assets/images/hero_saqo_dispatch_1794561358037.jp
 import hubImg from '../assets/images/interstate_parcel_hub_1794561359146.jpg';
 import { useRealtime } from '../hooks/useRealtime';
 import { apiRequest } from '../lib/api';
-import { NIGERIA_STATES, resolveAddressCoordinates } from '../shared/nigeria';
+import { resolveAddressCoordinates } from '../shared/nigeria';
 import { formatEta, formatNaira } from '../shared/pricing';
 import { formatDeliveryStatusLabel, getTrackingProgress } from '../shared/tracking';
 import type {
@@ -31,9 +29,10 @@ import type {
   PriceQuote,
   Profile,
 } from '../shared/types';
-import { AddressPickerField } from './AddressPickerField';
 import { LiveNigeriaMap } from './LiveNigeriaMap';
+import { MobileNavDrawer } from './MobileNavDrawer';
 import { PWAInstallButton } from './PWAInstallButton';
+import { RouteLocationCard } from './RouteLocationCard';
 import { SaqoLogo } from './SaqoLogo';
 import { buildWhatsAppUrl } from './WhatsAppWidget';
 
@@ -83,10 +82,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   const [trackCode, setTrackCode] = useState(initialTrackCode || '');
   const [trackedDelivery, setTrackedDelivery] = useState<ReturnType<typeof publicTrackingDelivery> | null>(null);
-  const [trackedHistory, setTrackedHistory] = useState<ReturnType<typeof publicTrackingHistory>>([]);
+  const [trackedHistory, setTrackedHistory] = useState<Awaited<ReturnType<typeof publicTrackingHistory>>>([]);
   const [trackError, setTrackError] = useState<string | null>(null);
   const [trackLoading, setTrackLoading] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
+  const trackingSearch = useRef(0);
+  const trackingRefresh = useRef<{ search: number; nextAt: number } | null>(null);
 
   const [otpInput, setOtpInput] = useState('');
   const [otpMessage, setOtpMessage] = useState<string | null>(null);
@@ -144,28 +145,33 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   }, [pickupState, pickupAddress, pickupCoords, destinationState, destinationAddress, destinationCoords]);
 
   const handleTrackSearch = async (codeToSearch?: string) => {
+    const search = ++trackingSearch.current;
     const code = (codeToSearch ?? trackCode).trim();
     if (!code) {
       setTrackError('Enter your SAQO tracking code to locate a parcel.');
+      setTrackLoading(false);
       return;
     }
     setTrackLoading(true);
     setTrackError(null);
     setOtpMessage(null);
     setOtpError(null);
+    setOtpInput('');
     try {
       const res = await apiRequest<{
         delivery: ReturnType<typeof publicTrackingDelivery>;
-        history: ReturnType<typeof publicTrackingHistory>;
+        history: Awaited<ReturnType<typeof publicTrackingHistory>>;
       }>(`/api/track/${encodeURIComponent(code)}`);
+      if (search !== trackingSearch.current) return;
       setTrackedDelivery(res.delivery);
       setTrackedHistory(res.history);
     } catch (err: any) {
+      if (search !== trackingSearch.current) return;
       setTrackedDelivery(null);
       setTrackedHistory([]);
       setTrackError(err.message || 'Parcel not found.');
     } finally {
-      setTrackLoading(false);
+      if (search === trackingSearch.current) setTrackLoading(false);
     }
   };
 
@@ -177,16 +183,21 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
   // Live real-time tracking updates for the currently tracked parcel
   const { connected, sendEvent } = useRealtime((evt) => {
-    if (!trackedDelivery) return;
+    if (!trackedDelivery || trackLoading) return;
     if (evt.type === 'delivery:updated') {
+      if (otpSubmitting) return;
       const updated = evt.payload as ReturnType<typeof publicTrackingDelivery>;
-      if (updated?.id === trackedDelivery.id) {
-        if (updated.status) setTrackedDelivery(updated);
+      if (!updated || updated.id === trackedDelivery.id) {
+        const search = trackingSearch.current;
+        const lastRefresh = trackingRefresh.current;
+        if (lastRefresh?.search === search && lastRefresh.nextAt > Date.now()) return;
+        trackingRefresh.current = { search, nextAt: Date.now() + 1000 };
         apiRequest<{
           delivery: ReturnType<typeof publicTrackingDelivery>;
-          history: ReturnType<typeof publicTrackingHistory>;
+          history: Awaited<ReturnType<typeof publicTrackingHistory>>;
         }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}`)
           .then((res) => {
+            if (search !== trackingSearch.current) return;
             setTrackedDelivery(res.delivery);
             setTrackedHistory(res.history);
           })
@@ -223,22 +234,25 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       return;
     }
     setOtpSubmitting(true);
+    const search = trackingSearch.current;
     setOtpError(null);
     setOtpMessage(null);
     try {
       const res = await apiRequest<{
         delivery: ReturnType<typeof publicTrackingDelivery>;
-        history: ReturnType<typeof publicTrackingHistory>;
+        history: Awaited<ReturnType<typeof publicTrackingHistory>>;
       }>(`/api/track/${encodeURIComponent(trackedDelivery.trackingCode)}/confirm-otp`, {
         method: 'POST',
         body: JSON.stringify({ otp: otpInput.trim() }),
       });
+      if (search !== trackingSearch.current) return;
+      trackingSearch.current += 1;
       setTrackedDelivery(res.delivery);
       setTrackedHistory(res.history);
       setOtpMessage('Delivery confirmed. Recipient OTP verified.');
       setOtpInput('');
     } catch (err: any) {
-      setOtpError(err.message || 'OTP verification failed.');
+      if (search === trackingSearch.current) setOtpError(err.message || 'OTP verification failed.');
     } finally {
       setOtpSubmitting(false);
     }
@@ -289,12 +303,14 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </nav>
 
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            <PWAInstallButton inverted compact />
+            <div className="hidden md:inline-flex">
+              <PWAInstallButton inverted compact />
+            </div>
             {currentUser ? (
               <button
                 type="button"
                 onClick={() => onOpenDashboard()}
-                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold bg-white text-black rounded-lg hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-bold bg-white text-black rounded-full hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Open Dashboard
               </button>
@@ -302,7 +318,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               <button
                 type="button"
                 onClick={() => onNavigateAuth('login', 'client')}
-                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold bg-white text-black rounded-lg hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-bold bg-white text-black rounded-full hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Sign in
               </button>
@@ -312,54 +328,99 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               onClick={() => setMobileMenuOpen((v) => !v)}
               aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
               aria-expanded={mobileMenuOpen}
-              className="md:hidden p-2 rounded-lg border border-white/20 text-white hover:bg-white/10 cursor-pointer"
+              className="md:hidden p-2 rounded-lg text-white hover:bg-white/10 active:scale-90 transition-all duration-200 cursor-pointer"
             >
-              {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+              {mobileMenuOpen ? (
+                <X className="w-5 h-5 transition-transform duration-200 rotate-0" />
+              ) : (
+                <Menu className="w-5 h-5 transition-transform duration-200 rotate-0" />
+              )}
             </button>
           </div>
         </div>
 
-        {mobileMenuOpen && (
-          <div className="md:hidden bg-black border-t border-white/15 px-4 py-4 space-y-2 text-sm font-medium">
-            <a
-              href="#send-box"
-              onClick={() => {
+        <MobileNavDrawer
+          open={mobileMenuOpen}
+          onClose={() => setMobileMenuOpen(false)}
+          ariaLabel="SAQO navigation"
+          headerAction={
+            currentUser ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onOpenDashboard();
+                }}
+                className="px-3.5 py-1.5 rounded-full bg-black text-white text-xs font-bold whitespace-nowrap cursor-pointer"
+              >
+                Dashboard
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  onNavigateAuth('login', 'client');
+                }}
+                className="px-3.5 py-1.5 rounded-full bg-black text-white text-xs font-bold whitespace-nowrap cursor-pointer"
+              >
+                Sign in
+              </button>
+            )
+          }
+          items={[
+            {
+              id: 'send',
+              label: 'Send a Parcel',
+              onSelect: () => {
                 setHeroTab('send');
-                setMobileMenuOpen(false);
-              }}
-              className="block py-2.5 px-3 rounded-lg text-neutral-200 hover:bg-white/10"
-            >
-              Send a Parcel
-            </a>
-            <a
-              href="#track-section"
-              onClick={() => {
+                document.getElementById('send-box')?.scrollIntoView({ behavior: 'smooth' });
+              },
+            },
+            {
+              id: 'track',
+              label: 'Track',
+              onSelect: () => {
                 scrollToTrack();
-                setMobileMenuOpen(false);
-              }}
-              className="block py-2.5 px-3 rounded-lg text-neutral-200 hover:bg-white/10"
-            >
-              Track a Parcel
-            </a>
-            <button
-              type="button"
-              onClick={() => {
-                setMobileMenuOpen(false);
-                onNavigateAuth('login', 'rider');
-              }}
-              className="w-full text-left py-2.5 px-3 rounded-lg text-neutral-200 hover:bg-white/10 cursor-pointer"
-            >
-              Rider Sign In
-            </button>
-            <a
-              href="#how-it-works"
-              onClick={() => setMobileMenuOpen(false)}
-              className="block py-2.5 px-3 rounded-lg text-neutral-200 hover:bg-white/10"
-            >
-              How it works
-            </a>
-          </div>
-        )}
+              },
+            },
+            {
+              id: 'drive',
+              label: 'Drive with SAQO',
+              onSelect: () => onNavigateAuth('login', 'rider'),
+            },
+            {
+              id: 'how-it-works',
+              label: 'How it works',
+              onSelect: () => {
+                document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' });
+              },
+            },
+            {
+              id: 'help',
+              label: 'Help',
+              onSelect: () => onOpenSupportChat?.(),
+            },
+          ]}
+          footerContent={
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <PWAInstallButton />
+                {whatsAppOrderNumber && (
+                  <a
+                    href={buildWhatsAppUrl(whatsAppOrderNumber, 'HI')}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs font-bold text-black underline"
+                  >
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    <span>WhatsApp Bot</span>
+                  </a>
+                )}
+              </div>
+            </div>
+          }
+        />
       </header>
 
       {/* Hero Section: Uber-inspired High-Contrast Black Editorial Canvas */}
@@ -434,184 +495,77 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 </button>
               </div>
 
-              {heroTab === 'send' && whatsAppOrderNumber && (
-                <a href={buildWhatsAppUrl(whatsAppOrderNumber, 'ORDER')} target="_blank" rel="noreferrer"
-                  className="mb-3 inline-flex items-center gap-2 rounded-lg border border-neutral-300 px-3 py-2 text-xs font-semibold hover:bg-neutral-100">
-                  Order on WhatsApp
-                </a>
+              {whatsAppOrderNumber && (
+                <div className="mb-3 flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] font-semibold text-neutral-500 mr-1">WhatsApp:</span>
+                  {([
+                    ['Order', 'ORDER'],
+                    ['Status', 'STATUS'],
+                    ['Support', 'SUPPORT'],
+                    ['Menu', 'HI'],
+                  ] as const).map(([label, cmd]) => (
+                    <a
+                      key={cmd}
+                      href={buildWhatsAppUrl(whatsAppOrderNumber, cmd)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center rounded-md border border-neutral-300 bg-white px-2.5 py-1 text-xs font-semibold text-black hover:bg-neutral-100 transition-colors"
+                    >
+                      {label}
+                    </a>
+                  ))}
+                </div>
               )}
 
               {heroTab === 'send' ? (
-                <div className="space-y-3">
-                  <div className="space-y-2.5">
-                    {/* FROM: PICKUP */}
-                    <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-3 space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-black">
-                          <span aria-hidden="true" className="w-2 h-2 rounded-full bg-black shrink-0" />
-                          <span>From · Pickup</span>
-                        </span>
-                        <span className="text-[11px] text-neutral-500">{showDeliveryStateSelectors ? pickupState : "Katsina State"}</span>
-                      </div>
-                      <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-5 gap-2" : undefined}>
-                        {showDeliveryStateSelectors && (
-                          <div className="sm:col-span-2">
-                            <label className="sr-only" htmlFor="hero-pickup-state">
-                              Pickup state
-                            </label>
-                            <select
-                              id="hero-pickup-state"
-                              value={pickupState}
-                              onChange={(e) => {
-                                const nextState = e.target.value;
-                                setPickupState(nextState);
-                                setPickupAddress('');
-                                setPickupCoords(null);
-                              }}
-                              className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
-                            >
-                              <option value="Katsina">Katsina (Live Hub)</option>
-                              {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
-                                <option key={s.name} value={s.name}>
-                                  {s.name}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        )}
-                        <div className={showDeliveryStateSelectors ? "sm:col-span-3" : undefined}>
-                          <label className="sr-only" htmlFor="hero-pickup-address">
-                            Pickup address
-                          </label>
-                          <AddressPickerField
-                            id="hero-pickup-address"
-                            label="Pickup address"
-                            variant="pickup"
-                            stateName={pickupState}
-                            restrictToState={!showDeliveryStateSelectors}
-                            value={pickupAddress}
-                            oppositeAddress={destinationCoords ? destinationAddress : undefined}
-                            selectedCoords={pickupCoords}
-                            placeholder="Type Katsina street, gate, or LGA..."
-                            surfaceClassName="bg-white border border-neutral-300"
-                            onChange={(value) => {
-                              setPickupAddress(value);
-                              setPickupCoords(null);
-                            }}
-                            onStateDetected={setPickupState}
-                            onLocationResolved={(place) => {
-                              setPickupCoords({ lat: place.lat, lng: place.lng });
-                            }}
-                          />
+                <div className="space-y-4">
+                  <RouteLocationCard
+                    idPrefix="hero"
+                    showDeliveryStateSelectors={showDeliveryStateSelectors}
+                    pickupState={pickupState}
+                    pickupAddress={pickupAddress}
+                    pickupCoords={pickupCoords}
+                    destinationState={destinationState}
+                    destinationAddress={destinationAddress}
+                    destinationCoords={destinationCoords}
+                    required={false}
+                    onPickupStateChange={setPickupState}
+                    onPickupAddressChange={setPickupAddress}
+                    onPickupCoordsChange={setPickupCoords}
+                    onDestinationStateChange={setDestinationState}
+                    onDestinationAddressChange={setDestinationAddress}
+                    onDestinationCoordsChange={setDestinationCoords}
+                    onSwap={() => {
+                      const nextPState = destinationState;
+                      const nextDState = pickupState;
+                      const nextPAddr = destinationAddress;
+                      const nextDAddr = pickupAddress;
+                      const nextPCoords = destinationCoords;
+                      const nextDCoords = pickupCoords;
+                      setPickupState(nextPState);
+                      setDestinationState(nextDState);
+                      setPickupAddress(nextPAddr);
+                      setDestinationAddress(nextDAddr);
+                      setPickupCoords(nextPCoords);
+                      setDestinationCoords(nextDCoords);
+                    }}
+                  />
+
+                  {quoteLoading && <p role="status" className="text-sm text-neutral-500">Calculating prices…</p>}
+                  {quote && pickupCoords && destinationCoords ? (
+                    <div className="pt-3 border-t border-neutral-200 space-y-3">
+                      <div className="flex flex-wrap items-baseline justify-between gap-2">
+                        <div>
+                          <p className="text-xs text-neutral-500 font-medium">
+                            {quote.targetLabel} · <span className="tabular-nums">{quote.distanceKm} km</span>
+                          </p>
+                          <p className="font-display font-extrabold text-2xl tabular-nums mt-0.5">
+                            {formatNaira(quote.deliveryFeeNgn)}{' '}
+                            <span className="text-sm font-medium text-neutral-600">
+                              · Est. {formatEta(quote.estimatedMinutes)}
+                            </span>
+                          </p>
                         </div>
-                      </div>
-                    </div>
-
-                    {/* Swap From & To Divider (clean spacing, zero overlap) */}
-                    <div className="flex items-center justify-center gap-3 py-2">
-                      <div className="h-px flex-1 bg-neutral-200" />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const nextPState = destinationState;
-                          const nextDState = pickupState;
-                          const nextPAddr = destinationAddress;
-                          const nextDAddr = pickupAddress;
-                          const nextPCoords = destinationCoords;
-                          const nextDCoords = pickupCoords;
-                          setPickupState(nextPState);
-                          setDestinationState(nextDState);
-                          setPickupAddress(nextPAddr);
-                          setDestinationAddress(nextDAddr);
-                          setPickupCoords(nextPCoords);
-                          setDestinationCoords(nextDCoords);
-                        }}
-                        aria-label="Swap From and To locations"
-                        className="inline-flex items-center gap-1.5 min-h-10 border border-neutral-300 bg-white hover:border-black px-3.5 py-1.5 rounded-full text-[11px] font-semibold text-neutral-700 hover:text-black shadow-xs cursor-pointer transition-colors shrink-0"
-                      >
-                        <ArrowUpDown className="w-3 h-3" />
-                        <span>Swap From / To</span>
-                      </button>
-                      <div className="h-px flex-1 bg-neutral-200" />
-                    </div>
-
-                    {/* TO: DESTINATION */}
-                    <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-3 space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-black">
-                          <span aria-hidden="true" className="w-2 h-2 border-2 border-black bg-white shrink-0" />
-                          <span>To · Destination</span>
-                        </span>
-                        <span className="text-[11px] text-neutral-500">{showDeliveryStateSelectors ? destinationState : "Katsina State"}</span>
-                      </div>
-                      <div className={showDeliveryStateSelectors ? "grid grid-cols-1 sm:grid-cols-5 gap-2" : undefined}>
-                        {showDeliveryStateSelectors && (
-                          <div className="sm:col-span-2">
-                            <label className="sr-only" htmlFor="hero-dest-state">
-                              Destination state
-                            </label>
-                            <select
-                              id="hero-dest-state"
-                              value={destinationState}
-                              onChange={(e) => {
-                                const nextState = e.target.value;
-                                setDestinationState(nextState);
-                                setDestinationAddress('');
-                                setDestinationCoords(null);
-                              }}
-                              className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2.5 text-base sm:text-sm font-medium focus:outline-none focus:ring-2 focus:ring-black"
-                            >
-                              <option value="Katsina">Katsina (Live Hub)</option>
-                              {NIGERIA_STATES.filter((s) => s.name !== 'Katsina').map((s) => (
-                                <option key={s.name} value={s.name}>
-                                  {s.name}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        )}
-                        <div className={showDeliveryStateSelectors ? "sm:col-span-3" : undefined}>
-                          <label className="sr-only" htmlFor="hero-dest-address">
-                            Destination address
-                          </label>
-                          <AddressPickerField
-                            id="hero-dest-address"
-                            label="Destination address"
-                            variant="destination"
-                            stateName={destinationState}
-                            restrictToState={!showDeliveryStateSelectors}
-                            value={destinationAddress}
-                            oppositeAddress={pickupCoords ? pickupAddress : undefined}
-                            selectedCoords={destinationCoords}
-                            placeholder="Type drop-off street, campus, or town..."
-                            surfaceClassName="bg-white border border-neutral-300"
-                            onChange={(value) => {
-                              setDestinationAddress(value);
-                              setDestinationCoords(null);
-                            }}
-                            onStateDetected={setDestinationState}
-                            onLocationResolved={(place) => {
-                              setDestinationCoords({ lat: place.lat, lng: place.lng });
-                            }}
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {quoteLoading && <p role="status" className="text-sm text-neutral-500">Calculating quote…</p>}
-                  {quote && pickupCoords && destinationCoords && (
-                    <div className="pt-2 flex flex-wrap items-center justify-between gap-4 border-t border-neutral-200">
-                      <div>
-                        <p className="text-xs text-neutral-500 font-medium">
-                          {quote.targetLabel} · <span className="tabular-nums">{quote.distanceKm} km</span>
-                        </p>
-                        <p className="font-display font-bold text-lg tabular-nums">
-                          {formatNaira(quote.deliveryFeeNgn)}{' '}
-                          <span className="text-sm font-normal text-neutral-600">
-                            · Est. {formatEta(quote.estimatedMinutes)}
-                          </span>
-                        </p>
                       </div>
                       <button
                         type="button"
@@ -620,11 +574,29 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                           if (currentUser?.role === 'client') onOpenDashboard(draft);
                           else onNavigateAuth('login', 'client', draft);
                         }}
-                        className="bg-black text-white px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-neutral-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        className="w-full bg-black text-white px-5 py-3.5 rounded-xl text-sm font-bold hover:bg-neutral-900 transition-colors cursor-pointer"
                       >
                         Request Rider
                       </button>
                     </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!pickupCoords) {
+                          document.getElementById('hero-pickup-addr')?.focus();
+                        } else if (!destinationCoords) {
+                          document.getElementById('hero-dest-addr')?.focus();
+                        } else {
+                          const draft = { pickupState, pickupAddress, pickupCoords, destinationState, destinationAddress, destinationCoords };
+                          if (currentUser?.role === 'client') onOpenDashboard(draft);
+                          else onNavigateAuth('login', 'client', draft);
+                        }
+                      }}
+                      className="w-full bg-black text-white px-5 py-3.5 rounded-xl text-sm font-bold hover:bg-neutral-900 transition-colors cursor-pointer"
+                    >
+                      See prices
+                    </button>
                   )}
                 </div>
               ) : (
@@ -1207,7 +1179,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
       {/* Role Portals Banner */}
       <section className="py-16 bg-black text-white">
-        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="border border-white/15 rounded-xl p-6 flex flex-col justify-between">
             <div>
               <Package className="w-6 h-6 mb-4" />
@@ -1239,23 +1211,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               className="mt-6 w-full bg-white text-black py-2.5 rounded-lg text-sm font-semibold hover:bg-neutral-200 transition-colors cursor-pointer"
             >
               Rider Portal
-            </button>
-          </div>
-
-          <div className="border border-white/15 rounded-xl p-6 flex flex-col justify-between">
-            <div>
-              <ShieldCheck className="w-6 h-6 mb-4" />
-              <h3 className="font-display font-bold text-xl">SAQO Operations</h3>
-              <p className="text-sm text-neutral-400 mt-2 leading-relaxed">
-                Monitor live Nigerian fleet activity, manually reassign parcels, verify riders, and configure dispatch rules & pricing.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => onNavigateAuth('login', 'client')}
-              className="mt-6 w-full border border-white/30 text-white py-2.5 rounded-lg text-sm font-semibold hover:bg-white/10 transition-colors cursor-pointer"
-            >
-              Admin Console Sign In
             </button>
           </div>
         </div>

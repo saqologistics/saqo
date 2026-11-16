@@ -6,6 +6,8 @@ import {
   calculateRiderPayoutNgn,
   classifyServiceTier,
   DEFAULT_PLATFORM_SETTINGS,
+  formatPaymentMethodLabel,
+  formatPaymentStatusLabel,
   isValidNigerianPhone,
   matchesDeliveryOtp,
 } from './pricing';
@@ -274,6 +276,12 @@ test('pricing & handoff helpers: validates rider payout, Nigerian phones, and 4-
   assert.equal(matchesDeliveryOtp('9999', '4821'), false);
   assert.equal(matchesDeliveryOtp('482', '4821'), false);
   assert.equal(matchesDeliveryOtp('abcd', 'abcd'), false);
+
+  assert.equal(formatPaymentMethodLabel('cash'), 'Cash on Delivery');
+  assert.equal(formatPaymentStatusLabel('cash', 'pending'), 'Pay Cash to Rider');
+  assert.equal(formatPaymentStatusLabel('cash', 'collected_by_rider'), 'Cash Collected');
+  assert.equal(formatPaymentStatusLabel('wallet', 'paid'), 'Paid');
+  assert.equal(formatPaymentStatusLabel('bank_transfer', 'pending_verification'), 'Awaiting Verification');
 });
 
 test('nigeria/katsina smart address search: resolves aliases, local landmarks, and distinct opposite exclusion', () => {

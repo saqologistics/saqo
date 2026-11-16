@@ -20,8 +20,10 @@ await new Promise((resolve) => portProbe.close(resolve));
 const origin = 'http://127.0.0.1:' + port;
 const credentials = { email: 'admin@saqo.test', password: 'SmokeTestAdminPassword1' };
 const env = {
-  ...process.env, NODE_ENV: 'production', PORT: String(port),
+  ...process.env, NODE_ENV: 'test', PORT: String(port),
+  SAQO_DATABASE_URL: '', SUPABASE_DB_URL: '',
   APP_URL: 'https://saqo.test', SAQO_SESSION_SECRET: 'local-smoke-test-secret-at-least-32-characters',
+  SAQO_API_ORIGIN: 'https://api.saqo.test',
   SAQO_ADMIN_EMAIL: credentials.email, SAQO_ADMIN_PASSWORD: credentials.password,
   SAQO_TRUST_PROXY: '0', SAQO_DISPATCH_ALERT_SECONDS: '1', SAQO_ALERT_WEBHOOK_URL: '',
   SUPABASE_URL: '', SUPABASE_ANON_KEY: '', SUPABASE_SERVICE_ROLE_KEY: '',
@@ -75,6 +77,20 @@ async function backupCommand(args, expected = 0) {
 
 try {
   await start(source);
+  const preflight = await fetch(origin + '/api/auth/me', {
+    method: 'OPTIONS', signal: AbortSignal.timeout(5000),
+    headers: {
+      Origin: env.APP_URL, 'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': 'authorization,content-type',
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), env.APP_URL);
+  const denied = await fetch(origin + '/api/settings/public', {
+    headers: { Origin: 'https://unrelated.test' }, signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('access-control-allow-origin'), null);
   const admin = await api('POST', '/api/auth/login', credentials);
   const riderLogin = { email: 'rider@saqo.test', password: 'SmokeTestRiderPassword1' };
   await api('POST', '/api/admin/riders', {
@@ -87,6 +103,11 @@ try {
   const customer = await api('POST', '/api/auth/register', {
     email: 'customer@saqo.test', password: 'SmokeCustomerPassword1', fullName: 'Smoke Customer', phone: '08012345679',
   }, undefined, 201);
+  for (const route of ['/api/admin/overview', '/api/admin/payments/overview', '/api/admin/gateway-settings']) {
+    await api('GET', route, null, admin.token);
+    await api('GET', route, null, rider.token, 403);
+    await api('GET', route, null, customer.token, 403);
+  }
   const booking = {
     pickupAddress: 'Kofar Kaura, Katsina', destinationAddress: 'Daura Town, Katsina',
     recipientName: 'Smoke Recipient', recipientPhone: '08012345680', parcelDescription: 'Smoke Parcel', paymentMethod: 'cash',
@@ -136,16 +157,47 @@ try {
     checked = await api('GET', '/api/rider/dashboard', null, rider.token);
   }
   assert.ok(checked.assignments.some((offer) => offer.id === originalOffer.id && offer.status === 'timed_out'));
-  assert.ok(checked.assignments.some((offer) => offer.deliveryId === second.id && offer.status === 'offered'));
+  const queuedOffer = checked.assignments.find((offer) => offer.deliveryId === second.id && offer.status === 'offered');
+  assert.ok(queuedOffer);
 
-  const ws = new WebSocket(origin.replace('http', 'ws') + '/ws');
+  const wsUrl = origin.replace('http', 'ws') + '/ws';
+  const deniedSocket = new WebSocket(wsUrl, { origin: 'https://unrelated.test', handshakeTimeout: 5000 });
+  const [deniedError] = await once(deniedSocket, 'error');
+  assert.match(deniedError.message, /403/);
+  const ws = new WebSocket(wsUrl, { origin: env.APP_URL, handshakeTimeout: 5000 });
   try {
     const [raw] = await once(ws, 'message');
     assert.equal(JSON.parse(raw).type, 'connected');
+    const events = [];
+    ws.on('message', (message) => events.push(JSON.parse(message)));
+    ws.send(JSON.stringify({ type: 'auth', token: customer.token }));
+    const pong = once(ws, 'pong', { signal: AbortSignal.timeout(5000) });
+    ws.ping();
+    await pong;
+
+    const accepted = await api('POST', '/api/rider/assignments/' + queuedOffer.id + '/respond', { action: 'accept' }, rider.token);
+    assert.equal(accepted.delivery.status, 'accepted');
+    assert.ok(Number.isFinite(accepted.delivery.pickupLat));
+    assert.ok(Number.isFinite(accepted.delivery.destinationLng));
+    assert.ok(!accepted.delivery.deliveryOtp);
+    const statusUrl = '/api/rider/deliveries/' + second.id + '/status';
+    for (const status of ['heading_to_pickup', 'parcel_picked_up', 'in_transit', 'arrived_at_destination']) {
+      assert.equal((await api('PATCH', statusUrl, { status }, rider.token)).delivery.status, status);
+    }
+    const delivered = await api('PATCH', statusUrl, { status: 'delivered', otp: second.deliveryOtp }, rider.token);
+    assert.equal(delivered.delivery.status, 'delivered');
+    const tracked = await api('GET', '/api/track/' + second.trackingCode);
+    assert.equal(tracked.delivery.status, 'delivered');
+    assert.ok(!tracked.delivery.deliveryOtp);
+    const isDeliveredNotice = (event) => event.type === 'notification:created' && event.payload?.title === 'Parcel Delivered';
+    for (let attempt = 0; attempt < 20 && !events.some(isDeliveredNotice); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(events.some(isDeliveredNotice));
   } finally {
     ws.close();
   }
-  console.log('PASS live SQLite backup, verified restore, queued delivery and offer recovery, WebSocket connection and persisted login throttling.');
+  console.log('PASS SQLite backup and restore, queue recovery, rider acceptance, verified delivery, customer notification, and login throttling.');
 } finally {
   await stop();
   for (const file of await readdir(dir)) await rm(path.join(dir, file));

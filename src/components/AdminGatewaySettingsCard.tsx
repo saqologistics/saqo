@@ -64,7 +64,7 @@ export const AdminGatewaySettingsCard: React.FC<{
   }, [loadGatewaySettings]);
 
   useRealtime((evt) => {
-    if (evt.type === 'gateway:updated') {
+    if (evt.type === 'gateway:updated' || evt.type === 'notifications:refresh') {
       loadGatewaySettings();
     }
   });

@@ -13,9 +13,14 @@ import {
   X,
 } from 'lucide-react';
 import { apiRequest, getStoredToken } from '../lib/api';
+import { apiUrl } from '../lib/deployment';
 import type { SaqoReceiptData } from '../lib/receipt';
 import { useRealtime } from '../hooks/useRealtime';
-import { formatNaira } from '../shared/pricing';
+import {
+  formatNaira,
+  formatPaymentMethodLabel,
+  formatPaymentStatusLabel,
+} from '../shared/pricing';
 import type {
   AdminPaymentsOverview,
   PaymentTransaction,
@@ -127,6 +132,7 @@ export const AdminPaymentsSection: React.FC<{
 
   useRealtime((evt) => {
     if (
+      evt.type === 'notifications:refresh' ||
       evt.type === 'wallet:updated' ||
       evt.type === 'payment:updated' ||
       evt.type === 'cash_collection:updated' ||
@@ -140,7 +146,7 @@ export const AdminPaymentsSection: React.FC<{
     try {
       const qs = buildQueryString(false);
       const token = getStoredToken();
-      const res = await fetch(`/api/admin/payments/export?${qs}`, {
+      const res = await fetch(apiUrl(`/api/admin/payments/export?${qs}`), {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!res.ok) throw new Error('Could not export CSV report.');
@@ -851,7 +857,7 @@ export const AdminPaymentsSection: React.FC<{
                         )}
                       </td>
                       <td className="py-3 px-4">
-                        <p className="font-mono uppercase">{cc.paymentMethod.replace(/_/g, ' ')}</p>
+                        <p className="font-medium text-black">{formatPaymentMethodLabel(cc.paymentMethod)}</p>
                         {cc.transferReference && (
                           <p className="font-mono text-[11px] text-neutral-600">
                             Ref: {cc.transferReference}
@@ -869,15 +875,15 @@ export const AdminPaymentsSection: React.FC<{
                       </td>
                       <td className="py-3 px-4">
                         <span
-                          className={`inline-block px-2 py-0.5 rounded-full font-mono text-[10px] font-bold uppercase ${
-                            cc.status === 'reconciled'
+                          className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                            cc.status === 'reconciled' || cc.status === 'collected_by_rider'
                               ? 'bg-black text-white'
                               : cc.status === 'disputed'
                                 ? 'border border-black text-black'
                                 : 'bg-neutral-200 text-neutral-800'
                           }`}
                         >
-                          {cc.status.replace(/_/g, ' ')}
+                          {formatPaymentStatusLabel(cc.paymentMethod, cc.status)}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap space-x-1.5">

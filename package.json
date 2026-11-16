@@ -7,11 +7,12 @@
     "dev": "tsx server.ts",
     "start": "node --import tsx --eval \"process.env.NODE_ENV = 'production'; import('./server.ts')\"",
     "build": "vite build",
+    "build:edge": "node scripts/buildEdgeFunction.mjs",
     "preview": "vite preview",
     "test:whatsapp:tunnel": "tsx scripts/whatsappSandbox.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/shared/logic.test.ts src/server/paymentService.test.ts"
+    "test": "tsx --test src/shared/logic.test.ts src/server/paymentService.test.ts src/server/webApp.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -25,6 +26,7 @@
     "leaflet": "^1.9.4",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "pg": "^8.23.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "tsx": "^4.21.0",
@@ -34,6 +36,7 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
